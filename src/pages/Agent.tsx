@@ -304,7 +304,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
               {it.type === "tool" ? (
                 <div
                   style={{
-                    background: "#0d1117",
+                    background: "var(--term-bg)",
                     border: "1px solid var(--border)",
                     borderRadius: 8,
                     padding: 10,
@@ -319,8 +319,8 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
                       style={{
                         margin: "6px 0 0",
                         padding: 8,
-                        background: "rgba(0,0,0,0.35)",
-                        color: "#c9d1d9",
+                        background: "var(--term-out)",
+                        color: "var(--term-text)",
                         borderRadius: 6,
                         fontSize: 12,
                         overflowX: "auto",
@@ -338,9 +338,9 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
                   style={{
                     background:
                       it.type === "user"
-                        ? "rgba(0,210,190,0.10)"
+                        ? "var(--active-bg)"
                         : it.type === "system"
-                          ? "rgba(147,160,189,0.15)"
+                          ? "var(--muted-bg)"
                           : "var(--panel-2)",
                     padding: "10px 12px",
                     borderRadius: 10,
@@ -381,7 +381,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
                   margin: "8px 0",
                   whiteSpace: "pre-wrap",
                   fontSize: 12.5,
-                  background: "rgba(0,0,0,0.25)",
+                  background: "var(--term-bg)", color: "var(--term-text)",
                   padding: 8,
                   borderRadius: 6,
                 }}
@@ -391,7 +391,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
               <div style={{ display: "flex", gap: 8 }}>
                 <button
                   className="btn"
-                  style={{ background: "var(--ok)", color: "#04150a" }}
+                  style={{ background: "var(--ok)", color: "var(--btn-text)" }}
                   onClick={() => confirm(true)}
                   disabled={busy}
                 >

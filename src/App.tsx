@@ -25,6 +25,23 @@ export default function App() {
   const [sidecarOk, setSidecarOk] = useState(false);
   const [checking, setChecking] = useState(true);
   const [agentPrefill, setAgentPrefill] = useState<string>("");
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    try {
+      return localStorage.getItem("jr-theme") === "light" ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
+
+  /** 主题切换：写入 <html data-theme>，并持久化到 localStorage。 */
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("jr-theme", theme);
+    } catch {
+      /* 忽略存储失败 */
+    }
+  }, [theme]);
 
   /** 从「③ 计划 & 项目」跳转到 Agent 实操，并带上基于计划的引导语。 */
   const startAgentFromPlan = () => {
@@ -139,6 +156,20 @@ export default function App() {
         <button className="btn-new" onClick={newSession}>
           ＋ 新建会话
         </button>
+        <div className="theme-switch">
+          <button
+            className={`theme-opt ${theme === "dark" ? "active" : ""}`}
+            onClick={() => setTheme("dark")}
+          >
+            深色
+          </button>
+          <button
+            className={`theme-opt ${theme === "light" ? "active" : ""}`}
+            onClick={() => setTheme("light")}
+          >
+            浅色
+          </button>
+        </div>
         <div className="page-sub" style={{ padding: "0 8px" }}>
           {sidecarOk ? (
             <span style={{ color: "var(--ok)" }}>● 本地服务正常</span>

@@ -1,4 +1,5 @@
 :root {
+  /* 深色主题（默认） */
   --bg: #0b1020;
   --panel: #141b30;
   --panel-2: #1b2440;
@@ -10,6 +11,45 @@
   --danger: #ff6b6b;
   --ok: #34d399;
   --warn: #fbbf24;
+  /* 派生变量（随主题切换） */
+  --btn-text: #06221e;
+  --info-text: #9db8ff;
+  --active-bg: rgba(0, 210, 190, 0.14);
+  --active-sess-bg: rgba(77, 141, 255, 0.16);
+  --accent-soft: rgba(0, 210, 190, 0.08);
+  --chip-bg: rgba(0, 210, 190, 0.12);
+  --chip-border: rgba(0, 210, 190, 0.3);
+  --muted-bg: rgba(147, 160, 189, 0.15);
+  /* Agent 终端块（两种主题下都保持深色代码块风格） */
+  --term-bg: #0d1117;
+  --term-text: #c9d1d9;
+  --term-out: rgba(0, 0, 0, 0.35);
+}
+
+/* 明亮主题（白蓝配色） */
+html[data-theme="light"] {
+  --bg: #f2f6fc;
+  --panel: #ffffff;
+  --panel-2: #eef3fb;
+  --border: #d9e3f2;
+  --text: #14202f;
+  --muted: #5b6b85;
+  --accent: #1677ff;
+  --accent-2: #2f6bff;
+  --danger: #d6403f;
+  --ok: #0f9d58;
+  --warn: #b96b00;
+  --btn-text: #ffffff;
+  --info-text: #1e4bd1;
+  --active-bg: rgba(22, 119, 255, 0.1);
+  --active-sess-bg: rgba(22, 119, 255, 0.1);
+  --accent-soft: rgba(22, 119, 255, 0.08);
+  --chip-bg: rgba(22, 119, 255, 0.1);
+  --chip-border: rgba(22, 119, 255, 0.35);
+  --muted-bg: rgba(91, 107, 133, 0.1);
+  --term-bg: #0d1117;
+  --term-text: #c9d1d9;
+  --term-out: rgba(0, 0, 0, 0.35);
 }
 
 * {
@@ -70,7 +110,7 @@ body,
 }
 
 .sidebar .nav-item.active {
-  background: rgba(0, 210, 190, 0.14);
+  background: var(--active-bg);
   color: var(--accent);
   font-weight: 600;
 }
@@ -102,7 +142,7 @@ body,
 }
 
 .sidebar .sess-item.active {
-  background: rgba(77, 141, 255, 0.16);
+  background: var(--active-sess-bg);
   color: var(--text);
 }
 
@@ -123,7 +163,7 @@ body,
 }
 
 .btn-new:hover {
-  background: rgba(0, 210, 190, 0.08);
+  background: var(--accent-soft);
 }
 
 /* 主内容 */
@@ -168,7 +208,7 @@ body,
   font-size: 13.5px;
   font-weight: 600;
   background: var(--accent);
-  color: #06221e;
+  color: var(--btn-text);
 }
 
 .btn:disabled {
@@ -226,9 +266,9 @@ label {
   padding: 3px 10px;
   border-radius: 999px;
   font-size: 12px;
-  background: rgba(0, 210, 190, 0.12);
+  background: var(--chip-bg);
   color: var(--accent);
-  border: 1px solid rgba(0, 210, 190, 0.3);
+  border: 1px solid var(--chip-border);
   margin: 2px 4px 2px 0;
 }
 
@@ -277,7 +317,7 @@ label {
 
 .alert.info {
   background: rgba(77, 141, 255, 0.12);
-  color: #9db8ff;
+  color: var(--info-text);
   border: 1px solid rgba(77, 141, 255, 0.3);
 }
 
@@ -386,4 +426,36 @@ th {
 .chip-row .chip {
   border: 1px solid var(--border);
   color: var(--text);
+}
+
+/* 主题切换（侧边栏左下角） */
+.theme-switch {
+  display: flex;
+  gap: 4px;
+  padding: 8px;
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.theme-opt {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.theme-opt:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.theme-opt.active {
+  background: var(--active-bg);
+  color: var(--accent);
+  border-color: transparent;
+  font-weight: 600;
 }
