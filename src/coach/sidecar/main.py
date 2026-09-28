@@ -371,7 +371,7 @@ def interview_answer(session_id: str, body: InterviewAnswerInput) -> dict:
 
 class ObsidianInput(BaseModel):
     vault_path: str
-    max_files: int = 20
+    max_files: int | None = None  # None = 不限制，读取全部笔记
 
 
 _SKIP_DIR_PARTS = {
@@ -397,7 +397,11 @@ def profile_from_obsidian(session_id: str, body: ObsidianInput) -> dict:
     if not md_files:
         raise HTTPException(status_code=400, detail=f"该目录下没有找到 Markdown 笔记：{vault}")
     md_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    selected = md_files[: max(1, body.max_files)]
+    # 不限制篇数：全部读取（max_files 为空或 <=0 时）；否则只取最近 N 篇
+    if body.max_files and body.max_files > 0:
+        selected = md_files[: body.max_files]
+    else:
+        selected = md_files
 
     router = get_router()
     profile = state.profile

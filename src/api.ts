@@ -70,10 +70,10 @@ export const api = {
       body: form,
     });
   },
-  profileFromObsidian: (sessionId: string, vaultPath: string, maxFiles = 20) =>
-    req<UserSkillProfile & { read_files: string[] }>(
+  profileFromObsidian: (sessionId: string, vaultPath: string) =>
+    req<UserSkillProfile & { read_files: string[]; failed_files: string[] }>(
       `/api/sessions/${sessionId}/profile/obsidian`,
-      json("POST", { vault_path: vaultPath, max_files: maxFiles }),
+      json("POST", { vault_path: vaultPath }),
     ),
 
   // 待澄清对话

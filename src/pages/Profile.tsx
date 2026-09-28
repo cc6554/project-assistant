@@ -265,8 +265,9 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
         <div className="card">
           <h3>从 Obsidian 读取经历日志</h3>
           <p className="page-sub">
-            填入你的 Obsidian 库路径，应用读取其中最近的 Markdown 笔记（默认 20 篇，跳过 .obsidian / 附件 / 模板 / 程序目录），
+            填入你的 Obsidian 库路径，应用读取其中全部 Markdown 笔记（跳过 .obsidian / 附件 / 模板 / 程序目录），
             从中抽取你的技能与经历。日记、周记、项目笔记都会成为档案证据。
+            笔记多时全部解析可能需要几分钟。
             建议填你个人的笔记目录，不要填程序或项目根目录，避免读入无关文件。
           </p>
           <label>Obsidian 库路径（Vault 目录）</label>
