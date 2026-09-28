@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { api } from "../api";
+import VoiceField from "../components/VoiceField";
 import type { JDCard, SessionState } from "../types";
 
 const EMPTY_JD: JDCard = {
@@ -163,11 +164,11 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
       {mode === "search" && (
         <div className="card">
           <label>岗位名称或方向</label>
-          <textarea
+          <VoiceField
             placeholder="例如：灵巧手抓取算法工程师 / 具身智能操作方向 / 大模型推理优化后端…可以加城市、关键词让搜索更准"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            style={{ minHeight: 72 }}
+            onChange={setQuery}
+            minHeight={72}
           />
           <button className="btn" onClick={startSearch} disabled={searching || !query.trim()}>
             {searching ? (
@@ -260,7 +261,7 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
               {listEdit("加分项", draft.nice_to_haves, (v) => setJd({ nice_to_haves: v }))}
               <div>
                 <label>原始摘要</label>
-                <textarea value={draft.raw_summary ?? ""} onChange={(e) => setJd({ raw_summary: e.target.value })} />
+                <VoiceField value={draft.raw_summary ?? ""} onChange={(v) => setJd({ raw_summary: v })} minHeight={80} />
               </div>
               <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
                 <button className="btn" onClick={saveEdit}>

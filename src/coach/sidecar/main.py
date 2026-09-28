@@ -25,7 +25,7 @@ from ..core.llm.registry import VALID_API_MODES, load_config
 from ..core.llm.router import ModelRouter
 from ..core.schema import Message
 from ..domain.schemas import JDCard
-from ..tools import github_search, interviewer, jd_parser, planner, profile_builder, web_search
+from ..tools import documents, github_search, interviewer, jd_parser, planner, profile_builder, web_search
 from ..tools.agent import AGENT_SYSTEM_PROMPT, AGENT_TOOLS, AgentRuntime, PendingAction
 from ..tools.pipeline import plan_and_recommend
 from . import paths
@@ -421,6 +421,65 @@ def profile_from_obsidian(session_id: str, body: ObsidianInput) -> dict:
     return {
         **profile.model_dump(exclude_none=True),
         "read_files": [str(p.relative_to(vault)) for p in selected],
+        "failed_files": failed,
+    }
+
+
+# ── 环节②c2：通用本地路径读取（任意目录，agent 自己读路径下文件）──────
+
+class LocalPathInput(BaseModel):
+    path: str
+    max_files: int | None = None  # None = 不限制
+
+
+_SUPPORTED_DOC_SUFFIXES = {".md", ".markdown", ".txt", ".log", ".pdf"}
+
+
+@app.post("/api/sessions/{session_id}/profile/path")
+def profile_from_path(session_id: str, body: LocalPathInput) -> dict:
+    """读取本地路径下全部支持的文件（md/txt/log/pdf），逐份并入技能档案。"""
+    root = Path(body.path).expanduser()
+    if not root.exists():
+        raise HTTPException(status_code=400, detail=f"路径不存在：{root}")
+    state = _session(session_id)
+
+    files: list[Path] = []
+    if root.is_dir():
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in _SUPPORTED_DOC_SUFFIXES:
+                continue
+            if any(part in _SKIP_DIR_PARTS for part in p.parts):
+                continue
+            files.append(p)
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    else:
+        files = [root]
+
+    if not files:
+        raise HTTPException(status_code=400, detail=f"该路径下没有找到支持的文件（md/txt/log/pdf）：{root}")
+    if body.max_files and body.max_files > 0:
+        files = files[: body.max_files]
+
+    router = get_router()
+    profile = state.profile
+    failed: list[str] = []
+    read_names: list[str] = []
+    for p in files:
+        try:
+            text = documents.read_document(p)
+            profile = profile_builder.build_profile_from_text(
+                router, text, source="local_path", existing=profile
+            )
+            read_names.append(str(p.relative_to(root)) if root.is_dir() else p.name)
+        except Exception as exc:  # noqa: BLE001 - 单文件失败跳过
+            failed.append(f"{p.name}: {exc}")
+            continue
+    assert profile is not None
+    state.profile = profile
+    store.save(state)
+    return {
+        **profile.model_dump(exclude_none=True),
+        "read_files": read_names,
         "failed_files": failed,
     }
 

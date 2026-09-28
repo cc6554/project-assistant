@@ -75,6 +75,11 @@ export const api = {
       `/api/sessions/${sessionId}/profile/obsidian`,
       json("POST", { vault_path: vaultPath }),
     ),
+  profileFromPath: (sessionId: string, localPath: string) =>
+    req<UserSkillProfile & { read_files: string[]; failed_files: string[] }>(
+      `/api/sessions/${sessionId}/profile/path`,
+      json("POST", { path: localPath }),
+    ),
 
   // 待澄清对话
   clarifyNext: (sessionId: string) =>

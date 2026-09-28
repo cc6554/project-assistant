@@ -27,7 +27,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # sidecar 运行时不需要的科学计算/绘图大依赖；
+        # Python 3.14 下 PyInstaller isolated 分析这些包会崩溃，故直接排除
+        # 注意：PIL 不能排除（jd_parser 的截图解析依赖它）
+        "numpy",
+        "pandas",
+        "pyarrow",
+        "matplotlib",
+        "scipy",
+        "tiktoken",
+    ],
     noarchive=False,
 )
 

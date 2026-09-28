@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { api } from "../api";
+import VoiceField from "../components/VoiceField";
 import type { SessionState, UserSkillProfile } from "../types";
 
 interface Props {
@@ -133,11 +134,11 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     ).then(() => setFiles([]));
   };
 
-  const submitObsidian = () => {
+  const submitPath = () => {
     if (!vaultPath.trim()) return;
     run(
-      () => api.profileFromObsidian(sessionId, vaultPath.trim()),
-      "Obsidian 笔记已并入档案 ✅",
+      () => api.profileFromPath(sessionId, vaultPath.trim()),
+      "本地路径文件已并入档案 ✅",
     );
   };
 
@@ -145,7 +146,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     <div>
       <h2 className="page-title">技能档案</h2>
       <p className="page-sub">
-        告诉 AI 你现在会什么（自述 / 简历 / 工作日志 / Obsidian 笔记 / 问答访谈），解析后如有疑问会直接问你，而不是留一堆待办让你自己看。
+        告诉 AI 你现在会什么（自述 / 简历 / 工作日志 / 上传文档 / 本地路径读取 / 问答访谈），解析后如有疑问会直接问你，而不是留一堆待办让你自己看。
       </p>
 
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
@@ -163,10 +164,11 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
               <div className="chat-line">
                 <div className="q">Q：{clarifyQ}</div>
               </div>
-              <textarea
+              <VoiceField
                 placeholder="直接回答：做过什么、做到什么程度、有没有项目能证明…"
                 value={clarifyA}
-                onChange={(e) => setClarifyA(e.target.value)}
+                onChange={setClarifyA}
+                minHeight={80}
               />
               <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
                 <button className="btn" onClick={submitClarify} disabled={clarifyBusy || !clarifyA.trim()}>
@@ -210,7 +212,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
             style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "7px 16px", cursor: "pointer" }}
             onClick={() => setTab(t)}
           >
-            {t === "text" ? "文本自述 / 简历 / 日志" : t === "documents" ? "上传文档" : t === "obsidian" ? "Obsidian 笔记库" : "访谈问答"}
+            {t === "text" ? "文本自述 / 简历 / 日志" : t === "documents" ? "上传文档" : t === "obsidian" ? "本地路径 / Obsidian" : "访谈问答"}
           </button>
         ))}
       </div>
@@ -224,11 +226,11 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
             <option value="work_log">工作日志（work_log）</option>
           </select>
           <label>内容</label>
-          <textarea
+          <VoiceField
             placeholder="粘贴你的技能自述 / 简历要点 / 工作日志，越具体越好，例如：我用 Python 写过爬虫，对 FastAPI 比较熟，PyTorch 只会调库…"
             value={text}
-            onChange={(e) => setText(e.target.value)}
-            style={{ minHeight: 160 }}
+            onChange={setText}
+            minHeight={160}
           />
           <button className="btn" onClick={submitText} disabled={busy || !text.trim()}>
             {busy ? "解析中…" : "解析并入档案"}
@@ -254,7 +256,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
           >
             {files.length ? `已选 ${files.length} 个：${files.map((f) => f.name).join("、")}` : "点击或拖拽 PDF / TXT / Markdown 文档"}
           </div>
-          <input ref={docRef} type="file" accept=".pdf,.txt,.md" multiple hidden onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
+          <input ref={docRef} type="file" accept=".pdf,.txt,.md,.markdown,.log" multiple hidden onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
           <button className="btn" onClick={submitDocs} disabled={busy || !files.length}>
             {busy ? "解析中…" : "解析并入档案"}
           </button>
@@ -263,21 +265,20 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
 
       {tab === "obsidian" && (
         <div className="card">
-          <h3>从 Obsidian 读取经历日志</h3>
+          <h3>从本地路径读取经历（Obsidian 库 / 任意笔记目录）</h3>
           <p className="page-sub">
-            填入你的 Obsidian 库路径，应用读取其中全部 Markdown 笔记（跳过 .obsidian / 附件 / 模板 / 程序目录），
-            从中抽取你的技能与经历。日记、周记、项目笔记都会成为档案证据。
-            笔记多时全部解析可能需要几分钟。
-            建议填你个人的笔记目录，不要填程序或项目根目录，避免读入无关文件。
+            填一个本地目录或文件路径，Agent 自己读取路径下的全部文件（支持 .md / .txt / .log / .pdf，数量不限制，跳过附件 / 模板 / 程序目录），
+            从中抽取你的技能与经历。Obsidian 库直接填 Vault 目录即可。
+            文件多时全部解析可能需要几分钟。
           </p>
-          <label>Obsidian 库路径（Vault 目录）</label>
+          <label>本地路径（目录或单个文件）</label>
           <input
-            placeholder="例如 D:\我的笔记 或 /home/cxy/Documents/Obsidian"
+            placeholder="例如 D:\我的笔记 或 /home/cxy/Documents/Obsidian 或 F:\resume.pdf"
             value={vaultPath}
             onChange={(e) => setVaultPath(e.target.value)}
           />
-          <button className="btn" onClick={submitObsidian} disabled={busy || !vaultPath.trim()}>
-            {busy ? "读取并解析中…" : "读取并解析"}
+          <button className="btn" onClick={submitPath} disabled={busy || !vaultPath.trim()}>
+            {busy ? "读取并解析中…" : "让 Agent 读取并解析"}
           </button>
         </div>
       )}
@@ -298,7 +299,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
               <div className="chat-line">
                 <div className="q">Q：{question}</div>
               </div>
-              <textarea placeholder="你的回答（可详述项目经历、掌握程度、使用频率…）" value={answer} onChange={(e) => setAnswer(e.target.value)} />
+              <VoiceField placeholder="你的回答（可详述项目经历、掌握程度、使用频率…）" value={answer} onChange={setAnswer} minHeight={80} />
               <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
                 <button className="btn" onClick={submitAnswer} disabled={busy || !answer.trim()}>
                   提交回答

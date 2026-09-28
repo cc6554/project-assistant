@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import VoiceField from "../components/VoiceField";
 import type { AgentLogEntry, SessionState } from "../types";
 
 interface Props {
@@ -412,13 +413,13 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
             gap: 8,
           }}
         >
-          <input
+          <VoiceField
+            multiline={false}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={setInput}
             onKeyDown={(e) => e.key === "Enter" && send()}
             placeholder={pending ? "先处理上面的确认…" : "告诉 Agent 你想做什么"}
             disabled={busy || !!pending || !hasPlan}
-            style={{ flex: 1 }}
           />
           <button
             className="btn"
