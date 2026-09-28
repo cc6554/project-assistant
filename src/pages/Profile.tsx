@@ -212,7 +212,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
             style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "7px 16px", cursor: "pointer" }}
             onClick={() => setTab(t)}
           >
-            {t === "text" ? "文本自述 / 简历 / 日志" : t === "documents" ? "上传文档" : t === "obsidian" ? "本地路径 / Obsidian" : "访谈问答"}
+            {t === "text" ? "文本自述 / 简历 / 日志" : t === "documents" ? "上传文件" : t === "obsidian" ? "本地路径 / Obsidian" : "访谈问答"}
           </button>
         ))}
       </div>
@@ -240,11 +240,15 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
 
       {tab === "documents" && (
         <div className="card">
-          <label>文档类型</label>
+          <label>文件类型（证据来源）</label>
           <select value={source} onChange={(e) => setSource(e.target.value)} style={{ maxWidth: 260 }}>
             <option value="resume">简历（resume）</option>
             <option value="work_log">工作日志（work_log）</option>
           </select>
+          <p className="page-sub">
+            任意类型文件都可以上传，数量不限。支持 PDF / Word / Excel / PPT / TXT / Markdown / JSON / CSV 自动解析，
+            其他类型会跳过并在结果里提示（不会被当作档案内容）。
+          </p>
           <div
             className="upload-zone"
             onClick={() => docRef.current?.click()}
@@ -254,9 +258,9 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
               setFiles(Array.from(e.dataTransfer.files));
             }}
           >
-            {files.length ? `已选 ${files.length} 个：${files.map((f) => f.name).join("、")}` : "点击或拖拽 PDF / TXT / Markdown 文档"}
+            {files.length ? `已选 ${files.length} 个：${files.map((f) => f.name).join("、")}` : "点击或拖拽任意文件（可多选）"}
           </div>
-          <input ref={docRef} type="file" accept=".pdf,.txt,.md,.markdown,.log" multiple hidden onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
+          <input ref={docRef} type="file" multiple hidden onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
           <button className="btn" onClick={submitDocs} disabled={busy || !files.length}>
             {busy ? "解析中…" : "解析并入档案"}
           </button>

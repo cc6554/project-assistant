@@ -305,26 +305,40 @@ def profile_from_text(session_id: str, body: ProfileTextInput) -> dict:
 async def profile_from_documents(
     session_id: str, source: str = Form(...), files: list[UploadFile] = File(...)
 ) -> dict:
+    """上传任意类型文件：可解析的并入档案；不支持的格式跳过并提示，不中断整批。"""
     state = _session(session_id)
     if not files:
-        raise HTTPException(status_code=400, detail="至少上传一个文档")
+        raise HTTPException(status_code=400, detail="至少上传一个文件")
     contents: dict[str, bytes] = {}
     for f in files:
         data = await f.read()
         if data:
-            contents[f.filename or "doc.pdf"] = data
+            contents[f.filename or "doc.bin"] = data
     paths_ = store.save_uploads(session_id, contents)
 
-    router = get_router()
-    try:
-        profile = profile_builder.build_profile_from_documents(
-            router, paths_, source=source, existing=state.profile
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"文档档案解析失败：{exc}") from exc
+    # 逐文件预检：可读的进解析列表，不可读的进 failed
+    readable: list[str] = []
+    failed: list[str] = []
+    for p in paths_:
+        try:
+            documents.read_document(p)
+            readable.append(p)
+        except Exception as exc:  # noqa: BLE001 - 未知类型/损坏文件跳过
+            failed.append(f"{Path(p).name}: {exc}")
+
+    profile = state.profile
+    if readable:
+        router = get_router()
+        try:
+            profile = profile_builder.build_profile_from_documents(
+                router, readable, source=source, existing=state.profile
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"文件解析失败：{exc}") from exc
+    assert profile is not None
     state.profile = profile
     store.save(state)
-    return profile.model_dump(exclude_none=True)
+    return {**profile.model_dump(exclude_none=True), "failed_files": failed}
 
 
 # ── 环节②b：访谈 ────────────────────────────────────────────────
