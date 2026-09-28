@@ -25,7 +25,7 @@ from ..core.llm.registry import VALID_API_MODES, load_config
 from ..core.llm.router import ModelRouter
 from ..core.schema import Message
 from ..domain.schemas import JDCard
-from ..tools import github_search, interviewer, jd_parser, planner, profile_builder
+from ..tools import github_search, interviewer, jd_parser, planner, profile_builder, web_search
 from ..tools.agent import AGENT_SYSTEM_PROMPT, AGENT_TOOLS, AgentRuntime, PendingAction
 from ..tools.pipeline import plan_and_recommend
 from . import paths
@@ -216,6 +216,69 @@ def update_jd(session_id: str, jd: JDCard) -> dict:
     return {"ok": True, "jd": jd.model_dump(exclude_none=True)}
 
 
+class JdSearchInput(BaseModel):
+    query: str
+
+
+_SEARCH_QUERY_PROMPT = "你是招聘信息检索助手。用户想找某类岗位的招聘 JD。\n\n输入：{query}\n\n要求：生成 2~3 条用于搜索的完整查询词（中文为主），每条聚焦一个角度（岗位名+方向 / 岗位名+城市 / 岗位名+要求关键词），能直接用于搜索引擎；严格通过 emit_result 工具输出 queries 字段。"
+
+
+class _SearchQueries(BaseModel):
+    queries: list[str] = []
+
+
+@app.post("/api/sessions/{session_id}/jd/search")
+def search_jd(session_id: str, body: JdSearchInput) -> dict:
+    """方式 A：用户说岗位 → 联网搜索招聘 JD 文本 → 解析为 JDCard。"""
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="请填写岗位名称或方向")
+    state = _session(session_id)
+    router = get_router()
+
+    try:
+        qraw = router.complete_json(
+            "default",
+            [Message(role="user", content=_SEARCH_QUERY_PROMPT.format(query=query))],
+            _SearchQueries.model_json_schema(),
+            tool_name="emit_result",
+            tool_description="提交搜索查询词列表",
+            temperature=0.2,
+        )
+        queries = (_SearchQueries.model_validate(qraw).queries or [query])[:3]
+    except Exception:  # noqa: BLE001 - 生成搜索词失败就直接用原文搜
+        queries = [query]
+
+    texts: list[str] = []
+    seen: set[str] = set()
+    last_err: Exception | None = None
+    for q in queries:
+        try:
+            for line in web_search.search_texts(q, n=6):
+                key = line[:60]
+                if key not in seen:
+                    seen.add(key)
+                    texts.append(line)
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+        if len(texts) >= 8:
+            break
+    if not texts:
+        raise HTTPException(
+            status_code=502,
+            detail=f"搜索没有拿到任何岗位文本：{last_err or '未知错误'}，请稍后重试或改用上传截图",
+        )
+
+    try:
+        jd = jd_parser.parse_jd_text(router, texts, task="parsing")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"岗位信息解析失败：{exc}") from exc
+
+    state.jd = jd
+    store.save(state)
+    return {"jd": jd.model_dump(exclude_none=True), "sources": len(texts)}
+
+
 # ── 环节②：技能档案 ─────────────────────────────────────────────
 
 class ProfileTextInput(BaseModel):
@@ -302,6 +365,104 @@ def interview_answer(session_id: str, body: InterviewAnswerInput) -> dict:
     state.interview_history.append([body.question, body.answer])
     store.save(state)
     return profile.model_dump(exclude_none=True)
+
+
+# ── 环节②c：Obsidian 笔记库读取 ─────────────────────────────────
+
+class ObsidianInput(BaseModel):
+    vault_path: str
+    max_files: int = 20
+
+
+_SKIP_DIR_PARTS = {
+    ".obsidian", ".trash", "attachments", "images", "files", "assets",
+    "templates", "template", "node_modules", "venv", ".venv", ".git",
+    "__pycache__", "_internal", "target", "dist", "build",
+}
+
+
+@app.post("/api/sessions/{session_id}/profile/obsidian")
+def profile_from_obsidian(session_id: str, body: ObsidianInput) -> dict:
+    """读取用户 Obsidian 库中最近的 Markdown 经历/日志，并入技能档案。"""
+    vault = Path(body.vault_path).expanduser()
+    if not vault.is_dir():
+        raise HTTPException(status_code=400, detail=f"目录不存在：{vault}")
+    state = _session(session_id)
+
+    md_files: list[Path] = []
+    for p in vault.rglob("*.md"):
+        if any(part in _SKIP_DIR_PARTS for part in p.parts):
+            continue
+        md_files.append(p)
+    if not md_files:
+        raise HTTPException(status_code=400, detail=f"该目录下没有找到 Markdown 笔记：{vault}")
+    md_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    selected = md_files[: max(1, body.max_files)]
+
+    router = get_router()
+    profile = state.profile
+    failed: list[str] = []
+    for p in selected:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            profile = profile_builder.build_profile_from_text(
+                router, text, source="obsidian", existing=profile
+            )
+        except Exception as exc:  # noqa: BLE001 - 单篇失败跳过，不让整批挂掉
+            failed.append(f"{p.name}: {exc}")
+            continue
+    assert profile is not None
+    state.profile = profile
+    store.save(state)
+    return {
+        **profile.model_dump(exclude_none=True),
+        "read_files": [str(p.relative_to(vault)) for p in selected],
+        "failed_files": failed,
+    }
+
+
+# ── 环节②d：待澄清内容 → 对话式澄清（不再只是列表展示）──────────
+
+@app.get("/api/sessions/{session_id}/profile/clarify/next")
+def clarify_next(session_id: str) -> dict:
+    """取档案中下一条待澄清问题；没有则返回 done。"""
+    state = _session(session_id)
+    if state.profile is None:
+        raise HTTPException(status_code=400, detail="请先建立技能档案")
+    questions = state.profile.open_questions
+    if not questions:
+        return {"question": None, "remaining": 0, "done": True}
+    return {"question": questions[0], "remaining": len(questions), "done": False}
+
+
+class ClarifyAnswerInput(BaseModel):
+    question: str
+    answer: str
+
+
+@app.post("/api/sessions/{session_id}/profile/clarify/answer")
+def clarify_answer(session_id: str, body: ClarifyAnswerInput) -> dict:
+    """用户回答一条待澄清问题 → 并入档案 → 返回下一条待澄清。"""
+    state = _session(session_id)
+    if state.profile is None:
+        raise HTTPException(status_code=400, detail="请先建立技能档案")
+    router = get_router()
+    try:
+        profile = interviewer.apply_interview_answer(
+            router, state.profile, body.question, body.answer
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"澄清答案并入档案失败：{exc}") from exc
+    state.profile = profile
+    state.interview_history.append([body.question, body.answer])
+    store.save(state)
+    remaining = profile.open_questions
+    return {
+        "profile": profile.model_dump(exclude_none=True),
+        "question": remaining[0] if remaining else None,
+        "remaining": len(remaining),
+        "done": not remaining,
+    }
 
 
 # ── 环节③④：计划 + GitHub 项目 ──────────────────────────────────

@@ -18,6 +18,11 @@ interface Props {
 }
 
 export default function JobsPage({ sessionId, state, onState }: Props) {
+  const [mode, setMode] = useState<"search" | "upload">("search");
+  // 方式 A：说岗位名，联网搜索
+  const [query, setQuery] = useState("");
+  const [searching, setSearching] = useState(false);
+  // 方式 B：上传 / 粘贴截图
   const [files, setFiles] = useState<File[]>([]);
   const [parsing, setParsing] = useState(false);
   const [msg, setMsg] = useState<{ kind: "error" | "info"; text: string } | null>(null);
@@ -26,6 +31,34 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const jd = state?.jd ?? null;
+
+  const applyJd = (nextJd: JDCard, infoText: string) => {
+    const next: SessionState = {
+      ...(state ?? { session_id: sessionId, repos: [], interview_history: [], coach_history: [] }),
+      jd: nextJd,
+    };
+    onState(next);
+    setDraft(nextJd);
+    setEditing(true);
+    setMsg({ kind: "info", text: infoText });
+  };
+
+  const startSearch = async () => {
+    if (!query.trim()) {
+      setMsg({ kind: "error", text: "先告诉我你想找什么岗位" });
+      return;
+    }
+    setSearching(true);
+    setMsg(null);
+    try {
+      const res = await api.searchJd(sessionId, query);
+      applyJd(res.jd, `搜索并识别完成（基于 ${res.sources} 条结果），请核对下面的字段，有错的直接改`);
+    } catch (e) {
+      setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
+    } finally {
+      setSearching(false);
+    }
+  };
 
   const startParse = async () => {
     if (!files.length) {
@@ -36,15 +69,20 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
     setMsg(null);
     try {
       const res = await api.parseJd(sessionId, files);
-      const next: SessionState = { ...(state ?? { session_id: sessionId, repos: [], interview_history: [], coach_history: [] }), jd: res.jd };
-      onState(next);
-      setEditing(true);
-      setDraft(res.jd);
-      setMsg({ kind: "info", text: "识别完成，请核对下面的字段，有错的直接改" });
+      applyJd(res.jd, "识别完成，请核对下面的字段，有错的直接改");
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
       setParsing(false);
+    }
+  };
+
+  const addPastedImages = (filesLike: FileList | null) => {
+    if (!filesLike) return;
+    const imgs = Array.from(filesLike).filter((f) => f.type.startsWith("image/"));
+    if (imgs.length) {
+      setFiles((prev) => [...prev, ...imgs]);
+      setMsg({ kind: "info", text: `已从剪贴板加入 ${imgs.length} 张图片` });
     }
   };
 
@@ -99,44 +137,88 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
   const setJd = (patch: Partial<JDCard>) => setDraft((d) => ({ ...d, ...patch }));
 
   return (
-    <div>
+    <div onPaste={(e) => addPastedImages(e.clipboardData?.files ?? null)}>
       <h2 className="page-title">岗位 JD</h2>
-      <p className="page-sub">上传 BOSS 直聘岗位详情的截图（可多张 / 长截图），AI 会合并识别为结构化卡片。</p>
+      <p className="page-sub">两种方式告诉 AI 你要投的岗位：说岗位名让 AI 去搜，或者直接给岗位详情截图（可粘贴）。</p>
 
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
 
-      <div className="card">
-        <h3>上传岗位截图</h3>
-        <div
-          className="upload-zone"
-          onClick={() => inputRef.current?.click()}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            setFiles(Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/")));
-          }}
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <button
+          className={`nav-item ${mode === "search" ? "active" : ""}`}
+          style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "7px 16px", cursor: "pointer" }}
+          onClick={() => setMode("search")}
         >
-          {files.length ? `已选 ${files.length} 张：${files.map((f) => f.name).join("、")}` : "点击或拖拽截图到这里"}
-        </div>
-        <input
-          ref={inputRef}
-          type="file"
-          accept="image/*"
-          multiple
-          hidden
-          onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
-        />
-        <button className="btn" onClick={startParse} disabled={parsing || !files.length}>
-          {parsing ? (
-            <>
-              <span className="spinner" />
-              识别中（可能需要 30–60 秒）…
-            </>
-          ) : (
-            "开始识别"
-          )}
+          说岗位名，AI 去搜
+        </button>
+        <button
+          className={`nav-item ${mode === "upload" ? "active" : ""}`}
+          style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "7px 16px", cursor: "pointer" }}
+          onClick={() => setMode("upload")}
+        >
+          上传 / 粘贴岗位截图
         </button>
       </div>
+
+      {mode === "search" && (
+        <div className="card">
+          <label>岗位名称或方向</label>
+          <textarea
+            placeholder="例如：灵巧手抓取算法工程师 / 具身智能操作方向 / 大模型推理优化后端…可以加城市、关键词让搜索更准"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            style={{ minHeight: 72 }}
+          />
+          <button className="btn" onClick={startSearch} disabled={searching || !query.trim()}>
+            {searching ? (
+              <>
+                <span className="spinner" />
+                搜索并识别中（30–60 秒）…
+              </>
+            ) : (
+              "搜索并识别"
+            )}
+          </button>
+          <p className="page-sub" style={{ marginTop: 8 }}>
+            联网搜索招聘 JD 文本后用 AI 结构化；结果可能不如截图精确，识别后务必核对。
+          </p>
+        </div>
+      )}
+
+      {mode === "upload" && (
+        <div className="card">
+          <h3>上传岗位截图</h3>
+          <div
+            className="upload-zone"
+            onClick={() => inputRef.current?.click()}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              setFiles(Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/")));
+            }}
+          >
+            {files.length ? `已选 ${files.length} 张：${files.map((f) => f.name).join("、")}` : "点击、拖拽截图到这里，或直接 Ctrl+V 粘贴"}
+          </div>
+          <input
+            ref={inputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            hidden
+            onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+          />
+          <button className="btn" onClick={startParse} disabled={parsing || !files.length}>
+            {parsing ? (
+              <>
+                <span className="spinner" />
+                识别中（可能需要 30–60 秒）…
+              </>
+            ) : (
+              "开始识别"
+            )}
+          </button>
+        </div>
+      )}
 
       {(editing || jd) && (
         <div className="card">

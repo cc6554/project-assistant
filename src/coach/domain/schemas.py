@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 # ── 环节①：岗位 JD 结构化卡片 ─────────────────────────────────
 
 Proficiency = Literal["aware", "working", "proficient", "expert"]
-EvidenceSource = Literal["resume", "self_report", "chat", "work_log"]
+EvidenceSource = Literal["resume", "self_report", "chat", "work_log", "obsidian"]
 
 
 class JDCard(BaseModel):

@@ -50,6 +50,11 @@ export const api = {
       body: form,
     });
   },
+  searchJd: (sessionId: string, query: string) =>
+    req<{ jd: JDCard; sources: number }>(
+      `/api/sessions/${sessionId}/jd/search`,
+      json("POST", { query }),
+    ),
   updateJd: (sessionId: string, jd: JDCard) =>
     req<{ ok: boolean; jd: JDCard }>(`/api/sessions/${sessionId}/jd`, json("PUT", jd)),
 
@@ -65,6 +70,22 @@ export const api = {
       body: form,
     });
   },
+  profileFromObsidian: (sessionId: string, vaultPath: string, maxFiles = 20) =>
+    req<UserSkillProfile & { read_files: string[] }>(
+      `/api/sessions/${sessionId}/profile/obsidian`,
+      json("POST", { vault_path: vaultPath, max_files: maxFiles }),
+    ),
+
+  // 待澄清对话
+  clarifyNext: (sessionId: string) =>
+    req<{ question: string | null; remaining: number; done: boolean }>(
+      `/api/sessions/${sessionId}/profile/clarify/next`,
+    ),
+  clarifyAnswer: (sessionId: string, question: string, answer: string) =>
+    req<{ profile: UserSkillProfile; question: string | null; remaining: number; done: boolean }>(
+      `/api/sessions/${sessionId}/profile/clarify/answer`,
+      json("POST", { question, answer }),
+    ),
 
   // 访谈
   nextQuestion: (sessionId: string) =>

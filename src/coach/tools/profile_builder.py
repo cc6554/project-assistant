@@ -24,6 +24,7 @@ _SOURCE_LABEL = {
     "work_log": "工作日志",
     "self_report": "技能自填",
     "chat": "访谈对话",
+    "obsidian": "Obsidian 笔记",
 }
 
 PROFILE_SYSTEM_PROMPT = """你是用户技能档案分析引擎。根据用户提供的材料（简历、工作日志或技能自填）抽取技能信息。
