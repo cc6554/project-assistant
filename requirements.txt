@@ -1,0 +1,15 @@
+# 校招雷达 sidecar 运行依赖（跨平台：Windows / Linux / macOS）
+# Ubuntu 上：pip install -r requirements.txt
+# 版本为宽松下限，各平台装最新兼容版即可（Python 3.11+）
+
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pydantic>=2.6
+PyYAML>=6.0
+python-dotenv>=1.0
+openai>=1.30
+anthropic>=0.40
+httpx>=0.27
+pypdf>=4.0
+numpy>=1.26
