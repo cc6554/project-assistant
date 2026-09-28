@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────
+# 提供商注册表
+# 任何「OpenAI 兼容」端点（/v1/chat/completions）只需在这里加一段，
+# 核心代码零改动。api_key_env 指向 .env 中的环境变量名。
+# ─────────────────────────────────────────────────────────────
+providers:
+  deepseek:
+    api_mode: chat_completions
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+
+  kimi:
+    api_mode: chat_completions
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: KIMI_API_KEY
+
+  zhipu:
+    api_mode: chat_completions
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key_env: ZHIPU_API_KEY
+
+  doubao:
+    api_mode: chat_completions
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: ARK_API_KEY
+
+  openai:
+    api_mode: chat_completions
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+
+  anthropic:
+    api_mode: anthropic_messages
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+
+  # 本地模型无需 key；api_key_env 留空即可
+  ollama-local:
+    api_mode: chat_completions
+    base_url: http://localhost:11434/v1
+    api_key_env: null
+    timeout: 180
+
+  # 任意第三方 OpenAI 兼容网关示例：
+  # my-gateway:
+  #   api_mode: chat_completions
+  #   base_url: https://gateway.example.com/v1
+  #   api_key_env: MY_GATEWAY_KEY
+  #   extra_body:          # 可选：合并进每个请求体的厂商专有字段
+  #     enable_thinking: true
+
+# ─────────────────────────────────────────────────────────────
+# 环节级路由：每个任务一条 fallback 链，自上而下尝试，
+# 遇到 401/403/408/409/429/5xx、超时、连接错误自动切下一家。
+# 可在不同环节挂不同厂商的模型（识图用便宜视觉模型，规划用推理模型）。
+# ─────────────────────────────────────────────────────────────
+tasks:
+  default:
+    - { provider: deepseek, model: deepseek-flash }
+    - { provider: kimi, model: moonshot-v1-8k }
+
+  vision:      # 岗位截图 OCR + 结构化
+    - { provider: doubao, model: doubao-seed-1-6-vision-250815 }
+    - { provider: openai, model: gpt-4o-mini }
+
+  parsing:     # 简历 / 工作日志 → 技能档案
+    - { provider: deepseek, model: deepseek-flash }
+
+  interview:   # 多轮技能访谈
+    - { provider: deepseek, model: deepseek-flash }
+
+  planning:    # 技能差距分析 + 学习计划
+    - { provider: deepseek, model: deepseek-v4-pro }
+    - { provider: anthropic, model: claude-sonnet-4-5-20250929 }

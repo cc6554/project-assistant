@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "默认能力：窗口核心权限（前端只与本地 sidecar 通信）",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
