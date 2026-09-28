@@ -30,6 +30,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
   const [clarifyA, setClarifyA] = useState("");
   const [clarifyBusy, setClarifyBusy] = useState(false);
   const docRef = useRef<HTMLInputElement>(null);
+  const clarifyCardRef = useRef<HTMLDivElement>(null);
 
   const profile = state?.profile ?? null;
 
@@ -40,21 +41,34 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     });
   };
 
-  /** 资料解析并入档案后：若有待澄清，自动进入对话式澄清。 */
-  const openClarifyIfAny = async (p: UserSkillProfile) => {
-    if (!p.open_questions.length) return;
-    setClarifyOpen(true);
+  /** 拉取下一条待澄清问题。 */
+  const loadClarifyNext = async () => {
     setClarifyBusy(true);
     try {
       const res = await api.clarifyNext(sessionId);
       setClarifyQ(res.question);
       setClarifyA("");
-      if (res.done) setClarifyOpen(false);
+      if (res.done) {
+        setClarifyOpen(false);
+        setMsg({ kind: "info", text: "待澄清内容已全部确认 ✅ 技能档案更新完成" });
+      }
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
       setClarifyBusy(false);
     }
+  };
+
+  /** 打开待澄清弹窗并自动加载下一条问题。 */
+  const openClarify = () => {
+    setClarifyOpen(true);
+    void loadClarifyNext();
+  };
+
+  /** 资料解析并入档案后：若有待澄清，自动进入对话式澄清。 */
+  const openClarifyIfAny = async (p: UserSkillProfile) => {
+    if (!p.open_questions.length) return;
+    openClarify();
   };
 
   const run = async (fn: () => Promise<unknown>, okText: string) => {
@@ -151,56 +165,65 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
 
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
 
-      {/* 待澄清对话：资料解析后自动弹出，逐个问题交互 */}
+      {/* 待澄清对话：弹窗形式，就地弹出，不滚动页面 */}
       {clarifyOpen && (
-        <div className="card" style={{ borderColor: "var(--accent)" }}>
-          <h3>有几个问题需要当面确认</h3>
-          {clarifyBusy ? (
-            <p>
-              <span className="spinner" /> 读取下一条问题…
-            </p>
-          ) : clarifyQ ? (
-            <div>
-              <div className="chat-line">
-                <div className="q">Q：{clarifyQ}</div>
-              </div>
-              <VoiceField
-                placeholder="直接回答：做过什么、做到什么程度、有没有项目能证明…"
-                value={clarifyA}
-                onChange={setClarifyA}
-                minHeight={80}
-              />
-              <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
-                <button className="btn" onClick={submitClarify} disabled={clarifyBusy || !clarifyA.trim()}>
-                  回答并继续
-                </button>
-                <button
-                  className="btn secondary"
-                  onClick={async () => {
-                    setClarifyBusy(true);
-                    try {
-                      const res = await api.clarifyAnswer(sessionId, clarifyQ, "这个问题我暂时没有更多信息。");
-                      updateProfile(res.profile);
-                      setClarifyQ(res.question);
-                      setClarifyA("");
-                      if (res.done) {
-                        setClarifyOpen(false);
-                        setMsg({ kind: "info", text: "待澄清内容已处理 ✅" });
+        <div className="modal-overlay">
+          <div ref={clarifyCardRef} className="modal">
+            <button
+              className="modal-close"
+              onClick={() => setClarifyOpen(false)}
+              title="关闭"
+            >
+              ✕
+            </button>
+            <h3 style={{ margin: "0 0 12px" }}>有几个问题需要当面确认</h3>
+            {clarifyBusy ? (
+              <p>
+                <span className="spinner" /> 读取下一条问题…
+              </p>
+            ) : clarifyQ ? (
+              <div>
+                <div className="chat-line">
+                  <div className="q">Q：{clarifyQ}</div>
+                </div>
+                <VoiceField
+                  placeholder="直接回答：做过什么、做到什么程度、有没有项目能证明…"
+                  value={clarifyA}
+                  onChange={setClarifyA}
+                  minHeight={80}
+                />
+                <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+                  <button className="btn" onClick={submitClarify} disabled={clarifyBusy || !clarifyA.trim()}>
+                    回答并继续
+                  </button>
+                  <button
+                    className="btn secondary"
+                    onClick={async () => {
+                      setClarifyBusy(true);
+                      try {
+                        const res = await api.clarifyAnswer(sessionId, clarifyQ, "这个问题我暂时没有更多信息。");
+                        updateProfile(res.profile);
+                        setClarifyQ(res.question);
+                        setClarifyA("");
+                        if (res.done) {
+                          setClarifyOpen(false);
+                          setMsg({ kind: "info", text: "待澄清内容已处理 ✅" });
+                        }
+                      } catch (e) {
+                        setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
+                      } finally {
+                        setClarifyBusy(false);
                       }
-                    } catch (e) {
-                      setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
-                    } finally {
-                      setClarifyBusy(false);
-                    }
-                  }}
-                >
-                  跳过这个
-                </button>
+                    }}
+                  >
+                    跳过这个
+                  </button>
+                </div>
               </div>
-            </div>
-          ) : (
-            <p>没有待澄清问题了。</p>
-          )}
+            ) : (
+              <p>没有待澄清问题了。</p>
+            )}
+          </div>
         </div>
       )}
 
@@ -347,7 +370,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
               <button
                 className="btn secondary"
                 style={{ marginLeft: 10, padding: "4px 12px" }}
-                onClick={() => setClarifyOpen(true)}
+                onClick={openClarify}
               >
                 现在回答
               </button>
