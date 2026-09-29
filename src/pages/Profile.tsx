@@ -24,11 +24,11 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
   const [question, setQuestion] = useState<string | null>(null);
   const [answer, setAnswer] = useState("");
   const [asking, setAsking] = useState(false);
-  // 待澄清对话
+  // 待澄清对话（自由对话式）
   const [clarifyOpen, setClarifyOpen] = useState(false);
-  const [clarifyQ, setClarifyQ] = useState<string | null>(null);
   const [clarifyA, setClarifyA] = useState("");
   const [clarifyBusy, setClarifyBusy] = useState(false);
+  const [clarifyMsgs, setClarifyMsgs] = useState<{ role: "assistant" | "user"; content: string }[]>([]);
   const docRef = useRef<HTMLInputElement>(null);
   const clarifyCardRef = useRef<HTMLDivElement>(null);
 
@@ -41,17 +41,22 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     });
   };
 
-  /** 拉取下一条待澄清问题。 */
+  /** 拉取下一条待澄清问题，并作为消息追加进对话（去重）。 */
   const loadClarifyNext = async () => {
     setClarifyBusy(true);
     try {
       const res = await api.clarifyNext(sessionId);
-      setClarifyQ(res.question);
-      setClarifyA("");
       if (res.done) {
         setClarifyOpen(false);
         setMsg({ kind: "info", text: "待澄清内容已全部确认 ✅ 技能档案更新完成" });
+        return;
       }
+      setClarifyA("");
+      setClarifyMsgs((msgs) => {
+        const q = `Q：${res.question}`;
+        if (msgs.some((m) => m.content === q)) return msgs;
+        return [...msgs, { role: "assistant", content: q }];
+      });
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
@@ -59,8 +64,10 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     }
   };
 
-  /** 打开待澄清弹窗并自动加载下一条问题。 */
+  /** 打开待澄清弹窗并自动加载第一条问题。 */
   const openClarify = () => {
+    setClarifyMsgs([]);
+    setClarifyA("");
     setClarifyOpen(true);
     void loadClarifyNext();
   };
@@ -112,18 +119,29 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     ).then(() => setQuestion(null));
   };
 
-  const submitClarify = async () => {
-    if (!clarifyQ || !clarifyA.trim()) return;
+  /** 自由对话发送：回答当前问题 / 追问"什么意思" / 跳过 / 补充背景，交给后端判定。 */
+  const sendClarify = async (text?: string) => {
+    const msg = (text ?? clarifyA).trim();
+    if (!msg) return;
+    const history = clarifyMsgs;
+    const userMsg: { role: "user"; content: string } = { role: "user", content: msg };
     setClarifyBusy(true);
-    setMsg(null);
+    setClarifyMsgs((msgs) => [...msgs, userMsg]);
+    setClarifyA("");
     try {
-      const res = await api.clarifyAnswer(sessionId, clarifyQ, clarifyA);
-      updateProfile(res.profile);
-      setClarifyQ(res.question);
-      setClarifyA("");
+      const res = await api.clarifyChat(sessionId, msg, history);
+      if (res.profile) updateProfile(res.profile);
+      const next = [...history, userMsg];
+      if (res.reply && res.reply.trim()) next.push({ role: "assistant", content: res.reply });
+      if (res.question) {
+        const q = `Q：${res.question}`;
+        if (!next.some((m) => m.content === q)) next.push({ role: "assistant", content: q });
+      }
       if (res.done) {
         setClarifyOpen(false);
         setMsg({ kind: "info", text: "待澄清内容已全部确认 ✅ 技能档案更新完成" });
+      } else {
+        setClarifyMsgs(next);
       }
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
@@ -165,7 +183,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
 
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
 
-      {/* 待澄清对话：弹窗形式，就地弹出，不滚动页面 */}
+      {/* 待澄清对话：自由对话弹窗（可回答，也可随时追问"什么意思"） */}
       {clarifyOpen && (
         <div className="modal-overlay">
           <div ref={clarifyCardRef} className="modal">
@@ -176,53 +194,37 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
             >
               ✕
             </button>
-            <h3 style={{ margin: "0 0 12px" }}>有几个问题需要当面确认</h3>
-            {clarifyBusy ? (
-              <p>
-                <span className="spinner" /> 读取下一条问题…
-              </p>
-            ) : clarifyQ ? (
-              <div>
-                <div className="chat-line">
-                  <div className="q">Q：{clarifyQ}</div>
+            <h3 style={{ margin: "0 0 12px" }}>待澄清对话</h3>
+            <div className="clarify-chat">
+              {clarifyMsgs.map((m, i) => (
+                <div key={i} className={`clarify-msg ${m.role}`}>
+                  {m.content}
                 </div>
-                <VoiceField
-                  placeholder="直接回答：做过什么、做到什么程度、有没有项目能证明…"
-                  value={clarifyA}
-                  onChange={setClarifyA}
-                  minHeight={80}
-                />
-                <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
-                  <button className="btn" onClick={submitClarify} disabled={clarifyBusy || !clarifyA.trim()}>
-                    回答并继续
-                  </button>
-                  <button
-                    className="btn secondary"
-                    onClick={async () => {
-                      setClarifyBusy(true);
-                      try {
-                        const res = await api.clarifyAnswer(sessionId, clarifyQ, "这个问题我暂时没有更多信息。");
-                        updateProfile(res.profile);
-                        setClarifyQ(res.question);
-                        setClarifyA("");
-                        if (res.done) {
-                          setClarifyOpen(false);
-                          setMsg({ kind: "info", text: "待澄清内容已处理 ✅" });
-                        }
-                      } catch (e) {
-                        setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
-                      } finally {
-                        setClarifyBusy(false);
-                      }
-                    }}
-                  >
-                    跳过这个
-                  </button>
+              ))}
+              {clarifyBusy && (
+                <div className="clarify-msg assistant">
+                  <span className="spinner" /> 思考中…
                 </div>
-              </div>
-            ) : (
-              <p>没有待澄清问题了。</p>
-            )}
+              )}
+            </div>
+            <VoiceField
+              placeholder="直接回答；也可以随时问：这个问题什么意思？"
+              value={clarifyA}
+              onChange={setClarifyA}
+              minHeight={60}
+            />
+            <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+              <button className="btn" onClick={() => sendClarify()} disabled={clarifyBusy || !clarifyA.trim()}>
+                发送
+              </button>
+              <button
+                className="btn secondary"
+                onClick={() => sendClarify("跳过")}
+                disabled={clarifyBusy}
+              >
+                跳过这个问题
+              </button>
+            </div>
           </div>
         </div>
       )}

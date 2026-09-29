@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 from ..core.llm.router import ModelRouter
@@ -96,3 +98,63 @@ def apply_interview_answer(
         q for q in updated.open_questions if q.strip() != question.strip()
     ]
     return updated
+
+
+# ── 待澄清自由对话（类 Codex 的灵活一问一答）──────────────────────
+
+CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自由对话完善用户的技能档案（类似 Codex 的交互：用户可以随时追问、解释、跑题，你再拉回来）。
+
+你刚问了用户一个待澄清问题，用户回复了一条消息。请判断用户意图：
+
+当前待澄清问题：{question}
+当前技能档案（摘要，供判断答非所问的程度）：
+{profile}
+历史对话（最近若干条）：
+{history}
+用户这条消息：{message}
+
+意图判定规则：
+- answer：用户实质回答了当前问题（给出事实、经验、程度，哪怕不完整）。reply 简短确认（如「收到，已记入档案」），不要重复问题；
+- explain：用户对问题本身有疑问、请求解释或举例（如「什么意思」「举个例子」「怎么答」）。reply 要通俗解释这个问题在问什么、大概怎么答，并鼓励ta接着回答，**不消耗问题**；
+- skip：用户明确表示跳过/不知道/不想答。reply 简短安抚并提示可以随时补充；
+- other：用户说了与当前问题不直接相关的内容（补充背景、闲聊、澄清前文）。reply 回应它，然后温和地把话题拉回当前问题，**不消耗问题**；
+- 如果消息同时包含回答和追问，按 answer 处理，并在 reply 里顺带解答其疑问。
+严格通过 emit_result 工具输出。"""
+
+
+class ClarifyTurn(BaseModel):
+    intent: Literal["answer", "explain", "skip", "other"] = "answer"
+    reply: str = ""
+
+
+def clarify_turn(
+    router: ModelRouter,
+    profile: UserSkillProfile,
+    current_question: str,
+    message: str,
+    history: list[dict],
+    *,
+    task: str = "interview",
+) -> ClarifyTurn:
+    """对用户一条自由消息做意图判定（回答 / 追问 / 跳过 / 其他）。"""
+    history_text = "\n".join(
+        f"{h.get('role', '?')}: {h.get('content', '')}" for h in history[-8:]
+    ) or "（暂无）"
+    result = router.complete_json(
+        task,
+        [
+            Message(
+                role="user",
+                content=CLARIFY_TURN_PROMPT.format(
+                    question=current_question,
+                    profile=profile.model_dump_json(),
+                    history=history_text,
+                    message=message,
+                ),
+            )
+        ],
+        ClarifyTurn.model_json_schema(),
+        tool_name="emit_result",
+        tool_description="提交意图判定与回复",
+    )
+    return ClarifyTurn.model_validate(result)

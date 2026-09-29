@@ -91,6 +91,18 @@ export const api = {
       `/api/sessions/${sessionId}/profile/clarify/answer`,
       json("POST", { question, answer }),
     ),
+  clarifyChat: (sessionId: string, message: string, history: { role: string; content: string }[]) =>
+    req<{
+      kind: string;
+      reply: string;
+      question: string | null;
+      remaining: number;
+      done: boolean;
+      profile?: UserSkillProfile | null;
+    }>(
+      `/api/sessions/${sessionId}/profile/clarify/chat`,
+      json("POST", { message, history }),
+    ),
 
   // 访谈
   nextQuestion: (sessionId: string) =>
