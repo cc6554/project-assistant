@@ -29,6 +29,10 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
   const [clarifyA, setClarifyA] = useState("");
   const [clarifyBusy, setClarifyBusy] = useState(false);
   const [clarifyMsgs, setClarifyMsgs] = useState<{ role: "assistant" | "user"; content: string }[]>([]);
+  // 待澄清提纲：系统生成的问题清单给 AI 作参考，AI 用自然对话问出，回复是主力
+  const [clarifyOutline, setClarifyOutline] = useState<string[]>([]);
+  const [clarifyOutlineOpen, setClarifyOutlineOpen] = useState(true);
+  const [clarifyRemaining, setClarifyRemaining] = useState(0);
   const docRef = useRef<HTMLInputElement>(null);
   const clarifyCardRef = useRef<HTMLDivElement>(null);
 
@@ -41,22 +45,21 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     });
   };
 
-  /** 拉取下一条待澄清问题，并作为消息追加进对话（去重）。 */
-  const loadClarifyNext = async () => {
+  /** 打开待澄清弹窗：加载提纲 + AI 自然开场（把第一条问题口语化问出）。 */
+  const loadClarifyStart = async () => {
     setClarifyBusy(true);
     try {
-      const res = await api.clarifyNext(sessionId);
+      const res = await api.clarifyStart(sessionId);
       if (res.done) {
         setClarifyOpen(false);
         setMsg({ kind: "info", text: "待澄清内容已全部确认 ✅ 技能档案更新完成" });
         return;
       }
+      setClarifyOutline(res.outline);
+      setClarifyOutlineOpen(true);
+      setClarifyRemaining(res.remaining);
       setClarifyA("");
-      setClarifyMsgs((msgs) => {
-        const q = `Q：${res.question}`;
-        if (msgs.some((m) => m.content === q)) return msgs;
-        return [...msgs, { role: "assistant", content: q }];
-      });
+      setClarifyMsgs(res.opening ? [{ role: "assistant", content: res.opening }] : []);
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
@@ -64,12 +67,13 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     }
   };
 
-  /** 打开待澄清弹窗并自动加载第一条问题。 */
+  /** 打开待澄清弹窗并自动开场。 */
   const openClarify = () => {
     setClarifyMsgs([]);
+    setClarifyOutline([]);
     setClarifyA("");
     setClarifyOpen(true);
-    void loadClarifyNext();
+    void loadClarifyStart();
   };
 
   /** 资料解析并入档案后：若有待澄清，自动进入对话式澄清。 */
@@ -133,10 +137,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
       if (res.profile) updateProfile(res.profile);
       const next = [...history, userMsg];
       if (res.reply && res.reply.trim()) next.push({ role: "assistant", content: res.reply });
-      if (res.question) {
-        const q = `Q：${res.question}`;
-        if (!next.some((m) => m.content === q)) next.push({ role: "assistant", content: q });
-      }
+      setClarifyRemaining(res.remaining ?? 0);
       if (res.done) {
         setClarifyOpen(false);
         setMsg({ kind: "info", text: "待澄清内容已全部确认 ✅ 技能档案更新完成" });
@@ -194,7 +195,32 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
             >
               ✕
             </button>
-            <h3 style={{ margin: "0 0 12px" }}>待澄清对话</h3>
+            <h3 style={{ margin: "0 0 4px" }}>
+              待澄清对话
+              {clarifyRemaining > 0 && (
+                <span style={{ fontSize: 12, color: "var(--muted)", marginLeft: 8 }}>
+                  还剩 {clarifyRemaining} 条
+                </span>
+              )}
+            </h3>
+            {clarifyOutline.length > 0 && (
+              <div
+                className="card"
+                style={{ margin: "0 0 10px", padding: "8px 12px", cursor: "pointer" }}
+                onClick={() => setClarifyOutlineOpen((v) => !v)}
+              >
+                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: clarifyOutlineOpen ? 6 : 0 }}>
+                  待澄清提纲 {clarifyOutlineOpen ? "▾" : "▸"}
+                </div>
+                {clarifyOutlineOpen && (
+                  <ol style={{ margin: 0, paddingLeft: 20, fontSize: 12, color: "var(--muted)" }}>
+                    {clarifyOutline.map((q, i) => (
+                      <li key={i}>{q}</li>
+                    ))}
+                  </ol>
+                )}
+              </div>
+            )}
             <div className="clarify-chat">
               {clarifyMsgs.map((m, i) => (
                 <div key={i} className={`clarify-msg ${m.role}`}>
@@ -222,7 +248,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
                 onClick={() => sendClarify("跳过")}
                 disabled={clarifyBusy}
               >
-                跳过这个问题
+                跳过当前问题
               </button>
             </div>
           </div>

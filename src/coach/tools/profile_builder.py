@@ -187,7 +187,7 @@ def merge_profile_delta(
 
     questions: list[str] = []
     for q in [*profile.open_questions, *delta.open_questions]:
-        if any(question_similar(q, existing) >= 0.65 for existing in questions):
+        if any(question_similar(q, existing) >= 0.6 for existing in questions):
             continue
         questions.append(q)
 

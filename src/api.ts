@@ -86,6 +86,10 @@ export const api = {
     ),
 
   // 待澄清对话
+  clarifyStart: (sessionId: string) =>
+    req<{ outline: string[]; opening: string; remaining: number; done: boolean }>(
+      `/api/sessions/${sessionId}/profile/clarify/start`,
+    ),
   clarifyNext: (sessionId: string) =>
     req<{ question: string | null; remaining: number; done: boolean }>(
       `/api/sessions/${sessionId}/profile/clarify/next`,
@@ -99,7 +103,6 @@ export const api = {
     req<{
       kind: string;
       reply: string;
-      question: string | null;
       remaining: number;
       done: boolean;
       profile?: UserSkillProfile | null;

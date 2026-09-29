@@ -99,48 +99,56 @@ def apply_interview_answer(
     updated.open_questions = [
         q
         for q in updated.open_questions
-        if not (q.strip() == question.strip() or question_similar(q, question) >= 0.65)
+        if not (q.strip() == question.strip() or question_similar(q, question) >= 0.6)
     ]
     return updated
 
 
 # ── 待澄清自由对话（类 Codex 的灵活一问一答）──────────────────────
 
-CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自由对话完善用户的技能档案（类似 Codex 的交互：用户可以随时追问、解释、跑题，你再拉回来）。
+CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自然对话完善用户的技能档案（类似 Codex 的交互：用户可以随时追问、解释、跑题，你再自然拉回来）。
 
-你刚问了用户一个待澄清问题，用户回复了一条消息。请判断用户意图：
+你手头有一份「待澄清问题清单」作为提纲（按顺序排列）。你的任务是把这份清单**融进自然的对话**里逐条推进：
+- 你的回复（reply）是主力：口语化、有温度，先简短回应用户刚说的内容，再顺势自然地问出清单里的问题，不要生硬念题单；
+- 用户随时可以追问"什么意思"、跳过、补充背景，你要自然应对；
+- 已经核对完的话题不要再重复问。
 
-当前待澄清问题：{question}
+待澄清问题清单（提纲，按顺序）：
+{outline}
 当前技能档案（摘要，供判断答非所问的程度）：
 {profile}
 历史对话（最近若干条）：
 {history}
 用户这条消息：{message}
 
-意图判定规则：
-- answer：用户实质回答了当前问题（给出事实、经验、程度，哪怕不完整）。reply 简短确认（如「收到，已记入档案」），不要重复问题；
-- explain：用户对问题本身有疑问、请求解释或举例（如「什么意思」「举个例子」「怎么答」）。reply 要通俗解释这个问题在问什么、大概怎么答，并鼓励ta接着回答，**不消耗问题**；
-- skip：用户明确表示跳过/不知道/不想答。reply 简短安抚并提示可以随时补充；
-- other：用户说了与当前问题不直接相关的内容（补充背景、闲聊、澄清前文）。reply 回应它，然后温和地把话题拉回当前问题，**不消耗问题**；
-- 如果消息同时包含回答和追问，按 answer 处理，并在 reply 里顺带解答其疑问。
+输出判定：
+- intent：
+  * answer：用户实质回答了清单里某一条（给出事实、经验、程度，哪怕不完整）
+  * explain：用户对问题本身有疑问、请求解释或举例（如「什么意思」「举个例子」「怎么答」）
+  * skip：用户明确表示跳过/不知道/不想答
+  * other：用户补充背景、闲聊或澄清前文
+- target_index：intent 为 answer/skip 时，指出用户回应的是清单里的第几条（从 0 开始；对应不上时填 -1，默认第一条）；其他意图填 -1
+- reply：你的完整回复（主力）。intent=answer 且清单还有下一条时，确认已记录并自然地问出下一条（≤3 句）；清单已空时表示核对完成；explain/other 时回应并温和拉回话题；skip 时简短安抚。
 严格通过 emit_result 工具输出。"""
 
 
 class ClarifyTurn(BaseModel):
     intent: Literal["answer", "explain", "skip", "other"] = "answer"
     reply: str = ""
+    target_index: int = -1
 
 
 def clarify_turn(
     router: ModelRouter,
     profile: UserSkillProfile,
-    current_question: str,
+    outline: list[str],
     message: str,
     history: list[dict],
     *,
     task: str = "interview",
 ) -> ClarifyTurn:
-    """对用户一条自由消息做意图判定（回答 / 追问 / 跳过 / 其他）。"""
+    """对用户一条自由消息做意图判定；提纲（open_questions）传给 LLM 作参考。"""
+    outline_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(outline)) or "（清单为空）"
     history_text = "\n".join(
         f"{h.get('role', '?')}: {h.get('content', '')}" for h in history[-8:]
     ) or "（暂无）"
@@ -150,7 +158,7 @@ def clarify_turn(
             Message(
                 role="user",
                 content=CLARIFY_TURN_PROMPT.format(
-                    question=current_question,
+                    outline=outline_text,
                     profile=profile.model_dump_json(),
                     history=history_text,
                     message=message,
@@ -162,3 +170,38 @@ def clarify_turn(
         tool_description="提交意图判定与回复",
     )
     return ClarifyTurn.model_validate(result)
+
+
+CLARIFY_OPENING_PROMPT = """你是技术求职教练，正在通过自然对话完善用户的技能档案。下面是待澄清问题清单（提纲，按顺序）：
+{outline}
+请输出一句自然的开场白（口语化、有温度，1~2 句），把第一条问题融进对话里自然地提出来，不要像念题单，不要编号。
+严格通过 emit_result 工具输出。"""
+
+
+class _Opening(BaseModel):
+    opening: str
+
+
+def clarify_opening(
+    router: ModelRouter,
+    outline: list[str],
+    *,
+    task: str = "interview",
+) -> str:
+    """生成自然开场白，把提纲第一条问题口语化地问出来。"""
+    if not outline:
+        return "没有待澄清问题了。"
+    outline_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(outline))
+    result = router.complete_json(
+        task,
+        [
+            Message(
+                role="user",
+                content=CLARIFY_OPENING_PROMPT.format(outline=outline_text),
+            )
+        ],
+        _Opening.model_json_schema(),
+        tool_name="emit_result",
+        tool_description="提交开场白",
+    )
+    return _Opening.model_validate(result).opening.strip() or f"先看第一条：{outline[0]}"

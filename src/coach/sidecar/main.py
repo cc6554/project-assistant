@@ -560,6 +560,33 @@ class ClarifyChatInput(BaseModel):
     history: list[dict] = []
 
 
+@app.get("/api/sessions/{session_id}/profile/clarify/start")
+def clarify_start(session_id: str) -> dict:
+    """打开澄清对话：返回完整提纲 + AI 自然开场白（把第一条问题口语化问出）。"""
+    state = _session(session_id)
+    if state.profile is None:
+        raise HTTPException(status_code=400, detail="请先建立技能档案")
+    questions = state.profile.open_questions
+    if not questions:
+        return {"outline": [], "opening": "没有待澄清问题了。", "remaining": 0, "done": True}
+    # 打开时自动清理提纲里的同主题重复变体（保留首次出现），存量污染也能自愈
+    deduped: list[str] = []
+    for q in questions:
+        if any(profile_builder.question_similar(q, e) >= 0.6 for e in deduped):
+            continue
+        deduped.append(q)
+    if len(deduped) != len(questions):
+        state.profile.open_questions = deduped
+        store.save(state)
+        questions = deduped
+    router = get_router()
+    try:
+        opening = interviewer.clarify_opening(router, questions)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"澄清开场失败：{exc}") from exc
+    return {"outline": questions, "opening": opening, "remaining": len(questions), "done": False}
+
+
 @app.post("/api/sessions/{session_id}/profile/clarify/chat")
 def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
     """自由对话式待澄清：用户可回答当前问题，也可随时追问「什么意思」、
@@ -580,35 +607,36 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         }
 
     router = get_router()
-    current = questions[0]
     try:
         decision = interviewer.clarify_turn(
-            router, profile, current, body.message, body.history
+            router, profile, questions, body.message, body.history
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"澄清对话失败：{exc}") from exc
 
     if decision.intent in ("answer", "skip"):
+        # 用户回应的目标问题：target_index 有效则按序号，否则默认第一条
+        idx = decision.target_index if 0 <= decision.target_index < len(questions) else 0
+        target = questions[idx]
         if decision.intent == "answer":
             try:
                 profile = interviewer.apply_interview_answer(
-                    router, profile, current, body.message
+                    router, profile, target, body.message
                 )
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=502, detail=f"答案并入档案失败：{exc}") from exc
         else:
-            # 明确跳过：移除当前问题
+            # 明确跳过：移除目标问题
             profile.open_questions = [
-                q for q in profile.open_questions if q.strip() != current.strip()
+                q for q in profile.open_questions if q.strip() != target.strip()
             ]
         state.profile = profile
-        state.interview_history.append([current, body.message])
+        state.interview_history.append([target, body.message])
         store.save(state)
         remaining = profile.open_questions
         return {
             "kind": decision.intent,
             "reply": decision.reply,
-            "question": remaining[0] if remaining else None,
             "remaining": len(remaining),
             "done": not remaining,
             "profile": profile.model_dump(exclude_none=True),
@@ -618,7 +646,6 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
     return {
         "kind": decision.intent,
         "reply": decision.reply,
-        "question": current,
         "remaining": len(questions),
         "done": False,
         "profile": None,
