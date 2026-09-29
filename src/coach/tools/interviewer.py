@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from ..core.llm.router import ModelRouter
 from ..core.schema import Message
 from ..domain.schemas import UserSkillProfile
-from .profile_builder import build_profile_from_text
+from .profile_builder import build_profile_from_text, question_similar
 
 NEXT_QUESTION_PROMPT = """你是技术求职教练，正在通过访谈补全用户的技能档案。
 
@@ -34,7 +34,9 @@ APPLY_ANSWER_HINT = """以下是技能访谈中的一轮对话。请从用户回
 - source 一律视为 chat（系统会强制覆盖）；
 - 回答中体现的真实项目细节可以提高 confidence；
 - 如果该问题已被回答清楚，从 open_questions 中移除它；回答引出新的疑问才加入 open_questions；
-- 用户明确表示不了解的技能不要加入档案。"""
+- 用户明确表示不了解的技能不要加入档案；
+- 用户已回答、明确关闭或要求剔除的话题（如"不是我干的，剔除"），无论以什么措辞出现都不得再写入 open_questions；
+- 不要用同义改写重新生成与已答问题同主题的问题，除非用户提供了此前完全没有的新信息维度。"""
 
 
 class _NextQuestion(BaseModel):
@@ -93,9 +95,11 @@ def apply_interview_answer(
         existing=profile,
         task=task,
     )
-    # 确定性后处理：本轮问题若仍被模型保留，直接移除（已问过）
+    # 确定性后处理：移除与已答问题相同或高度相似的变体（LLM 常换措辞重写同题）
     updated.open_questions = [
-        q for q in updated.open_questions if q.strip() != question.strip()
+        q
+        for q in updated.open_questions
+        if not (q.strip() == question.strip() or question_similar(q, question) >= 0.65)
     ]
     return updated
 

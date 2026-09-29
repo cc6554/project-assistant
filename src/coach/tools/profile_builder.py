@@ -6,7 +6,9 @@ LLM 只负责从单份材料里"抽取增量"；跨材料的合并是确定性�
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -27,6 +29,32 @@ _SOURCE_LABEL = {
     "obsidian": "Obsidian 笔记",
     "local_path": "本地路径文件",
 }
+
+
+def question_similar(a: str, b: str) -> float:
+    """问题文本相似度（0~1），用于识别 LLM 对同一问题的措辞变体。
+
+    完全相等返回 1.0；先算字符级 SequenceMatcher，再以关键词交集兜底，
+    覆盖「改写句式但核心词相同」的情况。
+    """
+    if not a or not b:
+        return 0.0
+    norm = lambda s: "".join(s.split())
+    a_norm, b_norm = norm(a), norm(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm == b_norm:
+        return 1.0
+    if len(a_norm) <= 6 or len(b_norm) <= 6:
+        # 短问题（<=6 字）一两个字的差异占比过高，只有完全相等才算重复
+        return 0.0
+    ratio = SequenceMatcher(None, a_norm, b_norm).ratio()
+    tok_a = set(re.findall(r"[\w\u4e00-\u9fff]+", a_norm))
+    tok_b = set(re.findall(r"[\w\u4e00-\u9fff]+", b_norm))
+    if not tok_a or not tok_b:
+        return ratio
+    inter = len(tok_a & tok_b) / min(len(tok_a), len(tok_b))
+    return max(ratio, inter)
 
 PROFILE_SYSTEM_PROMPT = """你是用户技能档案分析引擎。根据用户提供的材料（简历、工作日志或技能自填）抽取技能信息。
 
@@ -157,7 +185,11 @@ def merge_profile_delta(
             evidence=merged_evidence,
         )
 
-    questions = list(dict.fromkeys([*profile.open_questions, *delta.open_questions]))
+    questions: list[str] = []
+    for q in [*profile.open_questions, *delta.open_questions]:
+        if any(question_similar(q, existing) >= 0.65 for existing in questions):
+            continue
+        questions.append(q)
 
     return UserSkillProfile(
         user_id=profile.user_id,

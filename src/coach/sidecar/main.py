@@ -163,9 +163,22 @@ def list_sessions() -> list[dict]:
     return store.list_sessions()
 
 
+class CreateSessionInput(BaseModel):
+    source_session_id: str | None = None
+
+
 @app.post("/api/sessions")
-def create_session() -> dict:
+def create_session(body: CreateSessionInput | None = None) -> dict:
+    """新建岗位会话；可选从已有会话复制技能档案（profile 深拷贝）。"""
     state = store.create()
+    if body and body.source_session_id:
+        try:
+            src = _session(body.source_session_id)
+        except HTTPException:
+            raise HTTPException(status_code=404, detail="源会话不存在")
+        if src.profile is not None:
+            state.profile = src.profile.model_copy(deep=True)
+            store.save(state)
     return {"id": state.session_id}
 
 

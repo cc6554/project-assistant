@@ -25,6 +25,9 @@ export default function App() {
   const [sidecarOk, setSidecarOk] = useState(false);
   const [checking, setChecking] = useState(true);
   const [agentPrefill, setAgentPrefill] = useState<string>("");
+  // 新建会话弹窗：可选从已有会话复制技能档案
+  const [newOpen, setNewOpen] = useState(false);
+  const [copySource, setCopySource] = useState<string>("");
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     try {
       return localStorage.getItem("jr-theme") === "light" ? "light" : "dark";
@@ -105,8 +108,9 @@ export default function App() {
       }
     });
 
-  const newSession = async () => {
-    const res = await api.createSession();
+  const newSession = async (sourceSessionId?: string) => {
+    setNewOpen(false);
+    const res = await api.createSession(sourceSessionId);
     setSessionId(res.id);
     setState(null);
     await refreshSessions(res.id);
@@ -153,7 +157,7 @@ export default function App() {
             </button>
           </div>
         ))}
-        <button className="btn-new" onClick={newSession}>
+        <button className="btn-new" onClick={() => { setCopySource(""); setNewOpen(true); }}>
           ＋ 新建会话
         </button>
         <div className="theme-switch">
@@ -186,7 +190,7 @@ export default function App() {
           <div className="card">
             <h3>开始之前</h3>
             <p className="page-sub">先新建一个会话，然后按 ①→②→③ 的顺序操作：上传岗位截图 → 建立技能档案 → 生成计划。</p>
-            <button className="btn" onClick={newSession}>
+            <button className="btn" onClick={() => { setCopySource(""); setNewOpen(true); }}>
               ＋ 新建会话
             </button>
           </div>
@@ -215,6 +219,37 @@ export default function App() {
           </>
         )}
       </main>
+
+      {newOpen && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 420 }}>
+            <button className="modal-close" onClick={() => setNewOpen(false)} title="关闭">✕</button>
+            <h3 style={{ margin: "0 0 12px" }}>新建岗位会话</h3>
+            <p className="page-sub" style={{ marginBottom: 10 }}>
+              技能档案是同一个人的，新岗位可以接着用：复制旧档案，再补新岗位的 JD 就行。
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <label style={{ margin: 0 }}>复制来源（可选）</label>
+              <select value={copySource} onChange={(e) => setCopySource(e.target.value)}>
+                <option value="">不复制，空白档案</option>
+                {sessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.job_title || s.company || s.id.slice(0, 12)}（{s.skill_count} 技能）
+                  </option>
+                ))}
+              </select>
+              <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+                <button className="btn" onClick={() => newSession(copySource || undefined)}>
+                  {copySource ? "复制档案并新建" : "新建空白会话"}
+                </button>
+                <button className="btn secondary" onClick={() => setNewOpen(false)}>
+                  取消
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

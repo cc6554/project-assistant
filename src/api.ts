@@ -37,7 +37,11 @@ export const api = {
 
   // 会话
   listSessions: () => req<SessionSummary[]>("/api/sessions"),
-  createSession: () => req<{ id: string }>("/api/sessions", { method: "POST" }),
+  createSession: (sourceSessionId?: string) =>
+    req<{ id: string }>(
+      "/api/sessions",
+      json("POST", sourceSessionId ? { source_session_id: sourceSessionId } : {}),
+    ),
   getSession: (id: string) => req<SessionState>(`/api/sessions/${id}`),
   deleteSession: (id: string) => req<{ ok: boolean }>(`/api/sessions/${id}`, { method: "DELETE" }),
 
