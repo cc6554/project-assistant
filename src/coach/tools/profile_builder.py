@@ -65,7 +65,7 @@ PROFILE_SYSTEM_PROMPT = """你是用户技能档案分析引擎。根据用户�
    - 工作日志中反复、独立完成的实战记录，才可给 proficient 及以上；
 3. confidence 反映你对掌握程度判断的把握（0~1）：单一声明 0.4~0.6，有具体项目证据 0.6~0.85；
 4. 技能名使用规范技术名词（如 PyTorch、RAG、Go、Kubernetes），同一技能只出现一次；
-5. open_questions 列出材料中看不出、需要向用户追问的关键问题（最多 5 个），尤其针对求职方向上的核心技能缺口；
+5. open_questions 列出材料中看不出、需要向用户追问的关键问题（最多 {max_new_questions} 个），尤其针对求职方向上的核心技能缺口；
 6. 已经存在于旧档案中的技能不要重复抽取，只抽取新材料带来的增量信息；
 7. 严格通过 emit_result 工具输出。"""
 
@@ -89,10 +89,14 @@ def build_profile_from_text(
     source: str,
     existing: UserSkillProfile | None = None,
     task: str = "parsing",
+    max_new_questions: int = 5,
 ) -> UserSkillProfile:
     """从一段材料文本构建/更新技能档案。
 
     source: resume / work_log / self_report / chat
+    max_new_questions: 本次材料允许新增的待澄清问题上限。
+      - 材料解析（简历/日志/自填）：默认 5；
+      - 访谈问答合并（apply_interview_answer）：传 1，避免每轮回答都追问细节导致对话无限循环。
     """
     if source not in _SOURCE_LABEL:
         raise ValueError(f"未知技能证据来源：{source}")
@@ -109,7 +113,10 @@ def build_profile_from_text(
     delta_raw = router.complete_json(
         task,
         [
-            Message(role="system", content=PROFILE_SYSTEM_PROMPT),
+            Message(
+                role="system",
+                content=PROFILE_SYSTEM_PROMPT.format(max_new_questions=max_new_questions),
+            ),
             Message(role="user", content="\n".join(user_parts)),
         ],
         _delta_schema(),

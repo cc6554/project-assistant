@@ -151,6 +151,18 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     }
   };
 
+  /** 主动结束核对：关闭弹窗，剩余问题保留在档案里，之后可随时继续。 */
+  const finishClarify = () => {
+    setClarifyOpen(false);
+    setMsg({
+      kind: "info",
+      text:
+        clarifyRemaining > 0
+          ? `已暂停核对，剩余 ${clarifyRemaining} 条问题保留在档案里，可随时回来继续。`
+          : "待澄清内容已全部确认 ✅ 技能档案更新完成",
+    });
+  };
+
   const submitText = () => {
     if (!text.trim()) return;
     run(
@@ -249,6 +261,14 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
                 disabled={clarifyBusy}
               >
                 跳过当前问题
+              </button>
+              <button
+                className="btn secondary"
+                onClick={finishClarify}
+                disabled={clarifyBusy}
+                title="结束本轮核对，剩余问题保留，之后可继续"
+              >
+                完成核对
               </button>
             </div>
           </div>

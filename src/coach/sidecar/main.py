@@ -560,6 +560,10 @@ class ClarifyChatInput(BaseModel):
     history: list[dict] = []
 
 
+# 待澄清核对轮次上限：超过后不再自动追问（防 LLM 无限循环），剩余问题保留
+CLARIFY_MAX_ROUNDS = 12
+
+
 @app.get("/api/sessions/{session_id}/profile/clarify/start")
 def clarify_start(session_id: str) -> dict:
     """打开澄清对话：返回完整提纲 + AI 自然开场白（把第一条问题口语化问出）。"""
@@ -569,6 +573,13 @@ def clarify_start(session_id: str) -> dict:
     questions = state.profile.open_questions
     if not questions:
         return {"outline": [], "opening": "没有待澄清问题了。", "remaining": 0, "done": True}
+    if len(state.interview_history) >= CLARIFY_MAX_ROUNDS:
+        return {
+            "outline": questions,
+            "opening": "咱们已经核对得比较充分了。剩下的问题我保留在档案里，你之后想继续随时可以再打开。",
+            "remaining": len(questions),
+            "done": False,
+        }
     # 打开时自动清理提纲里的同主题重复变体（保留首次出现），存量污染也能自愈
     deduped: list[str] = []
     for q in questions:
@@ -634,6 +645,16 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         state.interview_history.append([target, body.message])
         store.save(state)
         remaining = profile.open_questions
+        rounds = len(state.interview_history)
+        if remaining and rounds >= CLARIFY_MAX_ROUNDS:
+            # 机器兜底：核对已充分，剩余问题保留在档案里，让对话自然收尾
+            return {
+                "kind": decision.intent,
+                "reply": f"{decision.reply}\n\n咱们已经核对得比较充分了，剩余 {len(remaining)} 条问题我保留在档案里，之后想继续随时回来。",
+                "remaining": len(remaining),
+                "done": True,
+                "profile": profile.model_dump(exclude_none=True),
+            }
         return {
             "kind": decision.intent,
             "reply": decision.reply,
