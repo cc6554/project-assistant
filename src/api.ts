@@ -87,9 +87,13 @@ export const api = {
 
   // 待澄清对话
   clarifyStart: (sessionId: string) =>
-    req<{ outline: string[]; opening: string; remaining: number; done: boolean }>(
-      `/api/sessions/${sessionId}/profile/clarify/start`,
-    ),
+    req<{
+      outline: string[];
+      opening: string;
+      remaining: number;
+      done: boolean;
+      profile?: UserSkillProfile | null;
+    }>(`/api/sessions/${sessionId}/profile/clarify/start`),
   clarifyNext: (sessionId: string) =>
     req<{ question: string | null; remaining: number; done: boolean }>(
       `/api/sessions/${sessionId}/profile/clarify/next`,
@@ -105,6 +109,7 @@ export const api = {
       reply: string;
       remaining: number;
       done: boolean;
+      reason?: string;
       profile?: UserSkillProfile | null;
     }>(
       `/api/sessions/${sessionId}/profile/clarify/chat`,

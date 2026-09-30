@@ -58,6 +58,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
       setClarifyOutline(res.outline);
       setClarifyOutlineOpen(true);
       setClarifyRemaining(res.remaining);
+      if (res.profile) updateProfile(res.profile);
       setClarifyA("");
       setClarifyMsgs(res.opening ? [{ role: "assistant", content: res.opening }] : []);
     } catch (e) {
@@ -140,7 +141,13 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
       setClarifyRemaining(res.remaining ?? 0);
       if (res.done) {
         setClarifyOpen(false);
-        setMsg({ kind: "info", text: "待澄清内容已全部确认 ✅ 技能档案更新完成" });
+        setMsg({
+          kind: "info",
+          text:
+            res.reason === "round_limit"
+              ? `已核对多轮，剩余 ${res.remaining ?? 0} 条问题保留在档案里，可随时回来继续。`
+              : "待澄清内容已全部确认 ✅ 技能档案更新完成",
+        });
       } else {
         setClarifyMsgs(next);
       }

@@ -579,9 +579,10 @@ def clarify_start(session_id: str) -> dict:
     if len(state.interview_history) >= clarify_max_rounds(len(questions)):
         return {
             "outline": questions,
-            "opening": "咱们已经核对得比较充分了。剩下的问题我保留在档案里，你之后想继续随时可以再打开。",
+            "opening": f"咱们已经核对 {len(state.interview_history)} 轮了，提纲里还剩 {len(questions)} 条。你想继续回答哪条直接说，我会记进档案；剩下的会一直保留，随时回来。",
             "remaining": len(questions),
             "done": False,
+            "profile": state.profile.model_dump(exclude_none=True),
         }
     # 打开时自动清理提纲里的同主题重复变体（保留首次出现），存量污染也能自愈
     deduped: list[str] = []
@@ -598,7 +599,13 @@ def clarify_start(session_id: str) -> dict:
         opening = interviewer.clarify_opening(router, questions)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"澄清开场失败：{exc}") from exc
-    return {"outline": questions, "opening": opening, "remaining": len(questions), "done": False}
+    return {
+        "outline": questions,
+        "opening": opening,
+        "remaining": len(questions),
+        "done": False,
+        "profile": state.profile.model_dump(exclude_none=True),
+    }
 
 
 @app.post("/api/sessions/{session_id}/profile/clarify/chat")
@@ -614,19 +621,9 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         return {
             "kind": "done",
             "reply": "没有待澄清问题了。",
-            "question": None,
             "remaining": 0,
             "done": True,
-            "profile": profile.model_dump(exclude_none=True),
-        }
-
-    # 机器兜底：核对已超过 12 轮，任何消息都不再追问（与 start 的「已核对充分」提示一致）
-    if questions and len(state.interview_history) + 1 >= clarify_max_rounds(len(questions)):
-        return {
-            "kind": "done",
-            "reply": "咱们已经核对得比较充分了。剩余问题我保留在档案里，你之后想继续随时可以再打开。",
-            "remaining": len(questions),
-            "done": True,
+            "reason": "exhausted",
             "profile": profile.model_dump(exclude_none=True),
         }
 
@@ -659,13 +656,15 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         store.save(state)
         remaining = profile.open_questions
         rounds = len(state.interview_history)
-        if remaining and rounds >= CLARIFY_MAX_ROUNDS:
-            # 机器兜底：核对已充分，剩余问题保留在档案里，让对话自然收尾
+        if remaining and rounds >= clarify_max_rounds(len(questions)):
+            # 机器兜底：超轮次后不再主动追问，但已处理的回答照常入库；
+            # 剩余问题保留在档案里（用户之后可继续回答），并让对话自然收尾
             return {
                 "kind": decision.intent,
-                "reply": f"{decision.reply}\n\n咱们已经核对得比较充分了，剩余 {len(remaining)} 条问题我保留在档案里，之后想继续随时回来。",
+                "reply": f"{decision.reply}\n\n已核对 {rounds} 轮，剩余 {len(remaining)} 条问题我保留在档案里，之后想继续随时回来。",
                 "remaining": len(remaining),
                 "done": True,
+                "reason": "round_limit",
                 "profile": profile.model_dump(exclude_none=True),
             }
         return {
@@ -673,6 +672,7 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
             "reply": decision.reply,
             "remaining": len(remaining),
             "done": not remaining,
+            "reason": "exhausted" if not remaining else "progress",
             "profile": profile.model_dump(exclude_none=True),
         }
 
