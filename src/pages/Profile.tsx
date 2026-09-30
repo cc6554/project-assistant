@@ -246,10 +246,16 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
               )}
             </div>
             <VoiceField
-              placeholder="直接回答；也可以随时问：这个问题什么意思？"
+              placeholder="直接回答；也可以随时问：这个问题什么意思？（回车发送，Shift+回车换行）"
               value={clarifyA}
               onChange={setClarifyA}
               minHeight={60}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void sendClarify();
+                }
+              }}
             />
             <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
               <button className="btn" onClick={() => sendClarify()} disabled={clarifyBusy || !clarifyA.trim()}>
@@ -374,7 +380,18 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
               <div className="chat-line">
                 <div className="q">Q：{question}</div>
               </div>
-              <VoiceField placeholder="你的回答（可详述项目经历、掌握程度、使用频率…）" value={answer} onChange={setAnswer} minHeight={80} />
+              <VoiceField
+                placeholder="你的回答（可详述项目经历、掌握程度、使用频率…）（回车提交，Shift+回车换行）"
+                value={answer}
+                onChange={setAnswer}
+                minHeight={80}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    if (answer.trim()) submitAnswer();
+                  }
+                }}
+              />
               <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
                 <button className="btn" onClick={submitAnswer} disabled={busy || !answer.trim()}>
                   提交回答

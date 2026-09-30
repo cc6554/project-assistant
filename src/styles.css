@@ -544,3 +544,22 @@ html[data-theme="light"] .modal {
   color: var(--text);
   border-top-right-radius: 3px;
 }
+
+/* 语音输入：实时音量条（说话时跳动） */
+.voice-level {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 22px;
+  padding: 0 2px;
+}
+.voice-level span {
+  width: 4px;
+  border-radius: 1px;
+  background: var(--border);
+  transition: background 0.08s, box-shadow 0.08s;
+}
+.voice-level span.on {
+  background: var(--accent, #4f8cff);
+  box-shadow: 0 0 5px var(--accent, #4f8cff);
+}

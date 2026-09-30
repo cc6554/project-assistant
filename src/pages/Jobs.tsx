@@ -165,10 +165,16 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
         <div className="card">
           <label>岗位名称或方向</label>
           <VoiceField
-            placeholder="例如：灵巧手抓取算法工程师 / 具身智能操作方向 / 大模型推理优化后端…可以加城市、关键词让搜索更准"
+            placeholder="例如：灵巧手抓取算法工程师 / 具身智能操作方向 / 大模型推理优化后端…可以加城市、关键词让搜索更准（回车搜索）"
             value={query}
             onChange={setQuery}
             minHeight={72}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (query.trim()) void startSearch();
+              }
+            }}
           />
           <button className="btn" onClick={startSearch} disabled={searching || !query.trim()}>
             {searching ? (

@@ -617,6 +617,16 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
             "profile": profile.model_dump(exclude_none=True),
         }
 
+    # 机器兜底：核对已超过 12 轮，任何消息都不再追问（与 start 的「已核对充分」提示一致）
+    if questions and len(state.interview_history) + 1 >= CLARIFY_MAX_ROUNDS:
+        return {
+            "kind": "done",
+            "reply": "咱们已经核对得比较充分了。剩余问题我保留在档案里，你之后想继续随时可以再打开。",
+            "remaining": len(questions),
+            "done": True,
+            "profile": profile.model_dump(exclude_none=True),
+        }
+
     router = get_router()
     try:
         decision = interviewer.clarify_turn(
