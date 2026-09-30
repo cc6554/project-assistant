@@ -560,8 +560,11 @@ class ClarifyChatInput(BaseModel):
     history: list[dict] = []
 
 
-# 待澄清核对轮次上限：超过后不再自动追问（防 LLM 无限循环），剩余问题保留
-CLARIFY_MAX_ROUNDS = 12
+# 待澄清核对轮次上限：按提纲规模自适应（每条问题约 2 轮对话 + 4 轮容差），
+# 至少 8 轮、至多 30 轮。它只是 LLM 失控时的最后保险——正常结束路径是
+# 「提纲清空 + LLM 自主判断」；轮数不够时不该提前掐断该澄清的内容。
+def clarify_max_rounds(n_questions: int) -> int:
+    return min(30, max(8, n_questions * 2 + 4))
 
 
 @app.get("/api/sessions/{session_id}/profile/clarify/start")
@@ -573,7 +576,7 @@ def clarify_start(session_id: str) -> dict:
     questions = state.profile.open_questions
     if not questions:
         return {"outline": [], "opening": "没有待澄清问题了。", "remaining": 0, "done": True}
-    if len(state.interview_history) >= CLARIFY_MAX_ROUNDS:
+    if len(state.interview_history) >= clarify_max_rounds(len(questions)):
         return {
             "outline": questions,
             "opening": "咱们已经核对得比较充分了。剩下的问题我保留在档案里，你之后想继续随时可以再打开。",
@@ -618,7 +621,7 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         }
 
     # 机器兜底：核对已超过 12 轮，任何消息都不再追问（与 start 的「已核对充分」提示一致）
-    if questions and len(state.interview_history) + 1 >= CLARIFY_MAX_ROUNDS:
+    if questions and len(state.interview_history) + 1 >= clarify_max_rounds(len(questions)):
         return {
             "kind": "done",
             "reply": "咱们已经核对得比较充分了。剩余问题我保留在档案里，你之后想继续随时可以再打开。",
