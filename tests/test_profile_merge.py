@@ -84,3 +84,27 @@ def test_open_questions_dedup():
     delta = _ProfileDelta(open_questions=["问题A", "问题B", "问题B"])
     merged = merge_profile_delta(profile, delta)
     assert merged.open_questions == ["问题A", "问题B"]
+
+
+def test_merge_remove_skills():
+    """merge_profile_delta 支持 remove_skills：用户明确否定的技能从档案移除。"""
+    from coach.domain.schemas import SkillItem, UserSkillProfile
+    from coach.tools.profile_builder import _ProfileDelta, merge_profile_delta
+
+    base = UserSkillProfile(
+        skills=[
+            SkillItem(name="Apache ORC", proficiency="working", confidence=0.6, sources=["chat"], evidence="学习笔记"),
+            SkillItem(name="JSON", proficiency="working", confidence=0.6, sources=["chat"], evidence="解析工具"),
+            SkillItem(name="PyTorch", proficiency="proficient", confidence=0.8, sources=["resume"], evidence="训练"),
+        ]
+    )
+    delta = _ProfileDelta(
+        remove_skills=["Apache ORC", "json"],
+        skills=[SkillItem(name="PyTorch", proficiency="expert", confidence=0.9, sources=["chat"], evidence="新增证据")],
+    )
+    out = merge_profile_delta(base, delta)
+    names = {s.name for s in out.skills}
+    assert "Apache ORC" not in names and "JSON" not in names
+    assert "PyTorch" in names
+    pt = next(s for s in out.skills if s.name == "PyTorch")
+    assert pt.proficiency == "expert" and pt.confidence >= 0.8

@@ -67,13 +67,17 @@ PROFILE_SYSTEM_PROMPT = """你是用户技能档案分析引擎。根据用户�
 4. 技能名使用规范技术名词（如 PyTorch、RAG、Go、Kubernetes），同一技能只出现一次；
 5. open_questions 列出材料中看不出、需要向用户追问的关键问题（最多 {max_new_questions} 个），尤其针对求职方向上的核心技能缺口；
 6. 已经存在于旧档案中的技能不要重复抽取，只抽取新材料带来的增量信息；
-7. 严格通过 emit_result 工具输出。"""
+7. 若材料**明确否定或纠正**了旧档案中的某项技能（如"没做过 X"、"不是我的"、"X 是错的"、
+   是别人做的、已废弃），把该技能名填入 remove_skills（用规范技术名词）；已移除的技能不要
+   再出现在 skills 里；
+8. 严格通过 emit_result 工具输出。"""
 
 
 class _ProfileDelta(BaseModel):
     summary: str = ""
     target_direction: str | None = None
     skills: list[SkillItem] = []
+    remove_skills: list[str] = []  # 材料明确否定/纠正的已有技能名
     open_questions: list[str] = []
 
 
@@ -161,6 +165,10 @@ def merge_profile_delta(
     delta: _ProfileDelta,
 ) -> UserSkillProfile:
     by_key = {normalize_skill_name(s.name): s for s in profile.skills}
+
+    # 先执行"剔除/纠正"：用户明确否定的技能从档案移除
+    for name in delta.remove_skills:
+        by_key.pop(normalize_skill_name(name), None)
 
     for incoming in delta.skills:
         key = normalize_skill_name(incoming.name)

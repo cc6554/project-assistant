@@ -33,6 +33,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
   const [clarifyOutline, setClarifyOutline] = useState<string[]>([]);
   const [clarifyOutlineOpen, setClarifyOutlineOpen] = useState(true);
   const [clarifyRemaining, setClarifyRemaining] = useState(0);
+  const [currentModelLabel, setCurrentModelLabel] = useState<string>("");
   const docRef = useRef<HTMLInputElement>(null);
   const clarifyCardRef = useRef<HTMLDivElement>(null);
 
@@ -61,6 +62,9 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
       if (res.profile) updateProfile(res.profile);
       setClarifyA("");
       setClarifyMsgs(res.opening ? [{ role: "assistant", content: res.opening }] : []);
+      void api.getModel().then((m) =>
+        setCurrentModelLabel(m.current ? m.current.model : "默认"),
+      ).catch(() => setCurrentModelLabel(""));
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
@@ -170,6 +174,21 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     });
   };
 
+  /** 删除一条误生成/没问过的问题（用户确认后从提纲移除）。 */
+  const removeClarifyQuestion = async (q: string) => {
+    try {
+      const res = await api.clarifyRemove(sessionId, q);
+      if (res.profile) {
+        updateProfile(res.profile);
+        setClarifyOutline(res.profile.open_questions ?? []);
+        setClarifyRemaining(res.profile.open_questions?.length ?? 0);
+      }
+      setClarifyMsgs((msgs) => msgs);
+    } catch (e) {
+      setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
+    }
+  };
+
   const submitText = () => {
     if (!text.trim()) return;
     run(
@@ -221,6 +240,20 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
                   还剩 {clarifyRemaining} 条
                 </span>
               )}
+              {currentModelLabel && (
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "var(--muted)",
+                    marginLeft: 8,
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    padding: "1px 8px",
+                  }}
+                >
+                  模型：{currentModelLabel}
+                </span>
+              )}
             </h3>
             {clarifyOutline.length > 0 && (
               <div
@@ -234,7 +267,27 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
                 {clarifyOutlineOpen && (
                   <ol style={{ margin: 0, paddingLeft: 20, fontSize: 12, color: "var(--muted)" }}>
                     {clarifyOutline.map((q, i) => (
-                      <li key={i}>{q}</li>
+                      <li key={i} style={{ marginBottom: 4, display: "flex", gap: 6, alignItems: "flex-start" }}>
+                        <span style={{ flex: 1 }}>{q}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void removeClarifyQuestion(q);
+                          }}
+                          title="删除该问题（没问过/误生成的可以去掉）"
+                          style={{
+                            border: "none",
+                            background: "transparent",
+                            cursor: "pointer",
+                            color: "var(--danger)",
+                            fontSize: 12,
+                            padding: 0,
+                            lineHeight: 1.4,
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </li>
                     ))}
                   </ol>
                 )}

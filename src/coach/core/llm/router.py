@@ -66,7 +66,8 @@ class ModelRouter:
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        chain = self.config.chain_for(task)
+        # 全局当前模型（对话界面选择）优先于任务默认链；未选则按任务路由
+        chain = [self.config.current] if self.config.current else self.config.chain_for(task)
         errors: list[ProviderError] = []
 
         for target in chain:

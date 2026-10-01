@@ -85,6 +85,18 @@ export const api = {
       json("POST", { path: localPath }),
     ),
 
+  // 模型选择（全局，与配置的 key 同步）
+  getModel: () =>
+    req<{
+      options: { provider: string; model: string }[];
+      current: { provider: string; model: string } | null;
+    }>("/api/model"),
+  setModel: (provider: string, model: string) =>
+    req<{ ok: boolean; current: { provider: string; model: string } }>(
+      "/api/model",
+      json("PUT", { provider, model }),
+    ),
+
   // 待澄清对话
   clarifyStart: (sessionId: string) =>
     req<{
@@ -114,6 +126,11 @@ export const api = {
     }>(
       `/api/sessions/${sessionId}/profile/clarify/chat`,
       json("POST", { message, history }),
+    ),
+  clarifyRemove: (sessionId: string, question: string) =>
+    req<{ profile: UserSkillProfile }>(
+      `/api/sessions/${sessionId}/profile/clarify/remove`,
+      json("POST", { question }),
     ),
 
   // 访谈

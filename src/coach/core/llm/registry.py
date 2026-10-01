@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ class TaskTarget:
 class ModelConfig:
     providers: dict[str, ProviderEntry]
     tasks: dict[str, list[TaskTarget]]
+    current: TaskTarget | None = None  # 全局当前模型（对话界面可选，覆盖任务默认链）
 
     def chain_for(self, task: str) -> list[TaskTarget]:
         if task not in self.tasks:
@@ -87,4 +89,16 @@ def load_config(path: str | Path) -> ModelConfig:
     if "default" not in tasks:
         raise ValueError("providers.yaml 必须配置 tasks.default 兜底链")
 
-    return ModelConfig(providers=providers, tasks=tasks)
+    # 全局当前模型：config/current_model.json（对话界面的模型选择器写入）
+    current: TaskTarget | None = None
+    cur_path = path.parent / "current_model.json"
+    if cur_path.exists():
+        try:
+            cur = json.loads(cur_path.read_text(encoding="utf-8")) or {}
+            provider, model = cur.get("provider"), cur.get("model")
+            if provider in providers and model:
+                current = TaskTarget(provider=provider, model=model)
+        except Exception:  # noqa: BLE001 - 损坏的 current_model.json 忽略，回退默认
+            current = None
+
+    return ModelConfig(providers=providers, tasks=tasks, current=current)

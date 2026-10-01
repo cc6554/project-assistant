@@ -25,6 +25,9 @@ export default function App() {
   const [sidecarOk, setSidecarOk] = useState(false);
   const [checking, setChecking] = useState(true);
   const [agentPrefill, setAgentPrefill] = useState<string>("");
+  // 全局模型选择（与配置的 API key 模型同步）
+  const [modelOptions, setModelOptions] = useState<{ provider: string; model: string }[]>([]);
+  const [currentModel, setCurrentModel] = useState<{ provider: string; model: string } | null>(null);
   // 新建会话弹窗：可选从已有会话复制技能档案
   const [newOpen, setNewOpen] = useState(false);
   const [copySource, setCopySource] = useState<string>("");
@@ -82,6 +85,7 @@ export default function App() {
       }
     };
     void check();
+    void loadModel();
     const timer = window.setInterval(check, 5000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -94,6 +98,16 @@ export default function App() {
       .then(setState)
       .catch(() => setState(null));
   }, [sessionId]);
+
+  const loadModel = async () => {
+    try {
+      const res = await api.getModel();
+      setModelOptions(res.options);
+      setCurrentModel(res.current);
+    } catch {
+      /* 模型选择失败不阻塞使用 */
+    }
+  };
 
   const refreshSessions = (keepId = sessionId) =>
     api.listSessions().then((list) => {
@@ -160,6 +174,34 @@ export default function App() {
         <button className="btn-new" onClick={() => { setCopySource(""); setNewOpen(true); }}>
           ＋ 新建会话
         </button>
+        <div style={{ padding: "0 8px 8px" }}>
+          <label style={{ fontSize: 12, color: "var(--muted)", display: "block", marginBottom: 4 }}>
+            对话模型（所有对话生效）
+          </label>
+          <select
+            value={currentModel ? `${currentModel.provider}/${currentModel.model}` : ""}
+            onChange={async (e) => {
+              const v = e.target.value;
+              if (!v) return;
+              const [provider, ...rest] = v.split("/");
+              const model = rest.join("/");
+              try {
+                await api.setModel(provider, model);
+                setCurrentModel({ provider, model });
+              } catch (err) {
+                console.error(err);
+              }
+            }}
+            style={{ width: "100%", fontSize: 12 }}
+          >
+            <option value="">默认（按任务自动）</option>
+            {modelOptions.map((o) => (
+              <option key={`${o.provider}/${o.model}`} value={`${o.provider}/${o.model}`}>
+                {o.model}
+              </option>
+            ))}
+          </select>
+        </div>
         <div className="theme-switch">
           <button
             className={`theme-opt ${theme === "dark" ? "active" : ""}`}

@@ -101,6 +101,46 @@ def get_config() -> dict:
     }
 
 
+class ModelSelectInput(BaseModel):
+    provider: str
+    model: str
+
+
+@app.get("/api/model")
+def get_model() -> dict:
+    """全局当前模型 + 可选模型列表（来自 providers.yaml 的任务链，与配置的 key 同步）。"""
+    raw = yaml.safe_load(paths.config_path().read_text(encoding="utf-8")) or {}
+    options: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for chain in (raw.get("tasks") or {}).values():
+        for item in chain:
+            key = (item.get("provider"), item["model"])
+            if key not in seen:
+                seen.add(key)
+                options.append({"provider": key[0], "model": item["model"]})
+    current = None
+    cur_path = paths.config_path().parent / "current_model.json"
+    if cur_path.exists():
+        try:
+            cur = json.loads(cur_path.read_text(encoding="utf-8")) or {}
+            if cur.get("provider") and cur.get("model"):
+                current = {"provider": cur["provider"], "model": cur["model"]}
+        except Exception:  # noqa: BLE001
+            current = None
+    return {"options": options, "current": current}
+
+
+@app.put("/api/model")
+def put_model(body: ModelSelectInput) -> dict:
+    """设置全局当前模型（持久化到 config/current_model.json，所有对话立即生效）。"""
+    cur_path = paths.config_path().parent / "current_model.json"
+    cur_path.write_text(
+        json.dumps({"provider": body.provider, "model": body.model}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {"ok": True, "current": {"provider": body.provider, "model": body.model}}
+
+
 class ProviderInput(BaseModel):
     name: str
     api_mode: str = "chat_completions"
@@ -606,6 +646,26 @@ def clarify_start(session_id: str) -> dict:
         "done": False,
         "profile": state.profile.model_dump(exclude_none=True),
     }
+
+
+class ClarifyRemoveInput(BaseModel):
+    question: str
+
+
+@app.post("/api/sessions/{session_id}/profile/clarify/remove")
+def clarify_remove(session_id: str, body: ClarifyRemoveInput) -> dict:
+    """删除一条待澄清问题（针对误生成/用户没问过的问题）。"""
+    state = _session(session_id)
+    if state.profile is None:
+        raise HTTPException(status_code=400, detail="请先建立技能档案")
+    q = body.question.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="question 不能为空")
+    state.profile.open_questions = [
+        x for x in state.profile.open_questions if x.strip() != q
+    ]
+    store.save(state)
+    return {"profile": state.profile.model_dump(exclude_none=True)}
 
 
 @app.post("/api/sessions/{session_id}/profile/clarify/chat")
