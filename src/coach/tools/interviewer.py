@@ -40,7 +40,10 @@ APPLY_ANSWER_HINT = """以下是技能访谈中的一轮对话。请从用户回
 - 不要从已答话题里生成细节追问（如"具体参数是什么"），不要用同义改写重问同主题问题；
 - 用户明确表示不了解的技能不要加入档案；
 - **用户明确否定/纠正已有技能时（"没做过X"、"不是我的"、"X是错的"、"剔除/删掉X"、"更正为Y"），必须把被否定的技能名放入 remove_skills 删除字段**，不要只靠不写入 skills 来表达否定——否则旧技能会一直留在档案里；
-- 用户已回答、明确关闭或要求剔除的话题，无论以什么措辞出现都不得再写入 open_questions。"""
+- 用户已回答、明确关闭或要求剔除的话题，无论以什么措辞出现都不得再写入 open_questions；
+- **用户回答澄清了清单里的某个问题时，把该问题（尽量用清单里的原文措辞）放入 remove_questions 删除字段**，
+  不要只靠不写入 open_questions 来表达——否则旧问题会一直挂在清单里；
+- 用户明确否定的技能（"没做过X"、"不是我的"）放入 remove_skills 删除字段。"""
 
 
 class _NextQuestion(BaseModel):
@@ -118,6 +121,9 @@ CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自�
 - 用户随时可以追问"什么意思"、跳过、补充背景，你要自然应对；
 - 已经核对完的话题不要再重复问。
 
+已完成核对的问题（防止重复追问；仅作参考，不要当成当前待答项）：
+{answered}
+
 待澄清问题清单（提纲，按顺序）：
 {outline}
 当前技能档案（摘要，供判断答非所问的程度）：
@@ -151,11 +157,16 @@ def clarify_turn(
     history: list[dict],
     *,
     task: str = "interview",
+    answered: list[str] | None = None,
 ) -> ClarifyTurn:
-    """对用户一条自由消息做意图判定；提纲（open_questions）传给 LLM 作参考。"""
+    """对用户一条自由消息做意图判定；提纲（open_questions）传给 LLM 作参考。
+
+    answered: 已完成核对的问题（来自后端 interview_history），防止 AI 重复追问。
+    """
     outline_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(outline)) or "（清单为空）"
+    answered_text = "\n".join(f"- {q}" for q in (answered or [])) or "（暂无）"
     history_text = "\n".join(
-        f"{h.get('role', '?')}: {h.get('content', '')}" for h in history[-8:]
+        f"{h.get('role', '?')}: {h.get('content', '')}" for h in history
     ) or "（暂无）"
     result = router.complete_json(
         task,
@@ -167,6 +178,7 @@ def clarify_turn(
                     profile=profile.model_dump_json(),
                     history=history_text,
                     message=message,
+                    answered=answered_text,
                 ),
             )
         ],

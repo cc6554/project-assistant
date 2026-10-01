@@ -70,7 +70,9 @@ PROFILE_SYSTEM_PROMPT = """你是用户技能档案分析引擎。根据用户�
 7. 若材料**明确否定或纠正**了旧档案中的某项技能（如"没做过 X"、"不是我的"、"X 是错的"、
    是别人做的、已废弃），把该技能名填入 remove_skills（用规范技术名词）；已移除的技能不要
    再出现在 skills 里；
-8. 严格通过 emit_result 工具输出。"""
+8. 若材料/回答**已经回答了清单中的某个待澄清问题**（含措辞变体），把该问题放入
+   remove_questions（按原有措辞或核心词），已澄清的问题不要重复出现在 open_questions 里；
+9. 严格通过 emit_result 工具输出。"""
 
 
 class _ProfileDelta(BaseModel):
@@ -78,6 +80,7 @@ class _ProfileDelta(BaseModel):
     target_direction: str | None = None
     skills: list[SkillItem] = []
     remove_skills: list[str] = []  # 材料明确否定/纠正的已有技能名
+    remove_questions: list[str] = []  # 材料/回答已澄清、应从清单移除的问题
     open_questions: list[str] = []
 
 
@@ -170,6 +173,10 @@ def merge_profile_delta(
     for name in delta.remove_skills:
         by_key.pop(normalize_skill_name(name), None)
 
+    # 已澄清的问题从清单移除（模糊匹配措辞变体；LLM 明确指定的删除，阈值放宽到 0.5）
+    questions_out = [q for q in profile.open_questions
+                     if not any(question_similar(q, r) >= 0.5 for r in delta.remove_questions)]
+
     for incoming in delta.skills:
         key = normalize_skill_name(incoming.name)
         current = by_key.get(key)
@@ -201,7 +208,7 @@ def merge_profile_delta(
         )
 
     questions: list[str] = []
-    for q in [*profile.open_questions, *delta.open_questions]:
+    for q in [*questions_out, *delta.open_questions]:
         if any(question_similar(q, existing) >= 0.6 for existing in questions):
             continue
         questions.append(q)

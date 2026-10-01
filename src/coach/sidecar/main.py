@@ -690,7 +690,12 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
     router = get_router()
     try:
         decision = interviewer.clarify_turn(
-            router, profile, questions, body.message, body.history
+            router,
+            profile,
+            questions,
+            body.message,
+            body.history,
+            answered=[q for q, _ in state.interview_history],
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"澄清对话失败：{exc}") from exc

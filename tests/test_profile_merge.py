@@ -108,3 +108,38 @@ def test_merge_remove_skills():
     assert "PyTorch" in names
     pt = next(s for s in out.skills if s.name == "PyTorch")
     assert pt.proficiency == "expert" and pt.confidence >= 0.8
+
+
+def test_merge_remove_questions():
+    """merge_profile_delta 支持 remove_questions：已澄清问题（含措辞变体）从清单移除。"""
+    from coach.domain.schemas import SkillItem, UserSkillProfile
+    from coach.tools.profile_builder import _ProfileDelta, merge_profile_delta
+
+    base = UserSkillProfile(
+        skills=[SkillItem(name="PyTorch", proficiency="working", confidence=0.5, sources=["resume"], evidence="")],
+        open_questions=[
+            "你之前跑过 153 万步的 Isaac Gym + PPO 训练吗？用的什么框架？",
+            "DDPG 是你自研实现还是用的现成库？",
+            "抓取卡点是什么？",
+        ],
+    )
+    delta = _ProfileDelta(
+        remove_questions=["你之前跑过 153 万步的 Isaac Gym + PPO 训练吗？用的什么框架？", "DDPG 是你自研实现还是用的现成库？"],
+        open_questions=[],
+    )
+    out = merge_profile_delta(base, delta)
+    assert len(out.open_questions) == 1
+    assert "卡点" in out.open_questions[0]
+
+def test_merge_remove_questions_variant():
+    """措辞变体也能被 remove_questions 移除（模糊匹配）。"""
+    from coach.domain.schemas import SkillItem, UserSkillProfile
+    from coach.tools.profile_builder import _ProfileDelta, merge_profile_delta
+
+    base = UserSkillProfile(
+        skills=[SkillItem(name="PyTorch", proficiency="working", confidence=0.5, sources=["resume"], evidence="")],
+        open_questions=["你用的哪个 RL 库（Stable-Baselines3 / Ray RLlib / rl_games）？"],
+    )
+    delta = _ProfileDelta(remove_questions=["你用的是哪个 RL 库（Stable-Baselines3 / Ray RLlib / rl_games）"])
+    out = merge_profile_delta(base, delta)
+    assert out.open_questions == []
