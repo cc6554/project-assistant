@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -422,9 +423,13 @@ def interview_answer(session_id: str, body: InterviewAnswerInput) -> dict:
     if state.profile is None:
         raise HTTPException(status_code=400, detail="请先建立技能档案")
     router = get_router()
+    extra = _auto_fetch_context(body.answer)
+    answer_text = body.answer
+    if extra:
+        answer_text += f"\n\n（系统已自动抓取你提到的内容：\n{extra}）"
     try:
         profile = interviewer.apply_interview_answer(
-            router, state.profile, body.question, body.answer
+            router, state.profile, body.question, answer_text
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"应用访谈答案失败：{exc}") from exc
@@ -688,6 +693,9 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         }
 
     router = get_router()
+    # 自动预取：用户消息里带链接/本地路径时，系统先抓取/读取并注入上下文，
+    # 让澄清对话的 AI 也能"看到"GitHub 页面或本地文件（无需工具循环）
+    extra_context = _auto_fetch_context(body.message)
     try:
         decision = interviewer.clarify_turn(
             router,
@@ -696,6 +704,7 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
             body.message,
             body.history,
             answered=[q for q, _ in state.interview_history],
+            extra_context=extra_context,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"澄清对话失败：{exc}") from exc
@@ -706,8 +715,11 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         target = questions[idx]
         if decision.intent == "answer":
             try:
+                _answer_text = body.message
+                if extra_context:
+                    _answer_text += f"\n\n（系统已自动抓取你提到的内容：\n{extra_context}）"
                 profile = interviewer.apply_interview_answer(
-                    router, profile, target, body.message
+                    router, profile, target, _answer_text
                 )
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=502, detail=f"答案并入档案失败：{exc}") from exc
@@ -946,6 +958,47 @@ AGENT_MAX_STEPS = 25  # 每轮 turn/confirm 内最多执行的 LLM 决策步数
 
 def _agent_runtime() -> AgentRuntime:
     return AgentRuntime(paths.workspace_dir())
+
+
+_URL_RE = re.compile(r"https?://[^\s，。；、]+", re.IGNORECASE)
+
+
+def _auto_fetch_context(message: str) -> str:
+    """从用户消息里提取链接/本地路径，自动抓取/读取，返回可注入 LLM 上下文的转述文本。
+
+    只做只读操作（fetch_url / read_file / list_dir），不产生副作用。
+    """
+    from pathlib import Path
+
+    rt = _agent_runtime()
+    parts: list[str] = []
+
+    urls = _URL_RE.findall(message)
+    seen_urls: set[str] = set()
+    for u in urls:
+        u = u.rstrip(".,;，。；)")
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        fetched = rt.fetch_url(u, 4000)
+        if not fetched.startswith("（"):
+            parts.append(f"链接 {u} 的内容：\n{fetched}")
+        else:
+            parts.append(f"链接 {u}：{fetched}")
+
+    for tok in re.findall(
+        r"(?:[A-Za-z]:\\[^\s，。；、]+|/(?:home|Users|data|tmp)/[^\s，。；、]+)", message
+    ):
+        p = Path(tok.rstrip(".,;，。；)"))
+        if p.is_file():
+            try:
+                parts.append(f"本地文件 {tok} 的内容：\n{rt.read_file(str(p))}")
+            except Exception as exc:  # noqa: BLE001
+                parts.append(f"本地文件 {tok} 读取失败：{exc}")
+        elif p.is_dir():
+            parts.append(f"本地目录 {tok} 的内容：\n{rt.list_dir(str(p))}")
+
+    return "\n\n".join(parts)
 
 
 def _agent_system_prompt(state) -> str:

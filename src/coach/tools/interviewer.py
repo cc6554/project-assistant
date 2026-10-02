@@ -130,6 +130,8 @@ CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自�
 {profile}
 历史对话（最近若干条）：
 {history}
+用户消息里提到的链接/文件内容（系统已自动抓取并转述，你可以直接据此回答，不用再说"打不开/看不到"）：
+{extra}
 用户这条消息：{message}
 
 输出判定：
@@ -162,9 +164,11 @@ def clarify_turn(
     """对用户一条自由消息做意图判定；提纲（open_questions）传给 LLM 作参考。
 
     answered: 已完成核对的问题（来自后端 interview_history），防止 AI 重复追问。
+    extra_context: 系统已代为抓取的链接/文件内容（用户消息里提到的），AI 可直接据此回答。
     """
     outline_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(outline)) or "（清单为空）"
     answered_text = "\n".join(f"- {q}" for q in (answered or [])) or "（暂无）"
+    extra_text = extra_context or "（无）"
     history_text = "\n".join(
         f"{h.get('role', '?')}: {h.get('content', '')}" for h in history
     ) or "（暂无）"
@@ -179,6 +183,7 @@ def clarify_turn(
                     history=history_text,
                     message=message,
                     answered=answered_text,
+                    extra=extra_text,
                 ),
             )
         ],
