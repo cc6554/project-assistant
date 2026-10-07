@@ -160,6 +160,7 @@ def clarify_turn(
     *,
     task: str = "interview",
     answered: list[str] | None = None,
+    extra_context: str = "",
 ) -> ClarifyTurn:
     """对用户一条自由消息做意图判定；提纲（open_questions）传给 LLM 作参考。
 
