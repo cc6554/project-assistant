@@ -970,12 +970,18 @@ def _auto_fetch_context(message: str) -> str:
     """
     from pathlib import Path
 
+    import time as _time
+
     rt = _agent_runtime()
     parts: list[str] = []
+    _deadline = _time.monotonic() + 15.0  # 总预算 15 秒，超时跳过剩余链接，不卡对话
 
     urls = _URL_RE.findall(message)
     seen_urls: set[str] = set()
     for u in urls:
+        if _time.monotonic() > _deadline:
+            parts.append("（其余链接抓取超时，已跳过）")
+            break
         u = u.rstrip(".,;，。；)")
         if u in seen_urls:
             continue

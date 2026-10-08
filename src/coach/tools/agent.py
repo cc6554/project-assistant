@@ -203,6 +203,7 @@ class AgentRuntime:
         import requests
 
         proxy = self._git_proxy()
+        token = self._github_token()  # 私有仓库：复用 git 凭据
         attempts = []
         if proxy:
             attempts.append({"proxies": {"http": proxy, "https": proxy}})
@@ -210,11 +211,25 @@ class AgentRuntime:
         last_err: Exception | None = None
         for attempt in attempts:
             try:
-                kw = {"timeout": 30, "headers": {"User-Agent": "job-radar-agent/0.2"}}
+                kw = {"timeout": 10, "headers": {"User-Agent": "job-radar-agent/0.2"}}
                 if attempt["proxies"]:
                     kw["proxies"] = attempt["proxies"]
                 resp = requests.get(url, **kw)
+                # 匿名 401/403/404 且是 GitHub 链接：用用户 git 凭据认证重试
+                if resp.status_code in (401, 403, 404) and token and (
+                    "github.com" in url or "api.github.com" in url
+                ):
+                    resp = requests.get(
+                        url,
+                        headers={**kw["headers"], "Authorization": f"Bearer {token}"},
+                        **{k: v for k, v in kw.items() if k != "headers"},
+                    )
                 if resp.status_code != 200:
+                    # 私有仓库网页 404：降级到 GitHub API 读 README + 顶层结构
+                    if token and "github.com/" in url and "/blob/" not in url:
+                        api_text = self._github_api_read(url, token, kw)
+                        if api_text is not None:
+                            return _fmt_output(api_text, min(int(max_chars), FETCH_LIMIT))
                     return f"（HTTP {resp.status_code}，抓取失败：{url}）"
                 text = resp.text
                 # 去掉 script/style，减少噪音
@@ -226,6 +241,62 @@ class AgentRuntime:
                 last_err = exc
                 continue
         return f"（抓取失败：代理与直连均不可用。{last_err}）"
+
+    def _github_token(self) -> str | None:
+        """从 git 凭据管理器取 GitHub token（私有仓库认证用）。token 只进请求头，绝不出现在返回内容。"""
+        try:
+            out = subprocess.run(
+                ["git", "credential", "fill"],
+                input="protocol=https\nhost=github.com\n\n",
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in (out.stdout or "").splitlines():
+                if line.startswith("password="):
+                    return line[len("password="):].strip() or None
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _github_api_read(self, url: str, token: str, kw: dict) -> str | None:
+        """对 github.com/{owner}/{repo} 用 API 拉 README + 顶层文件结构（私有仓库可见）。"""
+        import requests
+
+        m = re.match(r"https?://github\.com/([^/]+)/([^/?#]+)", url)
+        if not m:
+            return None
+        owner, repo = m.group(1), m.group(2)
+        headers = {**kw.get("headers", {}), "Authorization": f"Bearer {token}"}
+        proxies = kw.get("proxies")
+        get_kw = {"headers": headers, "timeout": 10}
+        if proxies:
+            get_kw["proxies"] = proxies
+        parts: list[str] = []
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/readme",
+                headers={**headers, "Accept": "application/vnd.github.raw"},
+                timeout=10, proxies=proxies or {},
+            )
+            if r.status_code == 200:
+                parts.append("README:\n" + r.text[:6000])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/",
+                timeout=10, headers=headers, proxies=proxies or {},
+            )
+            if r.status_code == 200:
+                items = r.json()
+                if isinstance(items, list):
+                    lines = [
+                        ("DIR  " if it.get("type") == "dir" else "     ") + it.get("name", "")
+                        for it in items
+                    ]
+                    parts.append("仓库顶层结构（进入仓库后请用 github_repo 逐层查看）：\n" + "\n".join(lines))
+        except Exception:  # noqa: BLE001
+            pass
+        return "\n\n".join(parts) if parts else None
 
     def _git_proxy(self) -> str | None:
         """复用 git 全局代理（与用户 git 行为一致），失败则返回 None。"""
