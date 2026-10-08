@@ -28,6 +28,10 @@ export default function ConfigPage() {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ kind: "error" | "info"; text: string } | null>(null);
   const [started, setStarted] = useState(false);
+  const [ghToken, setGhToken] = useState("");
+  const [ghConfigured, setGhConfigured] = useState(false);
+  const [ghMasked, setGhMasked] = useState("");
+  const [ghSaving, setGhSaving] = useState(false);
 
   useEffect(() => {
     api
@@ -49,6 +53,13 @@ export default function ConfigPage() {
       })
       .catch((e) => setMsg({ kind: "error", text: String((e as Error)?.message ?? e) }))
       .finally(() => setLoading(false));
+    api
+      .getGithubToken()
+      .then((r) => {
+        setGhConfigured(r.configured);
+        setGhMasked(r.masked);
+      })
+      .catch(() => {});
   }, []);
 
   const updateProvider = (i: number, patch: Partial<ProviderForm>) => {
@@ -110,6 +121,21 @@ export default function ConfigPage() {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const saveGithubToken = async () => {
+    setGhSaving(true);
+    try {
+      const r = await api.putGithubToken(ghToken.trim());
+      setGhConfigured(r.configured);
+      setGhMasked(r.masked);
+      setGhToken("");
+      setMsg({ kind: "info", text: r.configured ? "GitHub Token 已保存（仅存本地），AI 现在可读你的私有仓库 ✅" : "已清除 GitHub Token" });
+    } catch (e) {
+      setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
+    } finally {
+      setGhSaving(false);
     }
   };
 
@@ -216,6 +242,34 @@ export default function ConfigPage() {
             </span>
           ))
         )}
+      </div>
+
+      <div className="card">
+        <h3>GitHub Token（读取你的私有仓库）</h3>
+        <p className="page-sub" style={{ marginBottom: 10 }}>
+          对话里的 AI 要读你的<strong>私有</strong> GitHub 仓库时，需要你显式提供 Token
+          （GitHub → Settings → Developer settings → Personal access tokens，勾选 repo
+          权限）。Token 只写入本地 <code>config/github_token.json</code>，不会上传、不会进对话。
+          不填则只能访问公开仓库，绝不自动读取系统 git 凭据。
+        </p>
+        <div className="field-row" style={{ alignItems: "end" }}>
+          <div style={{ flex: 1 }}>
+            <label>
+              Token（留空保存 = 清除）
+              {ghConfigured ? ` · 已配置 ${ghMasked} ✅` : " · 未配置"}
+            </label>
+            <input
+              type="password"
+              value={ghToken}
+              onChange={(e) => setGhToken(e.target.value)}
+              placeholder="ghp_... 或 github_pat_..."
+              style={{ width: "100%" }}
+            />
+          </div>
+          <button className="btn secondary" onClick={saveGithubToken} disabled={ghSaving}>
+            {ghSaving ? "保存中…" : ghConfigured ? "更新 Token" : "保存 Token"}
+          </button>
+        </div>
       </div>
 
       <button className="btn" onClick={save} disabled={saving || !started}>

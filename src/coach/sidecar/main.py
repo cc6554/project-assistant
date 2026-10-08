@@ -107,6 +107,35 @@ class ModelSelectInput(BaseModel):
     model: str
 
 
+class GithubTokenInput(BaseModel):
+    token: str
+
+
+@app.get("/api/settings/github-token")
+def get_github_token() -> dict:
+    """返回 GitHub Token 是否已配置（只回掩码，不回明文）。"""
+    p = paths.github_token_path()
+    token = ""
+    if p.exists():
+        try:
+            token = (json.loads(p.read_text(encoding="utf-8")) or {}).get("token", "") or ""
+        except Exception:  # noqa: BLE001
+            token = ""
+    return {"configured": bool(token), "masked": (token[:7] + "…" + token[-4:]) if token else ""}
+
+
+@app.put("/api/settings/github-token")
+def put_github_token(body: GithubTokenInput) -> dict:
+    """保存用户显式输入的 GitHub Token（本地 config/github_token.json，不入 git）。空串=清除。"""
+    token = (body.token or "").strip()
+    p = paths.github_token_path()
+    if token:
+        p.write_text(json.dumps({"token": token}, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        p.unlink(missing_ok=True)
+    return {"configured": bool(token), "masked": (token[:7] + "…" + token[-4:]) if token else ""}
+
+
 @app.get("/api/model")
 def get_model() -> dict:
     """全局当前模型 + 可选模型列表（来自 providers.yaml 的任务链，与配置的 key 同步）。"""

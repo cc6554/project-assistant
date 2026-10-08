@@ -182,4 +182,13 @@ export const api = {
     }[];
     tasks: Record<string, { provider: string; model: string }[]>;
   }) => req<{ ok: boolean }>("/api/config", json("PUT", cfg)),
+
+  // GitHub Token（私有仓库读取，用户显式输入）
+  getGithubToken: () =>
+    req<{ configured: boolean; masked: string }>("/api/settings/github-token"),
+  putGithubToken: (token: string) =>
+    req<{ configured: boolean; masked: string }>(
+      "/api/settings/github-token",
+      json("PUT", { token }),
+    ),
 };

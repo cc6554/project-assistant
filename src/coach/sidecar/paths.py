@@ -39,6 +39,13 @@ def config_path() -> Path:
     return c / "providers.yaml"
 
 
+def github_token_path() -> Path:
+    """用户显式输入的 GitHub Token（私有仓库读取用）；只读本文件，绝不自动读系统凭据。"""
+    c = app_root() / "config"
+    c.mkdir(parents=True, exist_ok=True)
+    return c / "github_token.json"
+
+
 def dist_dir() -> Path:
     """前端构建产物（Vite dist）。窗口直接加载 http://127.0.0.1:17689/。"""
     return app_root() / "dist"

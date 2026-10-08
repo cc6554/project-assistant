@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import uuid
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core.schema import ToolSpec
+from ..sidecar import paths
 
 OUTPUT_LIMIT = 30000          # 命令输出截断
 FILE_READ_LIMIT = 20000       # 读文件截断
@@ -243,19 +245,20 @@ class AgentRuntime:
         return f"（抓取失败：代理与直连均不可用。{last_err}）"
 
     def _github_token(self) -> str | None:
-        """从 git 凭据管理器取 GitHub token（私有仓库认证用）。token 只进请求头，绝不出现在返回内容。"""
+        """读取用户在设置页显式输入的 GitHub Token（config/github_token.json）。
+
+        只认用户主动配置的 token，绝不自动读取系统 git 凭据；
+        token 只进请求头，绝不出现在返回内容。
+        """
         try:
-            out = subprocess.run(
-                ["git", "credential", "fill"],
-                input="protocol=https\nhost=github.com\n\n",
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in (out.stdout or "").splitlines():
-                if line.startswith("password="):
-                    return line[len("password="):].strip() or None
+            p = paths.github_token_path()
+            if not p.exists():
+                return None
+            data = json.loads(p.read_text(encoding="utf-8")) or {}
+            tok = str(data.get("token") or "").strip()
+            return tok or None
         except Exception:  # noqa: BLE001
             return None
-        return None
 
     def _github_api_read(self, url: str, token: str, kw: dict) -> str | None:
         """对 github.com/{owner}/{repo} 用 API 拉 README + 顶层文件结构（私有仓库可见）。"""
