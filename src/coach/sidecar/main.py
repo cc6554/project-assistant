@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.llm.registry import VALID_API_MODES, load_config
 from ..core.llm.router import ModelRouter
@@ -41,6 +42,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    """所有响应禁用缓存：前端每次构建后，窗口/浏览器立即拿到最新版，避免旧缓存。"""
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return response
+
+
+app.add_middleware(NoCacheMiddleware)
 
 load_dotenv(paths.env_path())
 store = SessionStore()
