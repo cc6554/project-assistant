@@ -26,6 +26,7 @@ def plan_and_recommend(
     *,
     min_stars: int = 50,
     llm_rerank: bool = True,
+    preferences: dict[str, list[str]] | None = None,
 ) -> tuple[LearningPlan, list[GitHubRepo]]:
     """差距分析 + 学习计划 → 按计划检索词找 GitHub 复现项目。"""
     plan = build_learning_plan(router, jd, profile)
@@ -35,6 +36,7 @@ def plan_and_recommend(
         profile,
         min_stars=min_stars,
         llm_rerank=llm_rerank,
+        preferences=preferences,
     )
     return plan, repos
 

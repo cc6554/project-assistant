@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { api } from "../api";
+import VoiceInput from "../components/VoiceInput";
 import VoiceField from "../components/VoiceField";
 import type { JDCard, SessionState } from "../types";
 
@@ -22,6 +23,18 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
   const [mode, setMode] = useState<"search" | "upload">("search");
   // 方式 A：说岗位名，联网搜索
   const [query, setQuery] = useState("");
+  const [platform, setPlatform] = useState("boss");
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceText, setSourceText] = useState("");
+  const importSource = async () => {
+    setSearching(true); setMsg(null);
+    try {
+      const result = await api.importJd(sessionId, sourceUrl, sourceText);
+      applyJd(result.jd, "导入完成，请核对岗位信息");
+      onState(await api.getSession(sessionId));
+    } catch (error) { setMsg({ kind: "error", text: String(error) }); }
+    finally { setSearching(false); }
+  };
   const [searching, setSearching] = useState(false);
   // 方式 B：上传 / 粘贴截图
   const [files, setFiles] = useState<File[]>([]);
@@ -52,8 +65,9 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
     setSearching(true);
     setMsg(null);
     try {
-      const res = await api.searchJd(sessionId, query);
+      const res = await api.searchJd(sessionId, query, platform);
       applyJd(res.jd, `搜索并识别完成（基于 ${res.sources} 条结果），请核对下面的字段，有错的直接改`);
+      onState(await api.getSession(sessionId));
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
     } finally {
@@ -113,7 +127,7 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
       <label>{label}</label>
       {(values.length === 0 ? [""] : values).map((v, i) => (
         <div key={i} className="edit-line">
-          <input
+          <VoiceInput
             value={v}
             onChange={(e) => {
               const next = [...values];
@@ -143,6 +157,12 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
       <p className="page-sub">两种方式告诉 AI 你要投的岗位：说岗位名让 AI 去搜，或者直接给岗位详情截图（可粘贴）。</p>
 
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
+      <details className="card"><summary>从招聘平台链接 / 正文导入</summary>
+        <label>来源链接</label><VoiceField multiline={false} value={sourceUrl} onChange={setSourceUrl} placeholder="BOSS 直聘、猎聘或智联招聘的 HTTPS 链接" />
+        <label>岗位正文（链接无法直接访问时粘贴）</label><VoiceField value={sourceText} onChange={setSourceText} />
+        <button className="btn" disabled={searching || !sourceUrl.trim()} onClick={importSource}>导入并解析</button>
+      </details>
+      {!!state?.jd_sources?.length && <div className="card"><h3>岗位来源</h3>{state.jd_sources.map((source, i) => <p key={i}><a href={source.url} target="_blank" rel="noreferrer">{source.platform} · {source.title}</a>（{source.method}）</p>)}</div>}
 
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <button
@@ -163,6 +183,10 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
 
       {mode === "search" && (
         <div className="card">
+          <label>招聘平台（公开搜索索引）</label>
+          <select value={platform} onChange={event => setPlatform(event.target.value)}>
+            <option value="boss">BOSS 直聘</option><option value="liepin">猎聘</option><option value="zhilian">智联招聘</option>
+          </select>
           <label>岗位名称或方向</label>
           <VoiceField
             placeholder="例如：灵巧手抓取算法工程师 / 具身智能操作方向 / 大模型推理优化后端…可以加城市、关键词让搜索更准（回车搜索）"
@@ -240,26 +264,26 @@ export default function JobsPage({ sessionId, state, onState }: Props) {
               <div className="field-row">
                 <div>
                   <label>岗位名称</label>
-                  <input value={draft.job_title ?? ""} onChange={(e) => setJd({ job_title: e.target.value })} />
+                  <VoiceInput value={draft.job_title ?? ""} onChange={(e) => setJd({ job_title: e.target.value })} />
                 </div>
                 <div>
                   <label>公司</label>
-                  <input value={draft.company ?? ""} onChange={(e) => setJd({ company: e.target.value })} />
+                  <VoiceInput value={draft.company ?? ""} onChange={(e) => setJd({ company: e.target.value })} />
                 </div>
               </div>
               <div className="field-row">
                 <div>
                   <label>薪资（原文）</label>
-                  <input value={draft.salary ?? ""} onChange={(e) => setJd({ salary: e.target.value })} />
+                  <VoiceInput value={draft.salary ?? ""} onChange={(e) => setJd({ salary: e.target.value })} />
                 </div>
                 <div>
                   <label>地点</label>
-                  <input value={draft.location ?? ""} onChange={(e) => setJd({ location: e.target.value })} />
+                  <VoiceInput value={draft.location ?? ""} onChange={(e) => setJd({ location: e.target.value })} />
                 </div>
               </div>
               <div>
                 <label>团队 / 部门</label>
-                <input value={draft.team ?? ""} onChange={(e) => setJd({ team: e.target.value })} />
+                <VoiceInput value={draft.team ?? ""} onChange={(e) => setJd({ team: e.target.value })} />
               </div>
               {listEdit("硬性要求", draft.hard_requirements, (v) => setJd({ hard_requirements: v }))}
               {listEdit("技能标签", draft.skill_tags, (v) => setJd({ skill_tags: v }))}

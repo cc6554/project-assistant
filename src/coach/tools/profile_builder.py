@@ -179,6 +179,8 @@ def merge_profile_delta(
 
     for incoming in delta.skills:
         key = normalize_skill_name(incoming.name)
+        if key in {normalize_skill_name(name) for name in delta.remove_skills}:
+            continue
         current = by_key.get(key)
         if current is None:
             by_key[key] = incoming
@@ -218,6 +220,6 @@ def merge_profile_delta(
         summary=delta.summary or profile.summary,
         target_direction=delta.target_direction or profile.target_direction,
         skills=list(by_key.values()),
-        open_questions=questions[:10],
+        open_questions=questions,
         updated_at=datetime.now(),
     )

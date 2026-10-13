@@ -80,6 +80,7 @@ export interface ProviderInfo {
   api_key_env?: string | null;
   timeout: number;
   key_configured: boolean;
+  extra_body?: Record<string, unknown>;
 }
 
 export interface ConfigInfo {
@@ -102,6 +103,11 @@ export interface AgentLogEntry {
 
 export interface SessionState {
   session_id: string;
+  revision?: number;
+  agent_running?: boolean;
+  agent_pending?: { action_id: string; kind: string; summary: string; tool_call_id: string; payload: Record<string, unknown> } | null;
+  repository_preferences?: { include: string[]; exclude: string[] };
+  jd_sources?: { platform: string; url: string; title: string; text: string; method: string }[];
   jd?: JDCard | null;
   profile?: UserSkillProfile | null;
   plan?: LearningPlan | null;

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import VoiceField from "../components/VoiceField";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { SessionState } from "../types";
 
@@ -21,6 +22,10 @@ export default function PlanPage({ sessionId, state, onState, onStartAgent }: Pr
   const [msg, setMsg] = useState<{ kind: "error" | "info"; text: string } | null>(null);
   const [minStars, setMinStars] = useState(50);
   const [rerank, setRerank] = useState(true);
+  const [include, setInclude] = useState((state?.repository_preferences?.include ?? []).join(", "));
+  const [exclude, setExclude] = useState((state?.repository_preferences?.exclude ?? []).join(", "));
+  useEffect(() => { setInclude((state?.repository_preferences?.include ?? []).join(", ")); setExclude((state?.repository_preferences?.exclude ?? []).join(", ")); }, [state?.session_id]);
+  const terms = (value: string) => value.split(/[,，\n]/).map(term => term.trim()).filter(Boolean);
 
   const plan = state?.plan ?? null;
   const repos = state?.repos ?? [];
@@ -30,9 +35,10 @@ export default function PlanPage({ sessionId, state, onState, onStartAgent }: Pr
     setBusy(true);
     setMsg(null);
     try {
-      const res = await api.buildPlan(sessionId, minStars, rerank);
+      const res = await api.buildPlan(sessionId, minStars, rerank, terms(include), terms(exclude));
       onState({
         ...(state ?? { session_id: sessionId, repos: [], interview_history: [], coach_history: [] }),
+        repository_preferences: { include: terms(include), exclude: terms(exclude) },
         plan: res.plan,
         repos: res.repos,
       });
@@ -62,6 +68,10 @@ export default function PlanPage({ sessionId, state, onState, onStartAgent }: Pr
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
 
       <div className="card">
+        <label>只保留含这些关键词的项目（任一匹配，留空不限制）</label>
+        <VoiceField multiline={false} value={include} onChange={setInclude} placeholder="例如 DDPG；多个词用逗号分隔" />
+        <label>排除含这些关键词的项目（优先于保留条件）</label>
+        <VoiceField multiline={false} value={exclude} onChange={setExclude} placeholder="例如 Isaac, issac；只影响当前会话" />
         <div className="field-row" style={{ maxWidth: 480 }}>
           <div>
             <label>GitHub 最低 star 数</label>

@@ -25,7 +25,7 @@
 | LLM 接入 | 多 provider 注册表 | OpenAI 兼容 / Anthropic，YAML 配置，任务级 fallback 链 |
 
 - sidecar 只监听回环地址 `127.0.0.1:17689`，不走系统代理，避免被代理/TUN 拦截
-- 跨平台：Windows / Linux / macOS（代码零平台耦合，见下方构建）
+- 支持 Windows / Linux 的构建入口；Ubuntu 和桌面 WebView 功能仍需在目标机器实测。
 
 ```
 src/coach/
@@ -45,7 +45,7 @@ src/coach/
 │   ├── planner.py             # ③ 差距分析 + 分阶段计划（含异常重试）
 │   ├── github_search.py       # ③ GitHub 检索 + README/LLM 重排
 │   ├── pipeline.py            # 一键跑完整条管线
-│   ├── agent.py               # ④ Agent 运行时（工作区受限、按需确认）
+│   ├── agent.py               # ④ 通用 Agent 运行时（写入/命令按需确认）
 │   └── session.py             # 会话状态持久化
 └── sidecar/
     ├── main.py                # FastAPI：同源托管前端 + API + SSE 流式 Agent
@@ -59,6 +59,7 @@ src/coach/
 # 后端
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e .
 cp config/providers.example.yaml config/providers.yaml
 cp .env.example .env        # 填入你的 DEEPSEEK_API_KEY 等
 python -m coach.sidecar.main   # 启动 127.0.0.1:17689
@@ -68,21 +69,20 @@ npm install
 npm run build
 
 # 桌面壳（可选）
-cd src-tauri && cargo build --release
+cd src-tauri && cargo run
 ```
 
-浏览器打开 `http://127.0.0.1:17689/` 即可使用（无需 Rust 壳）。
+浏览器使用后端启动终端打印的带启动令牌链接进入（无需 Rust 壳）。令牌在 URL fragment 中，前端读取后移除，并为本标签页的 API 请求附加鉴权。桌面壳自动传递令牌；直接访问不带令牌的新标签页不能调用 API。
 
 ## 构建桌面应用
 
 ### Windows
 ```powershell
 pip install pyinstaller
-pyinstaller --noconfirm src-tauri/job-radar-sidecar.spec
-npm run build
-Copy-Item dist\* src-tauri\target\release\dist\ -Recurse -Force
-cd src-tauri; cargo build --release
+.\build-windows.ps1
 ```
+
+脚本会先在 PATH 中查找 Cargo，未找到时依次检查 `CARGO_HOME\bin` 和用户目录下的 `.cargo\bin`，仅为当前构建进程补充 PATH，不修改系统或用户环境变量。自定义安装位置需正确设置 `CARGO_HOME` 和 `RUSTUP_HOME`。
 
 ### Linux（Ubuntu 22.04+）
 ```bash
@@ -92,6 +92,10 @@ sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
 bash build-linux.sh     # 一键：venv → sidecar → 前端 → Rust 壳 → 组装
 ```
 
+两个脚本均将 sidecar 放入 `build/sidecar-dist/`，前端放入 `dist/`，最后组装到新建的 `build/releases/<时间戳>/`。请移动、分发和启动这个完整目录，而不是仅复制桌面 exe。发布目录只带配置模板，不复制开发机的 `.env`、Token 或模型配置；首次运行在模型配置页填入自己的密钥。
+
+发布版资源从可执行文件所在目录定位，可写配置、会话和工作区存入系统应用数据目录。可在启动前设置绝对路径 `JOB_RADAR_HOME`，例如 PowerShell 中 `$env:JOB_RADAR_HOME='F:\Doubao\job-radar-data'`，将运行数据保存在 F 盘。迁移旧版数据时，先退出程序，再把自己的 `data/`、`config/`、`workspace/` 和 `.env` 复制到该数据目录；这些私人文件不要放入分发包。开发态 Python 默认继续使用项目根目录。
+
 ## 配置模型
 
 `config/providers.yaml` 是唯一需要了解的配置：任何 OpenAI 兼容端点只需加一段注册，`tasks` 定义每个环节的 fallback 链（如识图用视觉模型、规划用强推理模型）。API key 一律放 `.env`（`api_key_env` 指向的环境变量），不进代码。
@@ -99,9 +103,19 @@ bash build-linux.sh     # 一键：venv → sidecar → 前端 → Rust 壳 → 
 ## 安全
 
 - Agent 能操作真实电脑：只读操作（列目录/读文件）自动执行；写文件、跑命令、git clone 一律**先弹确认**，你批准才执行
-- Agent 文件操作被限制在应用工作区目录内（路径越界自动拒绝）
-- 会话数据（岗位截图、技能档案、计划）只存本机 `data/`
+- Agent 是通用电脑操作助手：默认工作目录为 `workspace/`，也能访问指定的其他本地路径；审批时请核对完整路径、命令及写入内容。
+- 会话数据（岗位截图、技能档案、计划）存入本机数据目录下的 `data/`。
 
 ## License
 
 MIT
+
+## 回归检查
+
+```bash
+python -m pytest -q
+node tests/frontend_remediation.cjs
+npx tsc --noEmit
+```
+
+测试使用模拟模型、网络和麦克风，验证逻辑及接口。真实模型质量、招聘平台在线可用性、系统剪贴板/麦克风和 Ubuntu 桌面启动仍需另做实机验收。

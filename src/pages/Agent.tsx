@@ -104,13 +104,17 @@ async function consumeSSE(
   }
 }
 
-export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: Props) {
+export default function AgentPage({ sessionId, state, onState, prefill, onPrefillUsed }: Props) {
   const [items, setItems] = useState<TimelineItem[]>([]);
   const [pending, setPending] = useState<PendingInfo | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [thinking, setThinking] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const syncState = async () => { const latest = await api.getSession(sessionId); if (mounted.current) onState(latest); };
+  useEffect(() => { void syncState().catch(() => {}); const timer = window.setInterval(() => { if (!busyRef.current) void syncState().catch(() => {}); }, 2000); return () => window.clearInterval(timer); }, [sessionId]);
   const listRef = useRef<HTMLDivElement>(null);
   const busyRef = useRef(false);
   busyRef.current = busy;
@@ -129,9 +133,9 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
   useEffect(() => {
     idSeq = 0;
     setItems(logsToItems(state?.agent_logs));
-    setPending(null);
+    if (!busyRef.current) setPending(state?.agent_pending ?? null);
     setErr(null);
-  }, [sessionId, state?.agent_logs]);
+  }, [sessionId, state?.agent_logs, state?.agent_pending]);
 
   // 自动滚到底部
   useEffect(() => {
@@ -142,6 +146,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
     setItems((prev) => [...prev, { ...item, id: nid() }]);
 
   const handleEvent = (event: string, data: Record<string, unknown>) => {
+    if (!mounted.current) return;
     switch (event) {
       case "thinking":
         setThinking(true);
@@ -212,11 +217,13 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
     try {
       const res = await api.agentTurnStream(sessionId, message);
       await consumeSSE(res, handleEvent);
+      await syncState();
     } catch (e) {
       setErr(String((e as Error)?.message ?? e));
     } finally {
       setThinking(false);
       setBusy(false);
+      void syncState().catch(() => {});
     }
   };
 
@@ -228,11 +235,13 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
     try {
       const res = await api.agentConfirmStream(sessionId, pending.action_id, approve);
       await consumeSSE(res, handleEvent);
+      await syncState();
     } catch (e) {
       setErr(String((e as Error)?.message ?? e));
     } finally {
       setThinking(false);
       setBusy(false);
+      void syncState().catch(() => {});
     }
   };
 
@@ -248,6 +257,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
       setErr(String((e as Error)?.message ?? e));
     } finally {
       setBusy(false);
+      void syncState().catch(() => {});
     }
   };
 
@@ -256,7 +266,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
       <h2 className="page-title">④ Agent 实操（能操作这台电脑）</h2>
       <p className="page-sub">
         像 Codex 一样：Agent 的每一步操作都实时显示在这里，过往记录会保存，刷新不丢。只读操作自动执行；
-        写文件 / 跑命令 / git clone 会停在确认卡等你批准。工作区：<b>应用目录 /workspace</b>。
+        写文件 / 跑命令 / git clone 会停在确认卡等你批准。默认目录为数据目录下的 workspace；也能访问指定的其他本地路径，请核对下方完整操作。
       </p>
 
       {!hasPlan && (
@@ -275,7 +285,7 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
                 className="chip"
                 style={{ cursor: "pointer", background: "var(--panel-2)" }}
                 onClick={() => setInput(`帮我 clone 并上手 ${r.full_name} 这个项目，先摸清结构再给我行动计划`)}
-                disabled={busy}
+                disabled={busy || !!state?.agent_running}
               >
                 {r.full_name} ⭐{r.stargazers_count}
               </button>
@@ -388,16 +398,31 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
               >
                 {pending.summary}
               </pre>
+              {pending.kind === "write_file" && <>
+                <p>完整路径：<code>{String(pending.payload.path ?? "")}</code></p>
+                <label>将写入的完整内容</label>
+                <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 400, overflow: "auto" }}>{String(pending.payload.content ?? "")}</pre>
+                <label>与原文件的差异</label>
+                <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 400, overflow: "auto" }}>{String(pending.payload.diff ?? "此旧审批没有保存差异；可拒绝并重新生成预览。")}</pre>
+              </>}
+              {pending.kind === "run_command" && <>
+                <p>解释器：{String(pending.payload.shell ?? "系统命令解释器")} · 工作目录：<code>{String(pending.payload.cwd ?? "")}</code></p>
+                <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{String(pending.payload.command ?? "")}</pre>
+              </>}
+              {pending.kind === "git_clone" && <>
+                <p>仓库：<code>{String(pending.payload.url ?? "")}</code></p>
+                <p>目标目录：<code>{String(pending.payload.dest ?? "")}</code></p>
+              </>}
               <div style={{ display: "flex", gap: 8 }}>
                 <button
                   className="btn"
                   style={{ background: "var(--ok)", color: "var(--btn-text)" }}
                   onClick={() => confirm(true)}
-                  disabled={busy}
+                  disabled={busy || !!state?.agent_running}
                 >
                   {busy ? "执行中…" : "✓ 同意执行"}
                 </button>
-                <button className="btn danger" onClick={() => confirm(false)} disabled={busy}>
+                <button className="btn danger" onClick={() => confirm(false)} disabled={busy || !!state?.agent_running}>
                   ✕ 拒绝
                 </button>
               </div>
@@ -428,14 +453,14 @@ export default function AgentPage({ sessionId, state, prefill, onPrefillUsed }: 
           >
             发送
           </button>
-          <button className="btn" onClick={reset} disabled={busy} title="清空对话与待确认（不影响工作区文件）">
+          <button className="btn" onClick={reset} disabled={busy || !!state?.agent_running} title="清空对话与待确认（不影响工作区文件）">
             重置
           </button>
         </div>
       </div>
 
       <p className="page-sub" style={{ marginTop: 10 }}>
-        说明：Agent 的命令在你的电脑上真实运行，仅限应用目录 /workspace；任何写文件、命令、克隆都需你确认。遇到危险命令直接点「拒绝」。
+        说明：Agent 的命令在你的电脑上真实运行，默认在数据目录的 workspace 中运行，也可访问指定的其他路径；任何写文件、命令、克隆都需你确认。遇到危险命令直接点「拒绝」。
       </p>
     </div>
   );

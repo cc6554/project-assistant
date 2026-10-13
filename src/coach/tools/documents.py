@@ -14,10 +14,13 @@ from __future__ import annotations
 import json as json_mod
 import re
 import zipfile
+import posixpath
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from pypdf import PdfReader
+
+SUPPORTED_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".log", ".json", ".csv", ".pdf", ".docx", ".docm", ".pptx", ".pptm", ".xlsx", ".xlsm"})
 
 
 class UnsupportedDocumentError(ValueError):
@@ -46,9 +49,25 @@ def _docx_text(path: Path) -> str:
 
 def _pptx_text(path: Path) -> str:
     with zipfile.ZipFile(str(path)) as z:
-        names = sorted(
-            n for n in z.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)
-        )
+        try:
+            presentation = ET.fromstring(z.read("ppt/presentation.xml"))
+            relationships = ET.fromstring(z.read("ppt/_rels/presentation.xml.rels"))
+            targets = {r.attrib["Id"]: r.attrib["Target"] for r in relationships
+                       if r.attrib.get("TargetMode") != "External" and r.attrib.get("Type", "").endswith("/slide")}
+            names = []
+            for node in presentation.iter():
+                if _local(node.tag) != "sldId":
+                    continue
+                relation = next((v for k, v in node.attrib.items() if k.endswith("}id")), None)
+                target = targets.get(relation)
+                if target is None:
+                    raise ValueError("Missing slide relationship")
+                name = posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join("ppt", target))
+                if not name.startswith("ppt/slides/"):
+                    raise ValueError("Invalid slide target")
+                names.append(name)
+        except (KeyError, ValueError, ET.ParseError) as exc:
+            raise UnsupportedDocumentError(f"PPT 页面关系无效：{path.name}") from exc
         if not names:
             raise UnsupportedDocumentError(f"不是有效的 PPT 文档：{path.name}")
         slides: list[str] = []

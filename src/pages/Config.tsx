@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import VoiceInput from "../components/VoiceInput";
 import type { ConfigInfo } from "../types";
 
 interface ProviderForm {
@@ -9,6 +10,7 @@ interface ProviderForm {
   api_key_env: string;
   api_key: string;
   timeout: number;
+  extra_body?: Record<string, unknown>;
 }
 
 const EMPTY: ProviderForm = {
@@ -20,7 +22,7 @@ const EMPTY: ProviderForm = {
   timeout: 180,
 };
 
-export default function ConfigPage() {
+export default function ConfigPage({ onSaved }: { onSaved?: () => void }) {
   const [cfg, setCfg] = useState<ConfigInfo | null>(null);
   const [providers, setProviders] = useState<ProviderForm[]>([]);
   const [tasks, setTasks] = useState<Record<string, { provider: string; model: string }[]>>({});
@@ -47,6 +49,7 @@ export default function ConfigPage() {
             api_key_env: p.api_key_env ?? "",
             api_key: "",
             timeout: p.timeout,
+            extra_body: p.extra_body ?? {},
           })),
         );
         setStarted(true);
@@ -107,15 +110,17 @@ export default function ConfigPage() {
           api_key_env: p.api_key_env.trim() || null,
           api_key: p.api_key || null,
           timeout: Number(p.timeout) || 120,
+          extra_body: p.extra_body ?? {},
         })),
         tasks,
       });
       setMsg({ kind: "info", text: "配置已保存并校验通过 ✅" });
+      onSaved?.();
       // 重新加载以刷新 key 状态
       const c = await api.getConfig();
       setCfg(c);
       setProviders((ps) =>
-        ps.map((p, i) => ({ ...p, api_key: "", api_key_env: Object.keys(c.providers)[i] ?? p.api_key_env })),
+        ps.map((p) => ({ ...p, api_key: "", api_key_env: c.providers[p.name.trim()]?.api_key_env ?? "", extra_body: c.providers[p.name.trim()]?.extra_body ?? {} })),
       );
     } catch (e) {
       setMsg({ kind: "error", text: String((e as Error)?.message ?? e) });
@@ -146,7 +151,7 @@ export default function ConfigPage() {
       <h2 className="page-title">模型配置</h2>
       <p className="page-sub">
         在这里添加任意 OpenAI 兼容 / Anthropic 兼容厂商，保存后立即可用；API Key 仅写入本地{" "}
-        <code>.env</code>，不会上传。
+        <code>.env</code>；仅在调用对应模型服务时用于认证。
       </p>
 
       {msg && <div className={`alert ${msg.kind}`}>{msg.text}</div>}
@@ -159,7 +164,7 @@ export default function ConfigPage() {
             <div className="field-row">
               <div>
                 <label>名称（唯一标识）</label>
-                <input value={p.name} onChange={(e) => updateProvider(i, { name: e.target.value })} placeholder="deepseek" />
+                <VoiceInput value={p.name} onChange={(e) => updateProvider(i, { name: e.target.value })} placeholder="deepseek" />
               </div>
               <div>
                 <label>API 模式</label>
@@ -170,11 +175,11 @@ export default function ConfigPage() {
               </div>
             </div>
             <label>Base URL（以 /v1 结尾，如 https://api.deepseek.com/v1）</label>
-            <input value={p.base_url} onChange={(e) => updateProvider(i, { base_url: e.target.value })} placeholder="https://api.deepseek.com/v1" />
+            <VoiceInput value={p.base_url} onChange={(e) => updateProvider(i, { base_url: e.target.value })} placeholder="https://api.deepseek.com/v1" />
             <div className="field-row">
               <div>
                 <label>环境变量名（API Key 存哪里）</label>
-                <input value={p.api_key_env} onChange={(e) => updateProvider(i, { api_key_env: e.target.value })} placeholder="DEEPSEEK_API_KEY" />
+                <VoiceInput value={p.api_key_env} onChange={(e) => updateProvider(i, { api_key_env: e.target.value })} placeholder="DEEPSEEK_API_KEY" />
               </div>
               <div>
                 <label>
@@ -212,13 +217,13 @@ export default function ConfigPage() {
             <label style={{ fontWeight: 700 }}>任务：{task}</label>
             {chain.map((t, i) => (
               <div key={i} className="edit-line">
-                <input
+                <VoiceInput
                   placeholder="provider"
                   value={t.provider}
                   onChange={(e) => updateTask(task, i, { provider: e.target.value })}
                   style={{ width: 180 }}
                 />
-                <input placeholder="model" value={t.model} onChange={(e) => updateTask(task, i, { model: e.target.value })} />
+                <VoiceInput placeholder="model" value={t.model} onChange={(e) => updateTask(task, i, { model: e.target.value })} />
                 <button className="btn danger" onClick={() => removeTaskStep(task, i)}>
                   ✕
                 </button>
@@ -249,7 +254,7 @@ export default function ConfigPage() {
         <p className="page-sub" style={{ marginBottom: 10 }}>
           对话里的 AI 要读你的<strong>私有</strong> GitHub 仓库时，需要你显式提供 Token
           （GitHub → Settings → Developer settings → Personal access tokens，勾选 repo
-          权限）。Token 只写入本地 <code>config/github_token.json</code>，不会上传、不会进对话。
+          权限）。Token 只写入本地 <code>config/github_token.json</code>，仅发往 GitHub 官方 HTTPS 服务的认证请求头，不进对话。
           不填则只能访问公开仓库，绝不自动读取系统 git 凭据。
         </p>
         <div className="field-row" style={{ alignItems: "end" }}>

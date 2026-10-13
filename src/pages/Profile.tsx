@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { api } from "../api";
+import VoiceInput from "../components/VoiceInput";
 import VoiceField from "../components/VoiceField";
 import type { SessionState, UserSkillProfile } from "../types";
 
@@ -59,7 +60,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
       setClarifyOutline(res.outline);
       setClarifyOutlineOpen(true);
       setClarifyRemaining(res.remaining);
-      if (res.profile) updateProfile(res.profile);
+      if (res.profile) { updateProfile(res.profile); setClarifyOutline(res.profile.open_questions); }
       setClarifyA("");
       setClarifyMsgs(res.opening ? [{ role: "assistant", content: res.opening }] : []);
       void api.getModel().then((m) =>
@@ -139,7 +140,7 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
     setClarifyA("");
     try {
       const res = await api.clarifyChat(sessionId, msg, history);
-      if (res.profile) updateProfile(res.profile);
+      if (res.profile) { updateProfile(res.profile); setClarifyOutline(res.profile.open_questions); }
       const next = [...history, userMsg];
       if (res.reply && res.reply.trim()) next.push({ role: "assistant", content: res.reply });
       setClarifyRemaining(res.remaining ?? 0);
@@ -408,12 +409,12 @@ export default function ProfilePage({ sessionId, state, onState }: Props) {
         <div className="card">
           <h3>从本地路径读取经历（Obsidian 库 / 任意笔记目录）</h3>
           <p className="page-sub">
-            填一个本地目录或文件路径，Agent 自己读取路径下的全部文件（支持 .md / .txt / .log / .pdf，数量不限制，跳过附件 / 模板 / 程序目录），
+            填一个本地目录或文件路径，Agent 自己读取路径下的全部文件（支持纯文本 / JSON / CSV / PDF / Word / Excel / PPT，数量不限制，跳过附件 / 模板 / 程序目录），
             从中抽取你的技能与经历。Obsidian 库直接填 Vault 目录即可。
             文件多时全部解析可能需要几分钟。
           </p>
           <label>本地路径（目录或单个文件）</label>
-          <input
+          <VoiceInput
             placeholder="例如 D:\我的笔记 或 /home/cxy/Documents/Obsidian 或 F:\resume.pdf"
             value={vaultPath}
             onChange={(e) => setVaultPath(e.target.value)}

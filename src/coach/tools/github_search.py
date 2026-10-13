@@ -6,7 +6,7 @@
 2. LLM 复现适配度重排（可关）：读候选仓库 README 摘要，结合用户技能档案，
    判断「以该用户当前水平能否复现、复现能否补差距」给出分数与理由。
 
-设置环境变量 GITHUB_TOKEN 可把搜索限额从 10 次/分钟提高到 30 次/分钟。
+认证只使用设置页显式保存的 Token；公共推荐强制过滤私有结果。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from ..core.llm.router import ModelRouter
 from ..core.schema import Message
 from ..domain.schemas import GitHubRepo, UserSkillProfile
+from .credentials import github_token
 
 API_ROOT = "https://api.github.com"
 README_CHAR_LIMIT = 3000
@@ -31,11 +32,11 @@ RERANK_POOL_NO_TOKEN = 4  # 无 token 限额 10 次/分钟：4 查询 + 4 README
 
 
 def _rerank_pool_size() -> int:
-    return RERANK_POOL_WITH_TOKEN if os.environ.get("GITHUB_TOKEN") else RERANK_POOL_NO_TOKEN
+    return RERANK_POOL_WITH_TOKEN if github_token() else RERANK_POOL_NO_TOKEN
 
 
 def _max_queries() -> int:
-    return 8 if os.environ.get("GITHUB_TOKEN") else 4
+    return 8 if github_token() else 4
 
 _RERANK_PROMPT = """你在为一个求学者挑选最适合「动手复现」的 GitHub 项目。
 
@@ -73,11 +74,19 @@ def search_github_projects(
     top_n: int = 10,
     llm_rerank: bool = True,
     task: str = "planning",
+    preferences: dict[str, list[str]] | None = None,
 ) -> list[GitHubRepo]:
     if not queries:
         return []
 
+    preferences = preferences or {}
     candidates = _collect_candidates(queries, min_stars, recency_days)
+    include = [x.strip().casefold() for x in preferences.get("include", []) if x.strip()]
+    exclude = [x.strip().casefold() for x in preferences.get("exclude", []) if x.strip()]
+    def allowed(item):
+        text = (item["full_name"] + " " + item.get("description", "")).casefold()
+        return not any(x in text for x in exclude) and (not include or any(x in text for x in include))
+    candidates = [item for item in candidates if allowed(item)]
     if not candidates:
         return []
 
@@ -108,7 +117,7 @@ def _client() -> httpx.Client:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    token = os.environ.get("GITHUB_TOKEN")
+    token = github_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(timeout=20.0, headers=headers)
@@ -126,7 +135,7 @@ def _collect_candidates(
 
     with _client() as client:
         for query in list(queries)[: _max_queries()]:
-            q = f"{query} stars:>{min_stars - 1} pushed:>{pushed_after}"
+            q = f"{query} is:public stars:>{min_stars - 1} pushed:>{pushed_after}"
             try:
                 resp = client.get(
                     f"{API_ROOT}/search/repositories",
@@ -141,7 +150,7 @@ def _collect_candidates(
                 continue
 
             for item in resp.json().get("items", []):
-                if item.get("archived") or item.get("disabled"):
+                if item.get("private") is not False or item.get("visibility", "public") != "public" or item.get("archived") or item.get("disabled"):
                     continue
                 full_name = item["full_name"]
                 scored = _score_repo(item)

@@ -11,13 +11,29 @@ import type {
 
 const BASE = "http://127.0.0.1:17689";
 
+function clientToken(): string {
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  const token = fragment.get("token");
+  if (token) {
+    sessionStorage.setItem("job-radar-token", token);
+    fragment.delete("token");
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + (fragment.toString() ? "#" + fragment : ""));
+  }
+  return token || sessionStorage.getItem("job-radar-token") || "";
+}
+function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers);
+  headers.set("X-Job-Radar-Token", clientToken());
+  return fetch(BASE + path, { ...init, headers });
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + path, init);
+  const res = await apiFetch(path, init);
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
       const body = await res.json();
-      if (body?.detail) detail = String(body.detail);
+      if (body?.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
     } catch {
       /* ignore */
     }
@@ -54,11 +70,12 @@ export const api = {
       body: form,
     });
   },
-  searchJd: (sessionId: string, query: string) =>
+  searchJd: (sessionId: string, query: string, platform = "boss") =>
     req<{ jd: JDCard; sources: number }>(
       `/api/sessions/${sessionId}/jd/search`,
-      json("POST", { query }),
+      json("POST", { query, platform }),
     ),
+  importJd: (sessionId: string, url: string, text: string) => req<{ jd: JDCard; sources: number }>(`/api/sessions/${sessionId}/jd/import`, json("POST", { url, text })),
   updateJd: (sessionId: string, jd: JDCard) =>
     req<{ ok: boolean; jd: JDCard }>(`/api/sessions/${sessionId}/jd`, json("PUT", jd)),
 
@@ -91,8 +108,8 @@ export const api = {
       options: { provider: string; model: string }[];
       current: { provider: string; model: string } | null;
     }>("/api/model"),
-  setModel: (provider: string, model: string) =>
-    req<{ ok: boolean; current: { provider: string; model: string } }>(
+  setModel: (provider: string | null, model: string | null) =>
+    req<{ ok: boolean; current: { provider: string; model: string } | null }>(
       "/api/model",
       json("PUT", { provider, model }),
     ),
@@ -143,10 +160,10 @@ export const api = {
     ),
 
   // 计划 + GitHub
-  buildPlan: (sessionId: string, minStars = 50, llmRerank = true) =>
+  buildPlan: (sessionId: string, minStars = 50, llmRerank = true, include: string[] = [], exclude: string[] = []) =>
     req<{ plan: LearningPlan; repos: GitHubRepo[] }>(
       `/api/sessions/${sessionId}/plan`,
-      json("POST", { min_stars: minStars, llm_rerank: llmRerank }),
+      json("POST", { min_stars: minStars, llm_rerank: llmRerank, include, exclude }),
     ),
 
   // 导师指导
@@ -163,9 +180,9 @@ export const api = {
 
   // 实操 Agent（能操作电脑）——SSE 流式，返回原始 Response 由页面逐步解析
   agentTurnStream: (sessionId: string, message: string) =>
-    fetch(BASE + `/api/sessions/${sessionId}/agent/turn`, json("POST", { message })),
+    apiFetch(`/api/sessions/${sessionId}/agent/turn`, json("POST", { message })),
   agentConfirmStream: (sessionId: string, actionId: string, approve: boolean) =>
-    fetch(BASE + `/api/sessions/${sessionId}/agent/confirm`, json("POST", { action_id: actionId, approve })),
+    apiFetch(`/api/sessions/${sessionId}/agent/confirm`, json("POST", { action_id: actionId, approve })),
   agentReset: (sessionId: string) =>
     req<{ ok: boolean }>(`/api/sessions/${sessionId}/agent/reset`, { method: "POST" }),
 
@@ -179,6 +196,7 @@ export const api = {
       api_key_env?: string | null;
       api_key?: string | null;
       timeout: number;
+      extra_body?: Record<string, unknown>;
     }[];
     tasks: Record<string, { provider: string; model: string }[]>;
   }) => req<{ ok: boolean }>("/api/config", json("PUT", cfg)),

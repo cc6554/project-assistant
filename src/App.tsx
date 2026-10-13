@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { SessionState, SessionSummary } from "./types";
 import JobsPage from "./pages/Jobs";
@@ -21,8 +21,12 @@ export default function App() {
   const [page, setPage] = useState<Page>("jobs");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  selectedRef.current = sessionId;
+  const acceptState = (next: SessionState) => { if (next.session_id === selectedRef.current) setState(next); };
   const [state, setState] = useState<SessionState | null>(null);
   const [sidecarOk, setSidecarOk] = useState(false);
+  const [connectionError, setConnectionError] = useState("");
   const [checking, setChecking] = useState(true);
   const [agentPrefill, setAgentPrefill] = useState<string>("");
   // 全局模型选择（与配置的 API key 模型同步）
@@ -77,9 +81,11 @@ export default function App() {
         setSidecarOk(true);
         const list = await api.listSessions();
         setSessions(list);
-        if (list.length && !sessionId) setSessionId(list[0].id);
+        setConnectionError("");
+        if (list.length) setSessionId(current => current ?? list[0].id);
         setChecking(false);
-      } catch {
+      } catch (error) {
+        setConnectionError(String((error as Error)?.message ?? error));
         setSidecarOk(false);
         setChecking(false);
       }
@@ -92,11 +98,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setState(null);
     if (!sessionId) return;
-    api
-      .getSession(sessionId)
-      .then(setState)
-      .catch(() => setState(null));
+    let cancelled = false;
+    api.getSession(sessionId).then(next => { if (!cancelled) acceptState(next); })
+      .catch(() => { if (!cancelled) setState(null); });
+    return () => { cancelled = true; };
   }, [sessionId]);
 
   const loadModel = async () => {
@@ -125,6 +132,7 @@ export default function App() {
   const newSession = async (sourceSessionId?: string) => {
     setNewOpen(false);
     const res = await api.createSession(sourceSessionId);
+    selectedRef.current = res.id;
     setSessionId(res.id);
     setState(null);
     await refreshSessions(res.id);
@@ -132,6 +140,7 @@ export default function App() {
   };
 
   const selectSession = async (id: string) => {
+    selectedRef.current = id;
     setSessionId(id);
     setPage("jobs");
   };
@@ -182,7 +191,7 @@ export default function App() {
             value={currentModel ? `${currentModel.provider}/${currentModel.model}` : ""}
             onChange={async (e) => {
               const v = e.target.value;
-              if (!v) return;
+              if (!v) { try { await api.setModel(null, null); setCurrentModel(null); } catch (error) { alert(String(error)); } return; }
               const [provider, ...rest] = v.split("/");
               const model = rest.join("/");
               try {
@@ -227,8 +236,8 @@ export default function App() {
 
       <main className="main">
         {!sidecarOk ? (
-          <div className="alert error">本地 AI 服务未启动（127.0.0.1:17689），请重启应用。</div>
-        ) : !sessionId ? (
+          <div className="alert error">本地服务连接失败：{connectionError || "请重启桌面应用或使用后端启动链接进入"}</div>
+        ) : page === "config" ? <ConfigPage onSaved={() => void loadModel()} /> : !sessionId ? (
           <div className="card">
             <h3>开始之前</h3>
             <p className="page-sub">先新建一个会话，然后按 ①→②→③ 的顺序操作：上传岗位截图 → 建立技能档案 → 生成计划。</p>
@@ -238,26 +247,25 @@ export default function App() {
           </div>
         ) : (
           <>
-            {page === "jobs" && <JobsPage sessionId={sessionId} state={state} onState={setState} />}
-            {page === "profile" && <ProfilePage sessionId={sessionId} state={state} onState={setState} />}
+            {page === "jobs" && <JobsPage key={sessionId} sessionId={sessionId} state={state} onState={acceptState} />}
+            {page === "profile" && <ProfilePage key={sessionId} sessionId={sessionId} state={state} onState={acceptState} />}
             {page === "plan" && (
-              <PlanPage
+              <PlanPage key={sessionId}
                 sessionId={sessionId}
                 state={state}
-                onState={setState}
+                onState={acceptState}
                 onStartAgent={startAgentFromPlan}
               />
             )}
             {page === "agent" && (
-              <AgentPage
+              <AgentPage key={sessionId}
                 sessionId={sessionId}
                 state={state}
-                onState={setState}
+                onState={acceptState}
                 prefill={agentPrefill}
                 onPrefillUsed={() => setAgentPrefill("")}
               />
             )}
-            {page === "config" && <ConfigPage />}
           </>
         )}
       </main>

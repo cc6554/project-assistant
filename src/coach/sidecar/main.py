@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
+from threading import RLock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -18,7 +20,7 @@ import yaml
 from dotenv import load_dotenv, set_key
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -27,18 +29,19 @@ from ..core.llm.registry import VALID_API_MODES, load_config
 from ..core.llm.router import ModelRouter
 from ..core.schema import Message
 from ..domain.schemas import JDCard
-from ..tools import documents, github_search, interviewer, jd_parser, planner, profile_builder, web_search
+from ..tools import job_sources, documents, github_search, interviewer, jd_parser, planner, profile_builder, web_search
 from ..tools.agent import AGENT_SYSTEM_PROMPT, AGENT_TOOLS, AgentRuntime, PendingAction
 from ..tools.pipeline import plan_and_recommend
 from . import paths
-from .store import SessionNotFound, SessionStore
+from .store import SessionNotFound, SessionStore, SessionConflict
+from .auth import API_TOKEN, INSTANCE_ID, ORIGINS, LocalAuthMiddleware
 
 PORT = 17689
 
 app = FastAPI(title="job-radar-coach sidecar", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 仅回环监听；Tauri webview 来源 http://127.0.0.1:17689
+    allow_origins=sorted(ORIGINS),  # 仅回环监听；Tauri webview 来源 http://127.0.0.1:17689
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -54,6 +57,15 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(NoCacheMiddleware)
+app.add_middleware(LocalAuthMiddleware)
+
+@app.exception_handler(SessionConflict)
+async def session_conflict(request, exc):
+    return JSONResponse({"detail": str(exc)}, status_code=409)
+
+@app.exception_handler(ValueError)
+async def invalid_input(request, exc):
+    return JSONResponse({"detail": str(exc)}, status_code=400)
 
 load_dotenv(paths.env_path())
 store = SessionStore()
@@ -73,7 +85,17 @@ def get_router() -> ModelRouter:
 
 def _session(session_id: str):
     try:
-        return store.get(session_id)
+        state = store.get(session_id)
+        if state.agent_running and (state.agent_execution or {}).get("instance_id") != INSTANCE_ID:
+            with store.lock(session_id):
+                state = store.get(session_id)
+                state.agent_running = False
+                state.agent_execution = {**(state.agent_execution or {}), "status": "interrupted"}
+                if state.agent_pending is None:
+                    _complete_missing_tools(state)
+                _agent_log(state, type="message", role="system", content="上次运行中断。操作结果可能不完整，请先检查实际文件和进程；不会自动重执行已领取的审批。")
+                store.save(state)
+        return state
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc
 
@@ -82,7 +104,7 @@ def _session(session_id: str):
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "port": PORT}
+    return {"ok": True, "port": PORT, "instance_id": INSTANCE_ID}
 
 
 # ── 模型配置 ─────────────────────────────────────────────────────
@@ -102,6 +124,7 @@ def get_config() -> dict:
             "api_key_env": key_env,
             "timeout": spec.get("timeout", 120),
             "key_configured": key_configured,
+            "extra_body": spec.get("extra_body") or {},
         }
         for chain in (raw.get("tasks") or {}).values():
             for item in chain:
@@ -116,8 +139,8 @@ def get_config() -> dict:
 
 
 class ModelSelectInput(BaseModel):
-    provider: str
-    model: str
+    provider: str | None = None
+    model: str | None = None
 
 
 class GithubTokenInput(BaseModel):
@@ -134,7 +157,7 @@ def get_github_token() -> dict:
             token = (json.loads(p.read_text(encoding="utf-8")) or {}).get("token", "") or ""
         except Exception:  # noqa: BLE001
             token = ""
-    return {"configured": bool(token), "masked": (token[:7] + "…" + token[-4:]) if token else ""}
+    return {"configured": bool(token), "masked": "********" if token else ""}
 
 
 @app.put("/api/settings/github-token")
@@ -143,10 +166,10 @@ def put_github_token(body: GithubTokenInput) -> dict:
     token = (body.token or "").strip()
     p = paths.github_token_path()
     if token:
-        p.write_text(json.dumps({"token": token}, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write(p, json.dumps({"token": token}, ensure_ascii=False, indent=2).encode("utf-8"))
     else:
         p.unlink(missing_ok=True)
-    return {"configured": bool(token), "masked": (token[:7] + "…" + token[-4:]) if token else ""}
+    return {"configured": bool(token), "masked": "********" if token else ""}
 
 
 @app.get("/api/model")
@@ -166,7 +189,7 @@ def get_model() -> dict:
     if cur_path.exists():
         try:
             cur = json.loads(cur_path.read_text(encoding="utf-8")) or {}
-            if cur.get("provider") and cur.get("model"):
+            if any(o == {"provider": cur.get("provider"), "model": cur.get("model")} for o in options):
                 current = {"provider": cur["provider"], "model": cur["model"]}
         except Exception:  # noqa: BLE001
             current = None
@@ -177,11 +200,14 @@ def get_model() -> dict:
 def put_model(body: ModelSelectInput) -> dict:
     """设置全局当前模型（持久化到 config/current_model.json，所有对话立即生效）。"""
     cur_path = paths.config_path().parent / "current_model.json"
-    cur_path.write_text(
-        json.dumps({"provider": body.provider, "model": body.model}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return {"ok": True, "current": {"provider": body.provider, "model": body.model}}
+    if not body.provider and not body.model:
+        cur_path.unlink(missing_ok=True)
+        return {"ok": True, "current": None}
+    current = {"provider": body.provider, "model": body.model}
+    if current not in get_model()["options"]:
+        raise HTTPException(status_code=400, detail="所选模型不在当前任务配置中")
+    _atomic_write(cur_path, json.dumps(current).encode("utf-8"))
+    return {"ok": True, "current": current}
 
 
 class ProviderInput(BaseModel):
@@ -191,6 +217,7 @@ class ProviderInput(BaseModel):
     api_key_env: str | None = None
     api_key: str | None = None  # 提供则写入 .env
     timeout: float = 120.0
+    extra_body: dict | None = None
 
 
 class ConfigInput(BaseModel):
@@ -198,45 +225,81 @@ class ConfigInput(BaseModel):
     tasks: dict[str, list[dict[str, str]]]
 
 
+_config_lock = RLock()
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 @app.put("/api/config")
 def put_config(cfg: ConfigInput) -> dict:
-    if not cfg.providers:
-        raise HTTPException(status_code=400, detail="至少需要一个 provider")
-    for p in cfg.providers:
-        if p.api_mode not in VALID_API_MODES:
-            raise HTTPException(status_code=400, detail=f"{p.name} 的 api_mode 不支持")
-        if not p.base_url:
-            raise HTTPException(status_code=400, detail=f"{p.name} 缺少 base_url")
-
-    providers_map: dict[str, dict[str, Any]] = {}
-    for p in cfg.providers:
-        entry: dict[str, Any] = {
-            "api_mode": p.api_mode,
-            "base_url": p.base_url,
-            "timeout": p.timeout,
-        }
-        if p.api_key_env:
-            entry["api_key_env"] = p.api_key_env
-        providers_map[p.name] = entry
-
-    doc = {
-        "providers": providers_map,
-        "tasks": cfg.tasks,
-    }
-    with paths.config_path().open("w", encoding="utf-8") as f:
-        yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
-
-    for p in cfg.providers:
-        if p.api_key and p.api_key_env:
-            set_key(paths.env_path(), p.api_key_env, p.api_key)
-            os.environ[p.api_key_env] = p.api_key
-
-    # 写完后校验配置合法
-    try:
-        load_config(paths.config_path())
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"配置写入但校验失败：{exc}") from exc
-    return {"ok": True}
+    from urllib.parse import urlsplit
+    with _config_lock:
+        if not cfg.providers or len({p.name for p in cfg.providers}) != len(cfg.providers):
+            raise HTTPException(status_code=400, detail="Provider 不能为空或重名")
+        config_file, env_file = paths.config_path(), paths.env_path()
+        old_config = config_file.read_bytes() if config_file.exists() else None
+        old_env = env_file.read_bytes() if env_file.exists() else None
+        raw = yaml.safe_load(old_config or b"") or {}
+        providers = {}
+        for provider in cfg.providers:
+            if not provider.name.strip() or provider.api_mode not in VALID_API_MODES or provider.timeout <= 0:
+                raise HTTPException(status_code=400, detail="Provider 名称、模式或超时无效")
+            parsed = urlsplit(provider.base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise HTTPException(status_code=400, detail="Endpoint 必须是 HTTP(S) 地址")
+            if provider.api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", provider.api_key_env):
+                raise HTTPException(status_code=400, detail="密钥环境变量名称无效")
+            if provider.api_key and not provider.api_key_env:
+                raise HTTPException(status_code=400, detail="填写密钥时必须指定环境变量名称")
+            entry = dict((raw.get("providers") or {}).get(provider.name, {}))
+            entry.update(api_mode=provider.api_mode, base_url=provider.base_url, timeout=provider.timeout)
+            if provider.api_key_env:
+                entry["api_key_env"] = provider.api_key_env
+            else:
+                entry.pop("api_key_env", None)
+            if provider.extra_body is not None:
+                entry["extra_body"] = provider.extra_body
+            providers[provider.name] = entry
+        if not cfg.tasks.get("default"):
+            raise HTTPException(status_code=400, detail="default 任务必须有有效模型")
+        for chain in cfg.tasks.values():
+            if not chain or any(t.get("provider") not in providers or not t.get("model", "").strip() for t in chain):
+                raise HTTPException(status_code=400, detail="任务链为空或引用了无效模型/Provider")
+        raw.update(providers=providers, tasks=cfg.tasks)
+        temporary = config_file.with_name(f".validate-{uuid.uuid4().hex}.yaml")
+        env_temporary = env_file.with_name(f".env.{uuid.uuid4().hex}.tmp")
+        keys = {provider.api_key_env: provider.api_key for provider in cfg.providers if provider.api_key}
+        committed = False
+        try:
+            temporary.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            load_config(temporary)
+            if keys:
+                env_temporary.write_bytes(old_env or b"")
+                for name, key in keys.items():
+                    set_key(str(env_temporary), name, key)
+            temporary.replace(config_file)
+            committed = True
+            if keys:
+                env_temporary.replace(env_file)
+            os.environ.update(keys)
+        except Exception as exc:
+            if committed:
+                if old_config is None:
+                    config_file.unlink(missing_ok=True)
+                else:
+                    _atomic_write(config_file, old_config)
+            raise HTTPException(status_code=400, detail=f"配置保存失败，旧配置保留：{exc}") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+            env_temporary.unlink(missing_ok=True)
+        return {"ok": True}
 
 
 # ── 会话管理 ─────────────────────────────────────────────────────
@@ -283,12 +346,12 @@ async def parse_jd(session_id: str, files: list[UploadFile] = File(...)) -> dict
     state = _session(session_id)
     if not files:
         raise HTTPException(status_code=400, detail="至少上传一张岗位截图")
-    contents: dict[str, bytes] = {}
+    contents: list[tuple[str, bytes]] = []
     for f in files:
         data = await f.read()
         if not data:
             continue
-        contents[f.filename or "screenshot.png"] = data
+        contents.append((f.filename or "screenshot.png", data))
     if not contents:
         raise HTTPException(status_code=400, detail="上传文件均为空")
     paths_ = store.save_uploads(session_id, contents)
@@ -300,6 +363,7 @@ async def parse_jd(session_id: str, files: list[UploadFile] = File(...)) -> dict
         raise HTTPException(status_code=502, detail=f"JD 识别失败：{exc}") from exc
 
     state.jd = jd
+    state.jd_sources = []
     store.save(state)
     return {"jd": jd.model_dump(exclude_none=True), "uploads": paths_}
 
@@ -314,6 +378,7 @@ def update_jd(session_id: str, jd: JDCard) -> dict:
 
 class JdSearchInput(BaseModel):
     query: str
+    platform: str = "boss"
 
 
 _SEARCH_QUERY_PROMPT = "你是招聘信息检索助手。用户想找某类岗位的招聘 JD。\n\n输入：{query}\n\n要求：生成 2~3 条用于搜索的完整查询词（中文为主），每条聚焦一个角度（岗位名+方向 / 岗位名+城市 / 岗位名+要求关键词），能直接用于搜索引擎；严格通过 emit_result 工具输出 queries 字段。"
@@ -346,15 +411,18 @@ def search_jd(session_id: str, body: JdSearchInput) -> dict:
         queries = [query]
 
     texts: list[str] = []
+    sources: list[dict[str, str]] = []
     seen: set[str] = set()
     last_err: Exception | None = None
     for q in queries:
         try:
-            for line in web_search.search_texts(q, n=6):
-                key = line[:60]
+            for source in job_sources.search(q, platform=body.platform, n=6):
+                line = source["title"] + "：" + source["text"] + "\n来源：" + source["url"]
+                key = source["url"]
                 if key not in seen:
                     seen.add(key)
                     texts.append(line)
+                    sources.append(source)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
         if len(texts) >= 8:
@@ -371,8 +439,28 @@ def search_jd(session_id: str, body: JdSearchInput) -> dict:
         raise HTTPException(status_code=502, detail=f"岗位信息解析失败：{exc}") from exc
 
     state.jd = jd
+    state.jd_sources = sources
     store.save(state)
-    return {"jd": jd.model_dump(exclude_none=True), "sources": len(texts)}
+    return {"jd": jd.model_dump(exclude_none=True), "sources": len(texts), "source_details": sources}
+
+
+class JdImportInput(BaseModel):
+    url: str
+    text: str = ""
+
+
+@app.post("/api/sessions/{session_id}/jd/import")
+def import_jd(session_id: str, body: JdImportInput) -> dict:
+    state = _session(session_id)
+    try:
+        source = job_sources.import_text(body.url, body.text)
+        jd = jd_parser.parse_jd_text(get_router(), [source["text"]], task="parsing")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"岗位导入失败：{exc}") from exc
+    state.jd = jd
+    state.jd_sources = [source]
+    store.save(state)
+    return {"jd": jd.model_dump(exclude_none=True), "sources": 1, "source_details": [source]}
 
 
 # ── 环节②：技能档案 ─────────────────────────────────────────────
@@ -405,11 +493,11 @@ async def profile_from_documents(
     state = _session(session_id)
     if not files:
         raise HTTPException(status_code=400, detail="至少上传一个文件")
-    contents: dict[str, bytes] = {}
+    contents: list[tuple[str, bytes]] = []
     for f in files:
         data = await f.read()
         if data:
-            contents[f.filename or "doc.bin"] = data
+            contents.append((f.filename or "doc.bin", data))
     paths_ = store.save_uploads(session_id, contents)
 
     # 逐文件预检：可读的进解析列表，不可读的进 failed
@@ -417,11 +505,14 @@ async def profile_from_documents(
     failed: list[str] = []
     for p in paths_:
         try:
-            documents.read_document(p)
+            if not documents.read_document(p).strip():
+                raise ValueError("文件为空或没有可提取文本")
             readable.append(p)
         except Exception as exc:  # noqa: BLE001 - 未知类型/损坏文件跳过
             failed.append(f"{Path(p).name}: {exc}")
 
+    if not readable:
+        raise HTTPException(status_code=400, detail={"message": "没有可解析文件", "failed_files": failed})
     profile = state.profile
     if readable:
         router = get_router()
@@ -431,7 +522,8 @@ async def profile_from_documents(
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"文件解析失败：{exc}") from exc
-    assert profile is not None
+    if profile is None:
+        raise HTTPException(status_code=400, detail={"message": "所有文件均未成功解析", "failed_files": failed})
     state.profile = profile
     store.save(state)
     return {**profile.model_dump(exclude_none=True), "failed_files": failed}
@@ -520,21 +612,28 @@ def profile_from_obsidian(session_id: str, body: ObsidianInput) -> dict:
     router = get_router()
     profile = state.profile
     failed: list[str] = []
+    read_names: list[str] = []
     for p in selected:
         try:
+            if AgentRuntime._is_sensitive(p):
+                raise ValueError("敏感文件已跳过")
             text = p.read_text(encoding="utf-8", errors="replace")
+            if not text.strip():
+                raise ValueError("文件为空")
             profile = profile_builder.build_profile_from_text(
                 router, text, source="obsidian", existing=profile
             )
+            read_names.append(str(p.relative_to(vault)))
         except Exception as exc:  # noqa: BLE001 - 单篇失败跳过，不让整批挂掉
             failed.append(f"{p.name}: {exc}")
             continue
-    assert profile is not None
+    if profile is None or not read_names:
+        raise HTTPException(status_code=400, detail={"message": "所有文件均未成功解析", "failed_files": failed})
     state.profile = profile
     store.save(state)
     return {
         **profile.model_dump(exclude_none=True),
-        "read_files": [str(p.relative_to(vault)) for p in selected],
+        "read_files": read_names,
         "failed_files": failed,
     }
 
@@ -546,12 +645,12 @@ class LocalPathInput(BaseModel):
     max_files: int | None = None  # None = 不限制
 
 
-_SUPPORTED_DOC_SUFFIXES = {".md", ".markdown", ".txt", ".log", ".pdf"}
+_SUPPORTED_DOC_SUFFIXES = documents.SUPPORTED_EXTENSIONS
 
 
 @app.post("/api/sessions/{session_id}/profile/path")
 def profile_from_path(session_id: str, body: LocalPathInput) -> dict:
-    """读取本地路径下全部支持的文件（md/txt/log/pdf），逐份并入技能档案。"""
+    """读取本地路径下全部支持的文件（纯文本/JSON/CSV/PDF/Word/Excel/PPT），逐份并入技能档案。"""
     root = Path(body.path).expanduser()
     if not root.exists():
         raise HTTPException(status_code=400, detail=f"路径不存在：{root}")
@@ -570,7 +669,7 @@ def profile_from_path(session_id: str, body: LocalPathInput) -> dict:
         files = [root]
 
     if not files:
-        raise HTTPException(status_code=400, detail=f"该路径下没有找到支持的文件（md/txt/log/pdf）：{root}")
+        raise HTTPException(status_code=400, detail=f"该路径下没有找到支持的文件（纯文本/JSON/CSV/PDF/Word/Excel/PPT）：{root}")
     if body.max_files and body.max_files > 0:
         files = files[: body.max_files]
 
@@ -580,7 +679,11 @@ def profile_from_path(session_id: str, body: LocalPathInput) -> dict:
     read_names: list[str] = []
     for p in files:
         try:
+            if AgentRuntime._is_sensitive(p):
+                raise ValueError("敏感文件已跳过")
             text = documents.read_document(p)
+            if not text.strip():
+                raise ValueError("文件没有可提取文本")
             profile = profile_builder.build_profile_from_text(
                 router, text, source="local_path", existing=profile
             )
@@ -588,7 +691,8 @@ def profile_from_path(session_id: str, body: LocalPathInput) -> dict:
         except Exception as exc:  # noqa: BLE001 - 单文件失败跳过
             failed.append(f"{p.name}: {exc}")
             continue
-    assert profile is not None
+    if profile is None or not read_names:
+        raise HTTPException(status_code=400, detail={"message": "所有文件均未成功解析", "failed_files": failed})
     state.profile = profile
     store.save(state)
     return {
@@ -647,13 +751,6 @@ class ClarifyChatInput(BaseModel):
     history: list[dict] = []
 
 
-# 待澄清核对轮次上限：按提纲规模自适应（每条问题约 2 轮对话 + 4 轮容差），
-# 至少 8 轮、至多 30 轮。它只是 LLM 失控时的最后保险——正常结束路径是
-# 「提纲清空 + LLM 自主判断」；轮数不够时不该提前掐断该澄清的内容。
-def clarify_max_rounds(n_questions: int) -> int:
-    return min(30, max(8, n_questions * 2 + 4))
-
-
 @app.get("/api/sessions/{session_id}/profile/clarify/start")
 def clarify_start(session_id: str) -> dict:
     """打开澄清对话：返回完整提纲 + AI 自然开场白（把第一条问题口语化问出）。"""
@@ -663,14 +760,6 @@ def clarify_start(session_id: str) -> dict:
     questions = state.profile.open_questions
     if not questions:
         return {"outline": [], "opening": "没有待澄清问题了。", "remaining": 0, "done": True}
-    if len(state.interview_history) >= clarify_max_rounds(len(questions)):
-        return {
-            "outline": questions,
-            "opening": f"咱们已经核对 {len(state.interview_history)} 轮了，提纲里还剩 {len(questions)} 条。你想继续回答哪条直接说，我会记进档案；剩下的会一直保留，随时回来。",
-            "remaining": len(questions),
-            "done": False,
-            "profile": state.profile.model_dump(exclude_none=True),
-        }
     # 打开时自动清理提纲里的同主题重复变体（保留首次出现），存量污染也能自愈
     deduped: list[str] = []
     for q in questions:
@@ -774,18 +863,6 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
         state.interview_history.append([target, body.message])
         store.save(state)
         remaining = profile.open_questions
-        rounds = len(state.interview_history)
-        if remaining and rounds >= clarify_max_rounds(len(questions)):
-            # 机器兜底：超轮次后不再主动追问，但已处理的回答照常入库；
-            # 剩余问题保留在档案里（用户之后可继续回答），并让对话自然收尾
-            return {
-                "kind": decision.intent,
-                "reply": f"{decision.reply}\n\n已核对 {rounds} 轮，剩余 {len(remaining)} 条问题我保留在档案里，之后想继续随时回来。",
-                "remaining": len(remaining),
-                "done": True,
-                "reason": "round_limit",
-                "profile": profile.model_dump(exclude_none=True),
-            }
         return {
             "kind": decision.intent,
             "reply": decision.reply,
@@ -810,6 +887,8 @@ def clarify_chat(session_id: str, body: ClarifyChatInput) -> dict:
 class PlanInput(BaseModel):
     min_stars: int = 50
     llm_rerank: bool = True
+    include: list[str] | None = None
+    exclude: list[str] | None = None
 
 
 @app.post("/api/sessions/{session_id}/plan")
@@ -827,10 +906,12 @@ def build_plan(session_id: str, body: PlanInput) -> dict:
             state.profile,
             min_stars=body.min_stars,
             llm_rerank=body.llm_rerank,
+            preferences={"include": body.include if body.include is not None else state.repository_preferences.get("include", []), "exclude": body.exclude if body.exclude is not None else state.repository_preferences.get("exclude", [])},
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"生成计划失败：{exc}") from exc
     state.plan = plan
+    state.repository_preferences = {"include": body.include if body.include is not None else state.repository_preferences.get("include", []), "exclude": body.exclude if body.exclude is not None else state.repository_preferences.get("exclude", [])}
     state.repos = repos
     store.save(state)
     return {"plan": plan.model_dump(exclude_none=True), "repos": [r.model_dump() for r in repos]}
@@ -978,8 +1059,8 @@ def coach_chat(session_id: str, body: CoachChatInput) -> dict:
             ),
         )
     ]
-    # 最近 6 条对话历史
-    for user_turn, asst_turn in state.coach_history[-6:]:
+    # 完整对话历史
+    for user_turn, asst_turn in state.coach_history:
         messages.append(Message(role="user", content=user_turn))
         messages.append(Message(role="assistant", content=asst_turn))
     messages.append(Message(role="user", content=msg))
@@ -1095,8 +1176,8 @@ def _agent_thread_messages(state) -> list[Message]:
                 for t in tc
             ]
             out.append(Message(role="assistant", content=content, tool_calls=tool_calls))
-        elif role == "user":
-            out.append(Message(role="user", content=content))
+        elif role in ("user", "assistant"):
+            out.append(Message(role=role, content=content))
         elif role == "system":
             out.append(Message(role="system", content=content))
     return out
@@ -1123,8 +1204,6 @@ def _agent_log(state, **fields) -> None:
     entry = {"ts": _now_iso()}
     entry.update(fields)
     state.agent_logs.append(entry)
-    if len(state.agent_logs) > 300:
-        state.agent_logs = state.agent_logs[-300:]
 
 
 def _describe_call(name: str, args: dict) -> str:
@@ -1138,7 +1217,7 @@ def _describe_call(name: str, args: dict) -> str:
         content = args.get("content", "")
         return f"写入文件 {args.get('path', '')}（{len(content)} 字符）"
     if name == "run_command":
-        return f"执行命令：{args.get('command', '')[:120]}"
+        return f"执行命令：{args.get('command', '')}"
     if name == "git_clone":
         return f"git clone {args.get('url', '')}"
     return f"调用 {name}"
@@ -1150,98 +1229,90 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _complete_missing_tools(state) -> None:
+    """Repair interrupted legacy batches without inventing successful execution."""
+    thread = state.agent_thread or []
+    repaired = []
+    waiting = {}
+    for message in thread:
+        if message.get("role") != "tool" and waiting:
+            for call_id in waiting:
+                repaired.append({"role": "tool", "tool_call_id": call_id, "content": "此前工具批次中断，未取得结果。请检查实际状态，不能假定已执行。"})
+            waiting = {}
+        repaired.append(message)
+        if message.get("tool_calls"):
+            waiting = {call["id"]: call for call in message["tool_calls"]}
+        if message.get("role") == "tool":
+            waiting.pop(message.get("tool_call_id"), None)
+    for call_id in waiting:
+        repaired.append({"role": "tool", "tool_call_id": call_id, "content": "此前工具批次中断，未取得结果。请检查实际状态。"})
+    state.agent_thread = repaired
+    state.agent_queue = []
+
+
 def _agent_stream(state, rt: AgentRuntime, router: ModelRouter) -> Iterator[str]:
-    """跑 agent 循环，逐步 yield SSE 事件（Codex 式实时可见）。"""
     steps = 0
     while steps < AGENT_MAX_STEPS:
-        steps += 1
-        yield _sse("thinking", {})
-        try:
-            resp = router.complete(
-                "agent",
-                _agent_thread_messages(state),
-                tools=AGENT_TOOLS,
-                temperature=0.3,
-                max_tokens=4096,
-            )
-        except Exception as exc:  # noqa: BLE001
-            yield _sse("error", {"detail": f"模型调用失败：{exc}"})
-            return
-
-        if not resp.tool_calls:
-            text = resp.text or "(无回复)"
-            state.agent_thread.append({"role": "assistant", "content": text})
-            _agent_log(state, type="message", role="assistant", content=text)
-            store.save(state)
-            yield _sse("message", {"role": "assistant", "content": text})
-            yield _sse("done", {"history": _agent_history_for_ui(state)})
-            return
-
-        asst_msg: dict = {
-            "role": "assistant",
-            "content": resp.text or "",
-            "tool_calls": [
-                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                for tc in resp.tool_calls
-            ],
-        }
-        state.agent_thread.append(asst_msg)
-
-        # 模型"带话执行"（如解释为何要做这一步）：先把话推给用户再执行工具
-        if resp.text and resp.text.strip():
-            _agent_log(
-                state, type="message", role="assistant", content=resp.text.strip()
-            )
-            yield _sse("message", {"role": "assistant", "content": resp.text.strip()})
-
-        for tc in resp.tool_calls:
-            summary = _describe_call(tc.name, tc.arguments)
-            yield _sse("tool_start", {"kind": tc.name, "summary": summary})
+        while state.agent_queue:
+            call = state.agent_queue.pop(0)
+            summary = _describe_call(call["name"], call.get("arguments", {}))
+            yield _sse("tool_start", {"kind": call["name"], "summary": summary})
             try:
-                result = rt.run_tool(tc.name, tc.arguments, tc.id)
-            except Exception as exc:  # noqa: BLE001 - 工具失败转给模型
+                result = rt.run_tool(call["name"], call.get("arguments", {}), call["id"])
+            except Exception as exc:
                 result = f"工具调用失败：{exc}"
-                state.agent_thread.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": result}
-                )
-                _agent_log(
-                    state, type="tool", kind=tc.name, summary=summary, output="", error=str(exc)
-                )
-                store.save(state)
-                yield _sse("tool", {"kind": tc.name, "summary": f"执行出错：{exc}", "output": ""})
-                continue
             if isinstance(result, PendingAction):
-                state.agent_pending = {
-                    "action_id": result.action_id,
-                    "kind": result.kind,
-                    "summary": result.summary,
-                    "tool_call_id": result.tool_call_id,
-                    "payload": result.payload,
-                }
-                _agent_log(
-                    state, type="pending", kind=result.kind, summary=result.summary, output=""
-                )
+                state.agent_pending = {"action_id": result.action_id, "kind": result.kind,
+                    "summary": result.summary, "tool_call_id": result.tool_call_id, "payload": result.payload}
+                _agent_log(state, type="pending", kind=result.kind, summary=result.summary)
                 store.save(state)
                 yield _sse("pending", {"pending": state.agent_pending})
                 return
-            state.agent_thread.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result}
-            )
-            _agent_log(state, type="tool", kind=tc.name, summary=summary, output=result)
+            state.agent_thread.append({"role": "tool", "tool_call_id": call["id"], "content": str(result)})
+            _agent_log(state, type="tool", kind=call["name"], summary=summary, output=str(result))
             store.save(state)
-            yield _sse("tool", {"kind": tc.name, "summary": result[:200], "output": result})
-
-    # 步数保护：强制结束本轮
-    state.agent_pending = None
+            yield _sse("tool", {"kind": call["name"], "summary": summary, "output": str(result)})
+        steps += 1
+        yield _sse("thinking", {})
+        _complete_missing_tools(state)
+        try:
+            resp = router.complete("agent", _agent_thread_messages(state), tools=AGENT_TOOLS, temperature=0.3, max_tokens=4096)
+        except Exception as exc:
+            yield _sse("error", {"detail": f"模型调用失败：{exc}"})
+            return
+        message = {"role": "assistant", "content": resp.text or ""}
+        if resp.tool_calls:
+            message["tool_calls"] = [{"id": t.id, "name": t.name, "arguments": t.arguments} for t in resp.tool_calls]
+            state.agent_queue = list(message["tool_calls"])
+        state.agent_thread.append(message)
+        if resp.text:
+            _agent_log(state, type="message", role="assistant", content=resp.text)
+        store.save(state)
+        if resp.text:
+            yield _sse("message", {"role": "assistant", "content": resp.text})
+        if not resp.tool_calls:
+            yield _sse("done", {"history": _agent_history_for_ui(state)})
+            return
+    # Drain queued calls next turn only after an explicit interruption notice.
+    _complete_missing_tools(state)
     store.save(state)
-    yield _sse(
-        "message",
-        {
-            "role": "assistant",
-            "content": f"（本轮已达到 {AGENT_MAX_STEPS} 步上限，先停下来让你确认进度；可以继续发消息让我推进）",
-        },
-    )
-    yield _sse("done", {"history": _agent_history_for_ui(state)})
+    yield _sse("message", {"role": "assistant", "content": "本轮操作预算已用完，未执行的工具已取消。可继续发消息推进。"})
+
+
+def _managed_stream(state, generator) -> Iterator[str]:
+    try:
+        yield from generator
+    except Exception as exc:
+        yield _sse("error", {"detail": str(exc)})
+    finally:
+        with store.lock(state.session_id):
+            latest = store.get(state.session_id)
+            latest.agent_running = False
+            if (latest.agent_execution or {}).get("status") == "claimed":
+                latest.agent_execution["status"] = "interrupted"
+                _complete_missing_tools(latest)
+                _agent_log(latest, type="message", role="system", content="审批领取后的连接中断，结果未知。请检查实际状态；原审批不能重放。")
+            store.save(latest)
 
 
 def _sse_response(gen: Iterator[str]) -> StreamingResponse:
@@ -1262,31 +1333,25 @@ class AgentTurnInput(BaseModel):
 
 @app.post("/api/sessions/{session_id}/agent/turn")
 def agent_turn(session_id: str, body: AgentTurnInput) -> StreamingResponse:
-    state = _session(session_id)
-    msg = body.message.strip()
-    if not msg:
-        raise HTTPException(status_code=400, detail="消息不能为空")
-    if state.plan is None:
-        raise HTTPException(status_code=400, detail="请先生成学习计划，再让 Agent 带做项目")
-    if state.agent_pending is not None:
-        raise HTTPException(status_code=409, detail="有一个操作正等你确认，请先处理再继续")
-
-    rt = _agent_runtime()
-    if state.agent_thread is None:
-        state.agent_thread = [{"role": "system", "content": _agent_system_prompt(state)}]
-    else:
-        # 计划可能更新过：每次发言前刷新 system 上下文（保留工具规则与最新计划）
-        state.agent_thread[0] = {"role": "system", "content": _agent_system_prompt(state)}
-    # 本轮提醒：把模型注意力钉在计划上（先给安排，再动手）
-    reminder = (
-        "【本轮要求】先根据上面的学习计划，用中文告诉用户：这轮从哪个技能点开始、"
-        "计划做什么（对应差距/阶段）、预期结果；然后再执行工具。"
-    )
-    state.agent_thread[0]["content"] = state.agent_thread[0]["content"] + "\n\n" + reminder
-    state.agent_thread.append({"role": "user", "content": msg})
-    _agent_log(state, type="message", role="user", content=msg)
-    store.save(state)
-    return _sse_response(_agent_stream(state, rt, get_router()))
+    router = get_router()
+    with store.lock(session_id):
+        state = _session(session_id)
+        msg = body.message.strip()
+        if not msg or state.plan is None:
+            raise HTTPException(status_code=400, detail="请先生成计划并输入消息")
+        if state.agent_pending or state.agent_running:
+            raise HTTPException(status_code=409, detail="请先处理待审批动作或等待当前操作结束")
+        _complete_missing_tools(state)
+        if not state.agent_thread:
+            state.agent_thread = [{"role": "system", "content": _agent_system_prompt(state)}]
+        else:
+            state.agent_thread[0] = {"role": "system", "content": _agent_system_prompt(state)}
+        state.agent_thread.append({"role": "user", "content": msg})
+        _agent_log(state, type="message", role="user", content=msg)
+        state.agent_running = True
+        state.agent_execution = {"instance_id": INSTANCE_ID, "status": "conversation"}
+        store.save(state)
+    return _sse_response(_managed_stream(state, _agent_stream(state, _agent_runtime(), router)))
 
 
 class AgentConfirmInput(BaseModel):
@@ -1296,53 +1361,61 @@ class AgentConfirmInput(BaseModel):
 
 @app.post("/api/sessions/{session_id}/agent/confirm")
 def agent_confirm(session_id: str, body: AgentConfirmInput) -> StreamingResponse:
-    state = _session(session_id)
-    pending = state.agent_pending
-    if pending is None or pending.get("action_id") != body.action_id:
-        raise HTTPException(status_code=409, detail="没有待确认的操作，或已过期")
-
-    rt = _agent_runtime()
-    tool_call_id = pending.get("tool_call_id", "")
-    summary = pending.get("summary", "")
-    if body.approve:
-        action = PendingAction(
-            action_id=pending["action_id"],
-            kind=pending["kind"],
-            summary=summary,
-            tool_call_id=tool_call_id,
-            payload=pending.get("payload", {}),
-        )
-        try:
-            result = rt.execute(action)
-        except Exception as exc:  # noqa: BLE001
-            result = f"执行失败：{exc}"
-        _agent_log(state, type="tool", kind=pending["kind"], summary=summary, output=result)
-    else:
-        result = "用户拒绝了这个操作。请改用不需要该操作的方式继续，或先向用户说明为什么需要它。"
-        _agent_log(state, type="message", role="system", content=result)
-
-    state.agent_thread.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
-    state.agent_pending = None
-    store.save(state)
-
-    def gen() -> Iterator[str]:
+    try:
+        router = get_router()
+    except HTTPException:
         if body.approve:
-            yield _sse("tool_start", {"kind": pending["kind"], "summary": summary})
-            yield _sse("tool", {"kind": pending["kind"], "summary": result[:200], "output": result})
+            raise
+        router = None
+    with store.lock(session_id):
+        state = _session(session_id)
+        pending = state.agent_pending
+        if state.agent_running or pending is None or pending.get("action_id") != body.action_id:
+            raise HTTPException(status_code=409, detail="动作已处理、正在执行或已过期")
+        # Persist the claim before any side effect or response generator starts.
+        state.agent_pending = None
+        state.agent_running = True
+        state.agent_execution = {"instance_id": INSTANCE_ID, "status": "claimed", "action_id": body.action_id,
+                                 "tool_call_id": pending["tool_call_id"], "kind": pending["kind"]}
+        store.save(state)
+    rt = _agent_runtime()
+    def generate():
+        if body.approve:
+            yield _sse("tool_start", {"kind": pending["kind"], "summary": pending["summary"]})
+            try:
+                result = rt.execute(PendingAction(**pending))
+                state.agent_execution["status"] = "finished"
+            except Exception as exc:
+                result = f"执行失败：{exc}。请检查实际状态；该审批不能重放。"
+                state.agent_execution["status"] = "failed"
         else:
-            yield _sse("message", {"role": "system", "content": result})
-        yield from _agent_stream(state, rt, get_router())
-
-    return _sse_response(gen())
+            result = "用户拒绝了这个操作。请使用其他方式继续。"
+            state.agent_execution["status"] = "rejected"
+        state.agent_thread.append({"role": "tool", "tool_call_id": pending["tool_call_id"], "content": result})
+        _agent_log(state, type="tool", kind=pending["kind"], summary=pending["summary"], output=result)
+        if router is None:
+            _complete_missing_tools(state)
+        store.save(state)
+        yield _sse("tool", {"kind": pending["kind"], "summary": pending["summary"], "output": result})
+        if router is not None:
+            yield from _agent_stream(state, rt, router)
+        else:
+            yield _sse("error", {"detail": "操作已拒绝，剩余工具已取消；修复模型配置后可继续对话"})
+    return _sse_response(_managed_stream(state, generate()))
 
 
 @app.post("/api/sessions/{session_id}/agent/reset")
 def agent_reset(session_id: str) -> dict:
-    """清空 Agent 对话与待确认状态（工作区文件不受影响）。"""
-    state = _session(session_id)
-    state.agent_thread = None
-    state.agent_pending = None
-    store.save(state)
+    with store.lock(session_id):
+        state = _session(session_id)
+        if state.agent_running:
+            raise HTTPException(status_code=409, detail="请等待当前操作结束后再重置")
+        state.agent_thread = None
+        state.agent_pending = None
+        state.agent_queue = []
+        state.agent_logs = []
+        state.agent_execution = None
+        store.save(state)
     return {"ok": True}
 
 
@@ -1365,6 +1438,7 @@ else:
 def main() -> None:
     import uvicorn
 
+    print(f"打开本机应用：http://127.0.0.1:{PORT}/#token={API_TOKEN}", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")
 
 

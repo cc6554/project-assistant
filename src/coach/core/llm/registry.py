@@ -96,7 +96,8 @@ def load_config(path: str | Path) -> ModelConfig:
         try:
             cur = json.loads(cur_path.read_text(encoding="utf-8")) or {}
             provider, model = cur.get("provider"), cur.get("model")
-            if provider in providers and model:
+            allowed = {(t.provider, t.model) for chain in tasks.values() for t in chain}
+            if provider in providers and (provider, model) in allowed:
                 current = TaskTarget(provider=provider, model=model)
         except Exception:  # noqa: BLE001 - 损坏的 current_model.json 忽略，回退默认
             current = None

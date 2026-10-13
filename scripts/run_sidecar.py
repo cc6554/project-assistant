@@ -7,9 +7,7 @@ main.py 位于包内使用相对导入，直接作为 PyInstaller 入口会报
 
 from __future__ import annotations
 
-import uvicorn
-
-from coach.sidecar.main import PORT, app
+from coach.sidecar.main import main
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")
+    main()

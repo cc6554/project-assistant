@@ -62,10 +62,11 @@ def build_learning_plan(
             continue
         if not plan.direction:
             plan.direction = jd.job_title or profile.target_direction or "目标岗位"
-        if plan.gaps and plan.phases:
+        plan.github_search_queries = list(dict.fromkeys(q.strip() for q in plan.github_search_queries if q.strip()))
+        if plan.gaps and plan.phases and plan.github_search_queries:
             return plan
         last_plan = plan  # 残缺结果留作兜底
-    reason = f"最后一次错误：{last_error}" if last_error else "gaps/phases 为空"
+    reason = f"最后一次错误：{last_error}" if last_error else "gaps/phases/github_search_queries 为空"
     raise ValueError(
         f"模型连续 {max_attempts} 次未产出有效计划（{reason}），请重试或更换模型配置"
     )

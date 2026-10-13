@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 from pathlib import Path
 
 from PIL import Image
@@ -25,7 +26,12 @@ def load_image_blocks(paths: list[str | Path]) -> list[ImageBlock]:
             raise FileNotFoundError(f"截图不存在：{path}")
         raw = path.read_bytes()
         with Image.open(path) as im:
-            media_type = _FORMAT_TO_MEDIA_TYPE.get(im.format, "image/png")
+            media_type = _FORMAT_TO_MEDIA_TYPE.get(im.format)
+            if media_type is None:
+                output = io.BytesIO()
+                im.convert("RGBA" if "A" in im.getbands() else "RGB").save(output, format="PNG")
+                raw = output.getvalue()
+                media_type = "image/png"
         blocks.append(
             ImageBlock(
                 media_type=media_type,

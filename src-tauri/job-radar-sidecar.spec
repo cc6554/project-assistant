@@ -1,14 +1,18 @@
 # PyInstaller 打包 Tauri sidecar（Python FastAPI 服务 → job-radar-sidecar.exe）
 # 用法：pyinstaller src-tauri/job-radar-sidecar.spec
-# 产物：dist/job-radar-sidecar/（onedir 目录：exe + _internal/）
+# 使用构建脚本：产物 build/sidecar-dist/job-radar-sidecar/，与 Vite dist 隔离。
 # onedir 模式启动只有 1 个进程（onefile 会有外层 bootloader 壳 + 实际子进程两个进程）
 
+from pathlib import Path
+
+project_root = Path(SPECPATH).resolve().parent
+
 a = Analysis(
-    ["../scripts/run_sidecar.py"],
-    pathex=["../src"],
+    [str(project_root / "scripts" / "run_sidecar.py")],
+    pathex=[str(project_root / "src")],
     binaries=[],
     datas=[
-        ("../config/providers.example.yaml", "config"),
+        (str(project_root / "config" / "providers.example.yaml"), "config"),
     ],
     hiddenimports=[
         "uvicorn.logging",

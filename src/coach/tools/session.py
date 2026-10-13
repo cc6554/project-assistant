@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -12,6 +13,12 @@ from ..domain.schemas import GitHubRepo, JDCard, LearningPlan, UserSkillProfile
 
 class SessionState(BaseModel):
     session_id: str = "default"
+    revision: int = 0
+    repository_preferences: dict[str, list[str]] = {"include": [], "exclude": []}
+    jd_sources: list[dict[str, str]] = []
+    agent_queue: list[dict] = []
+    agent_running: bool = False
+    agent_execution: dict | None = None
     jd: JDCard | None = None
     profile: UserSkillProfile | None = None
     plan: LearningPlan | None = None
@@ -25,11 +32,12 @@ class SessionState(BaseModel):
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            self.model_dump_json(indent=2), encoding="utf-8"
-        )
-        tmp.replace(path)
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: str | Path) -> "SessionState":

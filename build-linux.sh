@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 校招雷达 · Linux 构建脚本（Ubuntu 22.04 验证，其他发行版需自行装系统依赖）
+# 校招雷达 · Linux 构建脚本（Ubuntu 22.04+；需在目标机器验收）
 # 用法：bash build-linux.sh
 #
 # 前置系统依赖（Ubuntu/Debian）：
@@ -19,10 +19,10 @@ pip install -r requirements.txt
 pip install pyinstaller
 
 echo "==> 2/5 打包 sidecar（PyInstaller onedir）"
-pyinstaller --noconfirm src-tauri/job-radar-sidecar.spec
+pyinstaller --noconfirm --distpath build/sidecar-dist --workpath build/pyinstaller src-tauri/job-radar-sidecar.spec
 
 echo "==> 3/5 前端构建"
-npm ci 2>/dev/null || npm install
+npm ci
 npm run build
 
 echo "==> 4/5 编译 Tauri 壳（约 2 分钟）"
@@ -31,19 +31,7 @@ cargo build --release
 cd ..
 
 echo "==> 5/5 组装分发目录"
-REL="src-tauri/target/release"
-rm -rf "$REL/job-radar-sidecar" "$REL/dist"
-cp -r dist/job-radar-sidecar "$REL/job-radar-sidecar"
-cp -r dist "$REL/dist"
-mkdir -p "$REL/config"
-if [ -f config/providers.yaml ]; then
-  cp config/providers.yaml "$REL/config/providers.yaml"
-else
-  cp config/providers.example.yaml "$REL/config/providers.yaml"
-fi
-if [ -f .env ]; then
-  cp .env "$REL/.env"
-fi
+REL="$(python scripts/assemble_release.py)"
 
 echo ""
 echo "==> 完成。运行：$REL/job-radar-coach"

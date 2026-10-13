@@ -10,6 +10,11 @@
 from __future__ import annotations
 
 import json
+import os
+import difflib
+import hashlib
+from urllib.parse import urlsplit
+from .credentials import github_token
 import re
 import subprocess
 import uuid
@@ -205,7 +210,7 @@ class AgentRuntime:
         import requests
 
         proxy = self._git_proxy()
-        token = self._github_token()  # 私有仓库：复用 git 凭据
+        token = self._github_token() if self._trusted_github_url(url) else None
         attempts = []
         if proxy:
             attempts.append({"proxies": {"http": proxy, "https": proxy}})
@@ -217,18 +222,19 @@ class AgentRuntime:
                 if attempt["proxies"]:
                     kw["proxies"] = attempt["proxies"]
                 resp = requests.get(url, **kw)
-                # 匿名 401/403/404 且是 GitHub 链接：用用户 git 凭据认证重试
+                # 匿名 401/403/404 且是 GitHub 链接：用用户显式 Token 认证重试
                 if resp.status_code in (401, 403, 404) and token and (
-                    "github.com" in url or "api.github.com" in url
+                    self._trusted_github_url(url)
                 ):
                     resp = requests.get(
                         url,
                         headers={**kw["headers"], "Authorization": f"Bearer {token}"},
+                        allow_redirects=False,
                         **{k: v for k, v in kw.items() if k != "headers"},
                     )
                 if resp.status_code != 200:
                     # 私有仓库网页 404：降级到 GitHub API 读 README + 顶层结构
-                    if token and "github.com/" in url and "/blob/" not in url:
+                    if token and self._trusted_github_url(url) and urlsplit(url).hostname == "github.com" and "/blob/" not in url:
                         api_text = self._github_api_read(url, token, kw)
                         if api_text is not None:
                             return _fmt_output(api_text, min(int(max_chars), FETCH_LIMIT))
@@ -244,33 +250,30 @@ class AgentRuntime:
                 continue
         return f"（抓取失败：代理与直连均不可用。{last_err}）"
 
-    def _github_token(self) -> str | None:
-        """读取用户在设置页显式输入的 GitHub Token（config/github_token.json）。
+    @staticmethod
+    def _github_token() -> str | None:
+        return github_token()
 
-        只认用户主动配置的 token，绝不自动读取系统 git 凭据；
-        token 只进请求头，绝不出现在返回内容。
-        """
+    @staticmethod
+    def _trusted_github_url(url: str) -> bool:
         try:
-            p = paths.github_token_path()
-            if not p.exists():
-                return None
-            data = json.loads(p.read_text(encoding="utf-8")) or {}
-            tok = str(data.get("token") or "").strip()
-            return tok or None
-        except Exception:  # noqa: BLE001
-            return None
+            parsed = urlsplit(url)
+            return (parsed.scheme == "https" and parsed.hostname in {"github.com", "api.github.com", "raw.githubusercontent.com"}
+                    and parsed.port in (None, 443) and not parsed.username and not parsed.password)
+        except ValueError:
+            return False
 
     def _github_api_read(self, url: str, token: str, kw: dict) -> str | None:
         """对 github.com/{owner}/{repo} 用 API 拉 README + 顶层文件结构（私有仓库可见）。"""
         import requests
 
-        m = re.match(r"https?://github\.com/([^/]+)/([^/?#]+)", url)
+        m = re.match(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:[/?#]|$)", url)
         if not m:
             return None
         owner, repo = m.group(1), m.group(2)
         headers = {**kw.get("headers", {}), "Authorization": f"Bearer {token}"}
         proxies = kw.get("proxies")
-        get_kw = {"headers": headers, "timeout": 10}
+        get_kw = {"headers": headers, "timeout": 10, "allow_redirects": False}
         if proxies:
             get_kw["proxies"] = proxies
         parts: list[str] = []
@@ -278,7 +281,7 @@ class AgentRuntime:
             r = requests.get(
                 f"https://api.github.com/repos/{owner}/{repo}/readme",
                 headers={**headers, "Accept": "application/vnd.github.raw"},
-                timeout=10, proxies=proxies or {},
+                timeout=10, proxies=proxies or {}, allow_redirects=False,
             )
             if r.status_code == 200:
                 parts.append("README:\n" + r.text[:6000])
@@ -287,7 +290,7 @@ class AgentRuntime:
         try:
             r = requests.get(
                 f"https://api.github.com/repos/{owner}/{repo}/contents/",
-                timeout=10, headers=headers, proxies=proxies or {},
+                timeout=10, headers=headers, proxies=proxies or {}, allow_redirects=False,
             )
             if r.status_code == 200:
                 items = r.json()
@@ -323,7 +326,9 @@ class AgentRuntime:
             kind="write_file",
             summary=f"{'覆盖' if existed else '新建'}文件 {p}（{len(content)} 字符）",
             tool_call_id=tool_call_id,
-            payload={"path": str(p), "content": content},
+            payload={"path": str(p), "content": content,
+                     "before_hash": hashlib.sha256(p.read_bytes()).hexdigest() if existed else None,
+                     "diff": "".join(difflib.unified_diff((p.read_text(encoding="utf-8", errors="replace") if existed and not self._is_sensitive(p) else "（原文件内容属于敏感信息，不自动展示）" if existed else "").splitlines(keepends=True), content.splitlines(keepends=True), fromfile=str(p), tofile=str(p)))},
         )
         return action
 
@@ -334,13 +339,14 @@ class AgentRuntime:
         action = PendingAction(
             action_id=uuid.uuid4().hex[:10],
             kind="run_command",
-            summary=f"执行命令（在 {workdir}）：{command[:200]}",
+            summary=f"执行命令（在 {workdir}）：{command}",
             tool_call_id=tool_call_id,
-            payload={"command": command, "cwd": str(workdir)},
+            payload={"command": command, "cwd": str(workdir), "shell": "PowerShell" if os.name == "nt" else "bash"},
         )
         return action
 
     def git_clone(self, tool_call_id: str, url: str, target_dir: str = "") -> PendingAction:
+        self._validate_clone_url(url)
         name = target_dir.strip() or url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
         dest = self._resolve(name)
         action = PendingAction(
@@ -357,6 +363,10 @@ class AgentRuntime:
     def execute(self, action: PendingAction) -> str:
         if action.kind == "write_file":
             path = Path(action.payload["path"])
+            if "before_hash" in action.payload:
+                actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+                if actual != action.payload["before_hash"]:
+                    raise ValueError("文件在审批期间发生变化，请重新生成审批")
             path.parent.mkdir(parents=True, exist_ok=True)
             content = action.payload["content"]
             path.write_text(content, encoding="utf-8")
@@ -366,24 +376,31 @@ class AgentRuntime:
             return result
         if action.kind == "git_clone":
             url, dest = action.payload["url"], action.payload["dest"]
-            result = self._shell(f"git clone {url} {dest}", str(self.root))
+            self._validate_clone_url(url)
+            result = self._run_process(["git", "clone", "--", url, dest], str(self.root))
             return result
         return f"（未知动作类型：{action.kind}）"
 
+    @staticmethod
+    def _validate_clone_url(url: str) -> None:
+        parsed = urlsplit(url)
+        if any(c.isspace() for c in url) or parsed.scheme not in {"https", "http", "ssh"} or not parsed.hostname or parsed.password:
+            raise ValueError("克隆地址必须是有效的 HTTPS/HTTP/SSH URL，不能包含密码或空白")
+
     def _shell(self, command: str, cwd: str, timeout: int = 300) -> str:
+        if os.name == "nt":
+            executable = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+            args = [executable, "-NoProfile", "-NonInteractive", "-Command", command]
+        else:
+            args = ["/bin/bash", "-lc", command]
+        return self._run_process(args, cwd, timeout)
+
+    def _run_process(self, args: list[str], cwd: str, timeout: int = 300) -> str:
         try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            proc = subprocess.run(args, shell=False, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return f"命令超时（>{timeout}s），已终止"
         out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-        out = out.strip()
         if proc.returncode != 0:
-            return f"退出码 {proc.returncode}：\n{_fmt_output(out)}"
-        return _fmt_output(out or "(无输出)")
+            return f"退出码 {proc.returncode}：\n{_fmt_output(out.strip())}"
+        return _fmt_output(out.strip() or "(无输出)")

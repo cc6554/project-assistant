@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from ..core.llm.router import ModelRouter
 from ..core.schema import Message
@@ -50,6 +50,14 @@ class _NextQuestion(BaseModel):
     question: str | None = None
     done: bool = False
 
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.done and self.question is not None:
+            raise ValueError("done=true requires question=null")
+        if not self.done and not (self.question or "").strip():
+            raise ValueError("done=false requires a nonempty question")
+        return self
+
 
 def next_interview_question(
     router: ModelRouter,
@@ -57,33 +65,40 @@ def next_interview_question(
     history: list[tuple[str, str]],
     *,
     task: str = "interview",
-    max_rounds: int = 8,
+    max_rounds: int | None = None,
+    max_context_chars: int | None = None,
 ) -> str | None:
-    if len(history) >= max_rounds:
-        return None
+    if max_rounds is not None and len(history) >= max_rounds:
+        raise ValueError("达到调用方指定的访谈预算；历史已保留，访谈尚未判定完成")
 
     history_text = (
-        "\n".join(f"Q: {q}\nA: {a}" for q, a in history[-6:]) or "（暂无）"
+        "\n".join(f"Q: {q}\nA: {a}" for q, a in history) or "（暂无）"
     )
-    result = router.complete_json(
-        task,
-        [
-            Message(
-                role="user",
-                content=NEXT_QUESTION_PROMPT.format(
-                    profile=profile.model_dump_json(),
-                    history=history_text,
-                ),
+    if max_context_chars is not None and len(history_text) + len(profile.model_dump_json()) > max_context_chars:
+        raise ValueError("超过显式上下文预算，历史未截断；请提高预算或另开访谈")
+    last_error = None
+    for _ in range(3):
+        try:
+            result = router.complete_json(
+                task,
+                [
+                    Message(
+                        role="user",
+                        content=NEXT_QUESTION_PROMPT.format(
+                            profile=profile.model_dump_json(),
+                            history=history_text,
+                        ),
+                    )
+                ],
+                _NextQuestion.model_json_schema(),
+                tool_name="emit_result",
+                tool_description="提交下一个访谈问题或结束标记",
             )
-        ],
-        _NextQuestion.model_json_schema(),
-        tool_name="emit_result",
-        tool_description="提交下一个访谈问题或结束标记",
-    )
-    decision = _NextQuestion.model_validate(result)
-    if decision.done:
-        return None
-    return decision.question
+            decision = _NextQuestion.model_validate(result)
+            return None if decision.done else decision.question
+        except (ValueError, TypeError) as exc:
+            last_error = exc
+    raise ValueError(f"访谈输出连续无效：{last_error}")
 
 
 def apply_interview_answer(
@@ -128,7 +143,7 @@ CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自�
 {outline}
 当前技能档案（摘要，供判断答非所问的程度）：
 {profile}
-历史对话（最近若干条）：
+历史对话（完整保留）：
 {history}
 用户消息里提到的链接/文件内容（系统已自动抓取并转述，你可以直接据此回答，不用再说"打不开/看不到"）：
 {extra}

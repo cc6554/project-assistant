@@ -67,7 +67,11 @@ class ModelRouter:
         max_tokens: int | None = None,
     ) -> LLMResponse:
         # 全局当前模型（对话界面选择）优先于任务默认链；未选则按任务路由
-        chain = [self.config.current] if self.config.current else self.config.chain_for(task)
+        chain = list(self.config.chain_for(task))
+        current = self.config.current
+        # A conversation preference must not replace vision/parsing/planning routes.
+        if current and task in {"default", "agent", "interview", "coach"}:
+            chain = [current] + [t for t in chain if (t.provider, t.model) != (current.provider, current.model)]
         errors: list[ProviderError] = []
 
         for target in chain:
