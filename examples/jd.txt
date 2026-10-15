@@ -1,0 +1,4 @@
+演示岗位：Python 后端工程师（虚构示例）
+要求：熟悉 Python、SQL、HTTP API，能够使用 pytest 测试并通过 Docker 运行服务。
+职责：实现接口、定位故障、编写测试和维护项目文档。
+加分项：使用过 FastAPI 或异步任务队列。

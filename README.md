@@ -1,121 +1,98 @@
-# 校招雷达 · Job Radar Coach
+# 校招雷达 0.5
 
-给求职者的一站式「岗位要求 → 学习计划 → 动手实操」桌面应用：把 BOSS 直聘等平台的**岗位截图**丢给它，AI 解析出岗位要求，对比你的技能档案做**差距分析**，输出**分阶段学习计划**并检索 **GitHub 可复现项目**，最后由一个能操作你电脑的 **Agent** 按计划带你逐个补足技能点。
+校招雷达是一个持续的求职教练。它把岗位 JD、技能证据、学习计划、练习项目、实践进度、对话记录和审批记录放在同一会话上下文中，帮助用户从岗位分析一直推进到可核对的实践结果。
 
-## 工作流
+项目基于 Python 3.10+，提供命令行入口和 localhost 浏览器工作台；Windows 原生窗口可以由 `packaged_launcher.py` 构建。程序只在用户明确确认后写文件、执行命令或记录实践结果。
 
-```
-① 岗位 JD（截图） → ② 技能档案（简历/自填/访谈） → ③ 计划 & 项目（差距分析+分阶段计划+GitHub 项目）
-→ ④ Agent 实操（按计划补技能点，操作真实电脑，按需确认） → ⚙ 模型配置（多 provider）
-```
+## 快速开始
 
-- **① JD 识别**：多张/长截图输入，视觉模型提取岗位信息，识别后可手动修正
-- **② 技能档案**：上传简历 / 工作日志，或与 AI 访谈逐步建立技能画像
-- **③ 计划 & 项目**：差距分析（missing / weak / evidence_insufficient / met）+ 2~5 阶段学习计划 + GitHub 项目检索（star 过滤 + LLM 重排）
-- **④ Agent 实操**：Codex 式操作面板——对话与真实操作实时可见，写文件 / 跑命令 / git clone 前需你确认；Agent 以计划为主线带用户补技能点（③ 的差距、阶段、项目自动注入 Agent 上下文）
-- **⚙ 模型配置**：任意 OpenAI 兼容 / Anthropic 端点，YAML 注册 + 环节级模型路由 + 失败自动降级
+在项目根目录执行：
 
-## 技术架构
-
-| 层 | 技术 | 说明 |
-|---|---|---|
-| 桌面壳 | Tauri 2 (Rust) | 启动 sidecar、开窗口；窗口直接加载 `http://127.0.0.1:17689/` |
-| 后端 | Python FastAPI（PyInstaller 打包为 sidecar） | 业务内核 + 同源托管前端 + API |
-| 前端 | React + Vite + TypeScript | 五环节界面 |
-| LLM 接入 | 多 provider 注册表 | OpenAI 兼容 / Anthropic，YAML 配置，任务级 fallback 链 |
-
-- sidecar 只监听回环地址 `127.0.0.1:17689`，不走系统代理，避免被代理/TUN 拦截
-- 支持 Windows / Linux 的构建入口；Ubuntu 和桌面 WebView 功能仍需在目标机器实测。
-
-```
-src/coach/
-├── core/
-│   ├── schema.py              # 内部统一 Message / ToolCall / LLMResponse
-│   └── llm/
-│       ├── base.py            # LLMClient 抽象 + 可重试错误判定
-│       ├── openai_compat.py   # DeepSeek/Kimi/智谱/豆包/OpenAI/Ollama/vLLM
-│       ├── anthropic_adapter.py
-│       ├── registry.py        # providers.yaml 声明式注册表
-│       └── router.py          # 环节路由、fallback、结构化 JSON 解析
-├── domain/schemas.py          # JDCard / UserSkillProfile / LearningPlan / GitHubRepo
-├── tools/
-│   ├── jd_parser.py           # ① 多截图 → JDCard（视觉模型）
-│   ├── profile_builder.py     # ② 材料 → 技能档案（增量合并）
-│   ├── interviewer.py         # ②b 一次一问的技能访谈
-│   ├── planner.py             # ③ 差距分析 + 分阶段计划（含异常重试）
-│   ├── github_search.py       # ③ GitHub 检索 + README/LLM 重排
-│   ├── pipeline.py            # 一键跑完整条管线
-│   ├── agent.py               # ④ 通用 Agent 运行时（写入/命令按需确认）
-│   └── session.py             # 会话状态持久化
-└── sidecar/
-    ├── main.py                # FastAPI：同源托管前端 + API + SSE 流式 Agent
-    ├── paths.py               # 跨平台路径定位（开发态/打包态）
-    └── store.py               # 会话存储
-```
-
-## 快速开始（开发态）
-
-```bash
-# 后端
-python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-pip install -e .
-cp config/providers.example.yaml config/providers.yaml
-cp .env.example .env        # 填入你的 DEEPSEEK_API_KEY 等
-python -m coach.sidecar.main   # 启动 127.0.0.1:17689
-
-# 前端（另开终端）
-npm install
-npm run build
-
-# 桌面壳（可选）
-cd src-tauri && cargo run
-```
-
-浏览器使用后端启动终端打印的带启动令牌链接进入（无需 Rust 壳）。令牌在 URL fragment 中，前端读取后移除，并为本标签页的 API 请求附加鉴权。桌面壳自动传递令牌；直接访问不带令牌的新标签页不能调用 API。
-
-## 构建桌面应用
-
-### Windows
 ```powershell
-pip install pyinstaller
-.\build-windows.ps1
+.\setup.ps1
+.\start-ui.cmd --demo
 ```
 
-脚本会先在 PATH 中查找 Cargo，未找到时依次检查 `CARGO_HOME\bin` 和用户目录下的 `.cargo\bin`，仅为当前构建进程补充 PATH，不修改系统或用户环境变量。自定义安装位置需正确设置 `CARGO_HOME` 和 `RUSTUP_HOME`。
+`setup.ps1` 在项目内创建 `.venv` 并安装开发依赖。`--demo` 使用离线演示模型，不需要 API Key；启动后会打开本地浏览器工作台。也可以直接运行：
 
-### Linux（Ubuntu 22.04+）
-```bash
-sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-  python3-venv python3-pip nodejs npm
-bash build-linux.sh     # 一键：venv → sidecar → 前端 → Rust 壳 → 组装
+```powershell
+.\.venv\Scripts\python.exe .\run-web.py --workspace .\work --demo
 ```
 
-两个脚本均将 sidecar 放入 `build/sidecar-dist/`，前端放入 `dist/`，最后组装到新建的 `build/releases/<时间戳>/`。请移动、分发和启动这个完整目录，而不是仅复制桌面 exe。发布目录只带配置模板，不复制开发机的 `.env`、Token 或模型配置；首次运行在模型配置页填入自己的密钥。
+启动脚本会把运行数据放在项目内的 `work`，该目录已加入 `.gitignore`。如果端口被占用，可追加 `--port 0` 让系统选择空闲端口；自动化或不打开浏览器时可追加 `--no-browser`。
 
-发布版资源从可执行文件所在目录定位，可写配置、会话和工作区存入系统应用数据目录。可在启动前设置绝对路径 `JOB_RADAR_HOME`，例如 PowerShell 中 `$env:JOB_RADAR_HOME='F:\Doubao\job-radar-data'`，将运行数据保存在 F 盘。迁移旧版数据时，先退出程序，再把自己的 `data/`、`config/`、`workspace/` 和 `.env` 复制到该数据目录；这些私人文件不要放入分发包。开发态 Python 默认继续使用项目根目录。
+## 连接模型
 
-## 配置模型
+复制无密钥模板并填写 provider 地址和模型名：
 
-`config/providers.yaml` 是唯一需要了解的配置：任何 OpenAI 兼容端点只需加一段注册，`tasks` 定义每个环节的 fallback 链（如识图用视觉模型、规划用强推理模型）。API key 一律放 `.env`（`api_key_env` 指向的环境变量），不进代码。
-
-## 安全
-
-- Agent 能操作真实电脑：只读操作（列目录/读文件）自动执行；写文件、跑命令、git clone 一律**先弹确认**，你批准才执行
-- Agent 是通用电脑操作助手：默认工作目录为 `workspace/`，也能访问指定的其他本地路径；审批时请核对完整路径、命令及写入内容。
-- 会话数据（岗位截图、技能档案、计划）存入本机数据目录下的 `data/`。
-
-## License
-
-MIT
-
-## 回归检查
-
-```bash
-python -m pytest -q
-node tests/frontend_remediation.cjs
-npx tsc --noEmit
+```powershell
+Copy-Item .\config\providers.example.yaml .\config\providers.yaml
+$env:AGENT_COACH_API_KEY = '在当前终端临时设置'
+.\start-ui.cmd --config .\config\providers.yaml
 ```
 
-测试使用模拟模型、网络和麦克风，验证逻辑及接口。真实模型质量、招聘平台在线可用性、系统剪贴板/麦克风和 Ubuntu 桌面启动仍需另做实机验收。
+配置文件只保存端点、模型和环境变量名，实际密钥通过环境变量提供。`config/providers.yaml`、`.env`、工作区设置和会话数据不会进入 Git。命令行也支持：
+
+```powershell
+.\.venv\Scripts\python.exe .\run.py init --config .\config\providers.yaml
+.\.venv\Scripts\python.exe .\run.py doctor --config .\config\providers.yaml
+.\.venv\Scripts\python.exe .\run.py --workspace .\work --config .\config\providers.yaml
+```
+
+浏览器侧栏左下角的“管理 API 配置”用于维护多个模型配置。配置保存在本地工作区，并对所有岗位会话共享；顶部选择器可以切换当前使用的配置。已保存的密钥不会回显，清除密钥需要显式操作。GitHub Token 也只在用户主动设置时使用。
+
+## 工作台与求职流程
+
+工作台按四个步骤组织：岗位 JD、技能档案、计划与项目、Agent 实操。步骤页和下方对话使用同一个 Agent、会话和求职状态。可以粘贴文本、上传材料，或显式导入本地文件；图片支持 PNG、JPEG、GIF 和 WebP，单张不超过 10 MiB，每轮不超过 20 MiB。
+
+练习项目按项目身份保存历史。任意时刻只有一个活动项目，但已完成或暂停的项目会保留；重新选择候选项目不会抹掉其他项目的进度。更新 JD 或技能资料会使依赖它们的当前计划重新生成，历史证据仍可追溯。
+
+所有会话都使用同一套模型配置和工具协议，但每个会话仍有独立的消息与求职状态。文件读取、网页访问、Git 操作、写入和命令执行都经过工作区边界检查；有副作用的操作先生成审批预览。
+
+## 入口与架构
+
+| 入口 | 用途 |
+| --- | --- |
+| `run.py` | 源码方式启动 CLI，调用 `agent_coach.cli` |
+| `run-web.py` | 源码方式启动 localhost 浏览器工作台，调用 `agent_coach.web` |
+| `start.cmd` | 使用 `.venv` 或 `AGENT_COACH_PYTHON` 启动 CLI |
+| `start-ui.cmd` / `启动界面.cmd` | 使用本地配置或离线 demo 启动浏览器工作台 |
+| `packaged_launcher.py` | Windows 原生窗口的 PyInstaller 入口，共用同一套 HTTP 服务 |
+
+核心调用链是：浏览器或 CLI → `AgentEngine` → 当前会话模型 → 工具注册表 → 求职状态与工作区。`job_radar.py` 负责 JD、技能、计划、项目和实践进度；`tools.py` 负责文件、文档、网页、Git、命令和审批；`store.py` 负责工作区绑定、会话持久化、互斥锁和原子写入；`legacy/` 保存兼容的模型适配器、文档处理和求职算法。
+
+完整模块关系见 [docs/architecture.md](docs/architecture.md)。
+
+## Windows 原生窗口（可选）
+
+浏览器工作台已经可以直接使用。需要构建原生窗口时，先安装桌面依赖和 PyInstaller：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --no-cache-dir -e '.[desktop]'
+.\.venv\Scripts\python.exe -m pip install --no-cache-dir pyinstaller
+```
+
+然后使用当前项目的解释器运行构建脚本；不要依赖构建脚本的默认解释器路径：
+
+```powershell
+.\build_windows_exe.ps1 -Python (Resolve-Path .\.venv\Scripts\python.exe) -InstallDesktopDeps -PackageName XiaozhaoRadar
+```
+
+构建结果位于 `dist\XiaozhaoRadar`，生成的程序标题为“校招雷达”。Windows 需要 WebView2 Runtime。构建缓存和输出目录已加入 `.gitignore`，便携包不要与 `work` 或 `.agent-coach` 一起分发。
+
+## 测试与资料
+
+运行离线测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+测试覆盖消息转换、模型路由、会话恢复、审批、文件边界、图片附件、求职状态、项目历史和浏览器 API。测试不代表真实模型、在线 GitHub 搜索或本机麦克风已经验收；这些能力需要用户提供配置后单独验证。
+
+- [架构说明](docs/architecture.md)
+- [验证范围](docs/validation.md)
+- [历史需求参考](docs/需求清单.md)
+- [无密钥 provider 模板](config/providers.example.yaml)
+
+项目来源和迁移范围见 [docs/origin.json](docs/origin.json)。发布内容不包含原仓库的 `.git`、虚拟环境、真实 provider 配置、Token、会话、工作区、构建输出或本地验收缓存。

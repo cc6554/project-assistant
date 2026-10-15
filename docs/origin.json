@@ -1,0 +1,18 @@
+{
+  "source": "cc6554/project-assistant",
+  "base_commit": "23e978814c2db984ace0c7605c0ebd406bccc657",
+  "release": "0.5",
+  "included": [
+    "single-agent job-coaching engine and web workbench",
+    "model adapters and domain algorithms",
+    "CLI, browser and optional Windows launcher",
+    "tests, architecture notes and key-free configuration templates"
+  ],
+  "excluded": [
+    ".git metadata",
+    ".env files, real provider configuration and tokens",
+    "workspaces, sessions, uploads and .agent-coach runtime data",
+    "virtual environments, build/dist outputs, binaries and archives",
+    "local QA logs, screenshots and temporary approval artifacts"
+  ]
+}

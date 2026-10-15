@@ -1,0 +1,20 @@
+# Copy to config/providers.yaml and replace endpoint/model names.
+# API keys are read only from the named environment variables.
+providers:
+  primary:
+    api_mode: chat_completions
+    base_url: https://api.example.com/v1
+    api_key_env: AGENT_COACH_API_KEY
+    timeout: 120
+    extra_body: {}
+  local:
+    api_mode: chat_completions
+    base_url: http://localhost:11434/v1
+    api_key_env: null
+    timeout: 180
+tasks:
+  default:
+    # One continuous product Agent needs tool calling and vision input.
+    - {provider: primary, model: REPLACE_WITH_TOOL_AND_VISION_MODEL}
+  agent:
+    - {provider: primary, model: REPLACE_WITH_TOOL_AND_VISION_MODEL}

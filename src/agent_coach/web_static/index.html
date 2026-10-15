@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="求职辅导工作台：围绕目标岗位、已有技能和练习项目推进求职。" />
+    <title>校招雷达 · 求职辅导</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell" id="appShell">
+      <aside class="sidebar" id="sidebar" aria-label="会话导航">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <div class="brand-name">校招雷达</div>
+            <div class="brand-subtitle">求职辅导</div>
+          </div>
+        </div>
+        <button class="icon-button sidebar-mobile-close" type="button" id="sidebarClose" aria-label="关闭会话导航" title="关闭会话导航">
+          <span data-icon="close" aria-hidden="true"></span>
+        </button>
+
+        <button class="new-chat-button" type="button" id="newChatButton">
+          <span class="button-icon" data-icon="plus" aria-hidden="true"></span>
+          <span>新建岗位会话</span>
+          <span class="shortcut-hint">Ctrl K</span>
+        </button>
+
+        <div class="sidebar-heading">
+          <span>会话历史</span>
+          <span class="count-pill" id="sessionCount">0</span>
+        </div>
+        <nav class="session-list" id="sessionList" aria-label="会话历史列表">
+          <div class="empty-sidebar-state" id="emptySessions">还没有保存的求职会话</div>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="workspace-card">
+            <div class="workspace-card-label"><span class="status-dot" id="workspaceStatusDot"></span>本地工作区</div>
+            <div class="workspace-path" id="workspacePath">加载中…</div>
+            <div class="workspace-meta" id="workspaceMeta">会话和上传资料保存在工作区</div>
+          </div>
+          <div class="theme-switch" id="themeSwitch" role="group" aria-label="主题模式">
+            <button class="theme-opt" type="button" data-theme-option="dark" aria-pressed="false">深色</button>
+            <button class="theme-opt" type="button" data-theme-option="light" aria-pressed="false">浅色</button>
+          </div>
+          <button class="model-settings-button sidebar-settings-button" type="button" id="modelSettingsButton" aria-label="管理 API 配置和名称" aria-haspopup="dialog" aria-controls="modelSettingsBackdrop">
+            <span data-icon="settings" aria-hidden="true"></span><span>管理 API 配置</span>
+          </button>
+          <div class="sidebar-footer">
+            <span class="local-badge"><span class="lock-icon" data-icon="lock" aria-hidden="true"></span>本地工作台</span>
+            <span class="build-label">v0.5</span>
+          </div>
+        </div>
+      </aside>
+
+      <button class="sidebar-scrim hidden" type="button" id="sidebarScrim" aria-label="关闭会话导航" aria-hidden="true" tabindex="-1"></button>
+
+      <div class="main-shell">
+        <header class="topbar">
+          <button class="icon-button sidebar-toggle" type="button" id="sidebarToggle" aria-label="收起会话导航" aria-expanded="true" aria-controls="sidebar">
+            <span data-icon="menu" aria-hidden="true"></span>
+          </button>
+          <div class="topbar-title-group">
+            <div class="breadcrumbs"><span>求职辅导</span><span class="breadcrumb-chevron">/</span><span id="modeBreadcrumb">岗位雷达</span></div>
+            <h1 id="currentTitle">新会话</h1>
+          </div>
+          <div class="topbar-actions">
+            <div class="model-switcher"><label class="sr-only" for="globalModelChoice">所有会话使用的 API 配置</label><select class="mode-badge" id="globalModelChoice" aria-describedby="globalModelStatus"><option value="">正在加载 API 配置…</option></select><span class="sr-only" id="modeBadge"><span id="modeLabel">连接中</span></span><small id="globalModelStatus" role="status" aria-live="polite"></small></div>
+            <button class="icon-button" type="button" id="refreshButton" aria-label="刷新当前会话" title="刷新当前会话">
+              <span data-icon="refresh" aria-hidden="true"></span>
+            </button>
+            <button class="icon-button" type="button" id="inspectorToggle" aria-label="打开求职资料面板" aria-expanded="true" title="打开求职资料面板">
+              <span data-icon="panel" aria-hidden="true"></span>
+            </button>
+          </div>
+        </header>
+
+        <nav class="workflow-nav" aria-label="求职步骤">
+          <button type="button" class="action-button primary jd-launch" id="jdImportButton">导入 / 搜索岗位 JD</button>
+          <div class="workflow-steps">
+            <button type="button" class="workflow-step active" data-step="jd" aria-current="step"><span>① 岗位 JD</span><small class="step-status">待填写</small></button>
+            <button type="button" class="workflow-step" data-step="profile"><span>② 技能档案</span><small class="step-status">待填写</small></button>
+            <button type="button" class="workflow-step" data-step="plan"><span>③ 计划 &amp; 项目</span><small class="step-status">待生成</small></button>
+            <button type="button" class="workflow-step" data-step="practice"><span>④ Agent 实操</span><small class="step-status">待开始</small></button>
+          </div>
+          <p>点击步骤打开独立页面，按你的节奏继续</p>
+        </nav>
+
+        <div class="token-notice hidden" id="tokenNotice" role="status">
+          <span class="notice-icon" data-icon="key" aria-hidden="true"></span>
+          <div><strong>需要启动授权</strong><span>请用启动脚本输出的带 <code>#token=…</code> 链接打开此页面。令牌只保存在当前标签页。</span></div>
+          <button class="notice-close" type="button" id="dismissTokenNotice" aria-label="关闭提示">×</button>
+        </div>
+
+        <section class="workflow-page hidden" id="workflowPage" aria-label="求职步骤页面">
+          <header class="workflow-page-heading"><div><h2 id="workflowPageTitle"></h2><p id="workflowPageHint"></p></div><button class="action-button secondary" type="button" id="backToChat">返回对话 / 查看回复</button></header>
+          <div id="workflowPageStatus" role="status"></div>
+          <div class="step-page hidden" id="jdPage"><div id="jdPageImport"></div><div id="jdPageResults" class="page-results"></div></div>
+          <div class="step-page hidden" id="profilePage">
+            <div class="page-tabs" role="tablist" aria-label="档案来源"><button type="button" data-profile-tab="text" aria-selected="true">文字</button><button type="button" data-profile-tab="documents" aria-selected="false">文档</button><button type="button" data-profile-tab="obsidian" aria-selected="false">Obsidian / 本地路径</button><button type="button" data-profile-tab="interview" aria-selected="false">访谈</button></div>
+            <form id="profileImportForm" class="page-form">
+              <label for="profileSource">材料来源</label><select id="profileSource"><option value="self_report">技能自述</option><option value="resume">简历</option><option value="work_log">工作日志</option></select>
+              <div data-profile-panel="text"><label for="profileText">技能自述 / 简历要点 / 工作日志</label><textarea id="profileText" rows="7" placeholder="越具体越好：使用过哪些技术、做过什么项目、熟练程度与事实证据…"></textarea></div>
+              <div data-profile-panel="documents" class="hidden"><label for="profileDocuments">上传简历或工作日志</label><input type="file" multiple id="profileDocuments"><div id="profileDocumentList"></div><p>支持 PDF、Office、图片和文本；每份最多 10 MiB。</p></div>
+              <div data-profile-panel="obsidian" class="hidden"><label for="profilePath">Obsidian 库 / 本地笔记 / 简历路径</label><input type="text" id="profilePath" placeholder="例如 D:\我的笔记 或 F:\resume.pdf"><p>导入可读取材料，教练根据实际材料整理技能与证据。</p></div>
+              <div data-profile-panel="interview" class="hidden"><h3>访谈问答</h3><p>逐个补充你的项目经历、掌握程度和使用频率。</p><label for="profileAnswer">访谈 / 澄清回答</label><textarea id="profileAnswer" rows="5" placeholder="补充具体经历与事实；留空可开始访谈"></textarea></div>
+              <div class="workflow-actions"><button class="action-button primary" type="submit" id="profileImportSubmit">整理并更新技能档案</button><button class="action-button secondary" type="button" id="profileManual">手动编辑档案</button><button class="action-button secondary" type="button" id="profileCopy">复制档案到新会话</button></div><p id="profileImportStatus" role="status"></p>
+            </form><div id="profilePageResults" class="page-results"></div>
+          </div>
+          <div class="step-page hidden" id="planPage"><p class="workflow-prerequisite hidden" id="planPrerequisite" role="status"></p><form id="planPageForm" class="page-form"><h3>项目搜索偏好</h3><div class="page-form-grid"><div><label for="planInclude">包含关键词</label><input type="text" id="planInclude" placeholder="例如 DDPG；多个词用逗号分隔"></div><div><label for="planExclude">排除关键词</label><input type="text" id="planExclude" placeholder="例如 Isaac；只影响当前会话"></div><div><label for="planMinStars">GitHub 最低 star 数</label><input type="number" min="0" step="1" value="50" id="planMinStars"></div></div><label class="page-checkbox"><input type="checkbox" id="planRerank" checked> 使用 AI 教练比较项目（更贴合你的差距）</label><button type="submit" class="action-button primary" id="planGenerate">生成差距分析、学习计划和复现项目</button><p id="planPageStatus" role="status"></p></form><div id="planPageResults" class="page-results"></div></div>
+          <div class="step-page hidden" id="practicePage"><p class="workflow-prerequisite hidden" id="practicePrerequisite" role="status"></p><div class="practice-context"><div id="practicePageResults"></div><div class="workflow-actions"><button type="button" class="action-button secondary" id="practiceStarter">开始今天的实操</button><button type="button" class="action-button secondary" id="practiceFiles">工作区文件</button></div></div><div id="practiceChatHost"></div></div>
+        </section>
+        <div class="content-grid" id="chatHome">
+          <main class="chat-column" aria-label="求职辅导对话">
+            <div class="chat-scroll" id="chatScroll">
+              <section class="welcome-panel" id="welcomePanel">
+                <div class="welcome-eyebrow"><span class="eyebrow-line"></span>求职辅导</div>
+                <h2>粘贴 JD，或上传简历。</h2>
+                <p class="welcome-copy">也可以直接说明已有技能和相关材料，系统会整理岗位要求并记录进度。</p>
+                <div class="onboarding-note hidden" id="modelOnboarding">
+                  <span class="onboarding-icon" data-icon="key" aria-hidden="true"></span>
+                  <div><strong id="onboardingTitle">还没有配置模型</strong><span id="onboardingText">点击侧栏底部“管理 API 配置”填写模型信息。</span><button class="onboarding-action" type="button" id="onboardingOpenModelSettings">打开模型设置</button></div>
+                </div>
+              </section>
+
+              <section class="message-list" id="messageList" aria-live="polite" aria-label="对话记录"></section>
+              <details class="activity-panel hidden" id="activityPanel">
+                <summary class="activity-heading"><span class="activity-pulse"></span><span>运行记录</span><span class="activity-live" id="activityStatus">处理中</span></summary>
+                <div class="activity-list" id="activityList"></div>
+              </details>
+              <div class="busy-bar hidden" id="busyBar"><span class="spinner"></span><span id="busyText">正在处理…</span></div>
+              <section class="approval-region" id="approvalRegion" aria-live="assertive"></section>
+              <div class="scroll-anchor" id="scrollAnchor"></div>
+            </div>
+
+            <footer class="composer-wrap">
+              <div class="attachment-strip hidden" id="attachmentStrip"></div>
+              <form class="composer" id="composerForm" aria-label="求职消息输入">
+                <label class="sr-only" for="composerInput">给求职教练的消息</label>
+                <textarea id="composerInput" rows="1" placeholder="粘贴 JD、说明已有技能，或上传相关材料…" autocomplete="off" spellcheck="false"></textarea>
+                <div class="composer-toolbar">
+                  <div class="composer-tools">
+                    <input type="file" id="fileUploadInput" class="sr-only" aria-label="上传求职材料" multiple />
+                    <button class="composer-tool" type="button" id="uploadButton" title="上传文件（每个最多 10 MiB）" aria-label="上传求职材料（每个最多 10 MiB）"><span data-icon="paperclip" aria-hidden="true"></span><span class="tool-label">上传材料</span></button>
+                    <button class="composer-tool" type="button" id="localImportButton" title="导入本地路径" aria-label="导入本地路径"><span data-icon="folder-open" aria-hidden="true"></span><span class="tool-label">本地路径</span></button>
+                    <button class="composer-tool voice-tool" type="button" id="voiceButton" data-voice-input-button="true" data-voice-target="composerInput" title="语音输入" aria-label="开始语音输入" aria-pressed="false"><span data-icon="mic" aria-hidden="true"></span><span class="tool-label" id="voiceButtonLabel">语音输入</span></button>
+                    <div class="voice-level hidden" id="voiceLevel" data-voice-level="true" data-voice-target="composerInput" title="实时音量" aria-label="实时音量" aria-hidden="true">
+                      <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+                    </div>
+                  </div>
+                  <div class="composer-hint"><span>Enter 发送</span><span>Shift + Enter 换行</span></div>
+                  <button class="send-button" type="submit" id="sendButton" aria-label="发送消息"><span data-icon="arrow-up" aria-hidden="true"></span></button>
+                </div>
+              </form>
+              <div class="composer-disclaimer"><span class="disclaimer-lock" data-icon="shield" aria-hidden="true"></span>材料用于求职辅导；文件修改和命令执行需要确认。</div>
+            </footer>
+          </main>
+
+          <aside class="inspect-pane" id="inspectPane" aria-label="求职资料和工作区文件">
+            <div class="inspect-header">
+              <div><span class="inspect-kicker">岗位雷达</span><h2>求职资料</h2></div>
+              <button class="icon-button pane-close" type="button" id="paneClose" aria-label="收起求职资料面板"><span data-icon="panel-close" aria-hidden="true"></span></button>
+            </div>
+            <div class="inspect-tabs" role="tablist" aria-label="求职资料标签">
+              <button type="button" class="inspect-tab active" role="tab" aria-selected="true" data-tab="job">求职进度</button>
+              <button type="button" class="inspect-tab" role="tab" aria-selected="false" data-tab="files">工作区文件</button>
+            </div>
+            <div class="inspect-content" id="inspectContent"></div>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop hidden" id="fileModalBackdrop">
+      <section class="file-modal" role="dialog" aria-modal="true" aria-labelledby="fileModalTitle">
+        <header class="modal-header"><div><span class="inspect-kicker">文件预览</span><h2 id="fileModalTitle">文件预览</h2></div><button class="icon-button" type="button" id="fileModalClose" aria-label="关闭文件预览"><span data-icon="close" aria-hidden="true"></span></button></header>
+        <div class="file-modal-meta" id="fileModalMeta"></div>
+        <pre class="file-preview" id="filePreview"></pre>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="modelSettingsBackdrop">
+      <section class="model-settings-modal" role="dialog" aria-modal="true" aria-labelledby="modelSettingsTitle" aria-describedby="modelSettingsDescription">
+        <header class="modal-header model-settings-header">
+          <div><span class="inspect-kicker">连接设置</span><h2 id="modelSettingsTitle">模型设置</h2></div>
+          <button class="icon-button" type="button" id="modelSettingsClose" aria-label="关闭模型设置"><span data-icon="close" aria-hidden="true"></span></button>
+        </header>
+        <form class="model-settings-form" id="modelSettingsForm" novalidate>
+          <p class="model-settings-description" id="modelSettingsDescription">配置会在本地工作区共享给所有岗位会话，后续发送的消息将使用所选模型。测试连接只发送不含求职资料的探测请求，不会执行工具；当前已保存的密钥不会回显。</p>
+          <div class="model-settings-field">
+            <label for="modelProfileName">配置名称</label>
+            <input id="modelProfileName" name="display_name" type="text" autocomplete="off" placeholder="例如：工作模型" />
+            <span class="model-settings-hint">用于区分多个模型配置；留空时按当前配置或模型地址自动命名。</span>
+          </div>
+          <div class="model-settings-field">
+            <label for="modelApiMode">协议</label>
+            <select id="modelApiMode" name="api_mode" autocomplete="off">
+              <option value="chat_completions">Chat Completions（兼容 OpenAI）</option>
+              <option value="anthropic_messages">Anthropic Messages</option>
+            </select>
+          </div>
+          <div class="model-settings-field">
+            <label for="modelBaseUrl">API 地址</label>
+            <input id="modelBaseUrl" name="base_url" type="url" inputmode="url" autocomplete="url" placeholder="https://api.example.com/v1" required />
+          </div>
+          <div class="model-settings-field">
+            <label for="modelName">模型名称</label>
+            <input id="modelName" name="model" type="text" autocomplete="off" placeholder="例如 gpt-4o-mini" required />
+            <span class="model-settings-hint">官方 DeepSeek 地址请填写控制台提供的实际模型 ID（例如 deepseek-flash）；其他服务仍可填写自己的模型名。</span>
+          </div>
+          <div class="model-settings-field hidden" id="modelChoiceField">
+            <label for="modelChoice">已保存或声明的模型</label>
+            <select id="modelChoice" autocomplete="off"></select>
+            <div class="model-profile-list" id="modelProfileList"></div>
+            <span class="model-settings-hint">选择已保存配置会即时恢复对应密钥和连接字段；选择声明的 Provider/模型会切回配置文件中的路由。</span>
+          </div>
+          <div class="model-profile-actions model-profile-create-actions">
+            <button class="action-button secondary" type="button" id="modelNewProfileButton">新建配置</button>
+          </div>
+          <div class="model-settings-field">
+            <label for="modelApiKey">API Key</label>
+            <input id="modelApiKey" name="api_key" type="password" autocomplete="new-password" placeholder="未保存；留空则保留已保存的密钥" />
+            <span class="model-settings-hint" id="modelApiKeyHint">密钥只在提交时发送，不会保存到浏览器或显示在页面中。</span>
+          </div>
+          <label class="model-clear-key hidden" id="modelClearKeyLabel" for="modelClearKey">
+            <input id="modelClearKey" name="clear_api_key" type="checkbox" />
+            <span>清除已保存的 API Key</span>
+          </label>
+          <div class="github-settings-section">
+            <div class="github-settings-title">GitHub 搜索（可选）</div>
+            <div class="github-settings-field">
+              <label for="githubToken">GitHub Token</label>
+              <input id="githubToken" type="password" autocomplete="new-password" placeholder="未保存；留空则保留已保存的 Token" />
+              <span class="model-settings-hint" id="githubTokenHint">用于读取你有权限的私有仓库并提高公开仓库搜索额度；不会发给模型。</span>
+            </div>
+            <label class="model-clear-key hidden" id="githubClearTokenLabel" for="githubClearToken">
+              <input id="githubClearToken" type="checkbox" />
+              <span>清除已保存的 GitHub Token</span>
+            </label>
+            <div class="github-settings-actions">
+              <button class="action-button secondary" type="button" id="githubTokenSave">保存 GitHub Token</button>
+              <span class="model-settings-status" id="githubTokenStatus" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+          <div class="model-settings-status" id="modelSettingsStatus" role="status" aria-live="polite"></div>
+          <div class="model-settings-actions">
+            <button class="action-button secondary" type="button" id="modelTestButton">测试连接</button>
+            <div class="model-settings-actions-right">
+              <button class="action-button secondary" type="button" id="modelSettingsCancel">关闭</button>
+              <button class="action-button primary" type="submit" id="modelSaveButton">保存并应用</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="jobEditBackdrop">
+      <section class="job-edit-modal" role="dialog" aria-modal="true" aria-labelledby="jobEditTitle">
+        <header class="modal-header">
+          <div><span class="inspect-kicker">资料编辑</span><h2 id="jobEditTitle">编辑求职资料</h2></div>
+          <button class="icon-button" type="button" id="jobEditClose" aria-label="关闭资料编辑"><span data-icon="close" aria-hidden="true"></span></button>
+        </header>
+        <form class="job-edit-form" id="jobEditForm" novalidate>
+          <div id="jobEditFields"></div>
+          <p class="job-edit-hint">确认后保存到当前会话，求职教练下一轮会读取更新后的资料。相关计划和项目需要根据新资料重新生成。</p>
+          <div class="model-settings-status" id="jobEditStatus" role="status" aria-live="polite"></div>
+          <div class="model-settings-actions">
+            <button class="action-button secondary" type="button" id="jobEditCancel">取消</button>
+            <button class="action-button primary" type="submit" id="jobEditSave">确认并保存</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+
+    <div class="modal-backdrop hidden" id="jdImportBackdrop">
+      <section class="jd-import-modal" aria-labelledby="jdImportTitle">
+        <header class="modal-header"><div><span class="inspect-kicker">目标岗位</span><h2 id="jdImportTitle">岗位 JD</h2></div><button type="button" class="icon-button" id="jdImportClose" aria-label="关闭岗位导入">×</button></header>
+        <div class="jd-import-body">
+          <p class="job-edit-hint">提供链接 / 正文、说岗位名，或上传岗位详情截图。资料会写入当前会话。</p>
+          <div class="jd-mode-tabs" role="tablist" aria-label="岗位导入方式"><button type="button" role="tab" aria-selected="true" aria-controls="jdSourcePanel" data-jd-mode="source">链接 / 正文</button><button type="button" role="tab" aria-selected="false" aria-controls="jdSearchPanel" data-jd-mode="search">说岗位名</button><button type="button" role="tab" aria-selected="false" aria-controls="jdImagePanel" data-jd-mode="image">上传 / 粘贴截图</button></div>
+          <div id="jdSourcePanel" role="tabpanel">
+            <label for="jdSourceUrl">来源链接（可选）</label><input id="jdSourceUrl" type="url" placeholder="招聘岗位的 HTTPS 链接">
+            <label for="jdSourceText">岗位正文（可选）</label><textarea id="jdSourceText" rows="5" placeholder="粘贴真实岗位正文；链接和正文至少提供一项"></textarea>
+          </div>
+          <div id="jdSearchPanel" role="tabpanel" class="hidden">
+            <label for="jdPlatform">招聘平台（公开搜索索引）</label><select id="jdPlatform"><option value="boss">BOSS 直聘</option><option value="liepin">猎聘</option><option value="zhilian">智联招聘</option></select>
+            <label for="jdQuery">岗位名称或方向</label><textarea id="jdQuery" rows="3" placeholder="例如：具身智能算法工程师，可加城市、公司和关键词（回车搜索）"></textarea>
+            <p class="job-edit-field-hint">搜索公开招聘信息后整理 JD；请核对来源和识别结果。</p>
+          </div>
+          <div id="jdImagePanel" role="tabpanel" class="hidden">
+            <button type="button" class="jd-drop-zone" id="jdImageDrop">点击选择、拖拽岗位截图到这里，或在此 Ctrl+V 粘贴</button><input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden id="jdImagePicker">
+            <div id="jdImageList" aria-live="polite"></div><label for="jdImageNote">补充说明（可选）</label><textarea id="jdImageNote" rows="2" placeholder="例如：这是我想投递的校招岗位"></textarea>
+          </div>
+          <div class="workflow-actions"><button type="button" class="action-button primary" id="jdImportSubmit">交给 AI 整理 JD</button></div><p class="job-edit-field-hint">整理结果会显示在本页，核对后确认岗位 JD；三种方式都可继续处理。</p>
+          <p id="jdImportStatus" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="newSessionBackdrop">
+      <section class="new-session-modal" role="dialog" aria-modal="true" aria-labelledby="newSessionTitle">
+        <header class="modal-header">
+          <div><span class="inspect-kicker">会话管理</span><h2 id="newSessionTitle">新建岗位会话</h2></div>
+          <button class="icon-button" type="button" id="newSessionClose" aria-label="关闭新建会话"><span data-icon="close" aria-hidden="true"></span></button>
+        </header>
+        <form class="new-session-form" id="newSessionForm" novalidate>
+          <p class="job-edit-hint">已有技能档案可以复用到新岗位；当前会话的 JD 和对话记录不会复制。</p>
+          <label for="copySessionSource">复制来源（可选）</label>
+          <select id="copySessionSource" name="copy_session_source">
+            <option value="">不复制，空白档案</option>
+          </select>
+          <div class="model-settings-status" id="newSessionStatus" role="status" aria-live="polite"></div>
+          <div class="model-settings-actions">
+            <span></span>
+            <div class="model-settings-actions-right">
+              <button class="action-button secondary" type="button" id="newSessionCancel">取消</button>
+              <button class="action-button primary" type="submit" id="newSessionCreate">新建岗位会话</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="localImportBackdrop">
+      <section class="local-import-modal" role="dialog" aria-modal="true" aria-labelledby="localImportTitle">
+        <header class="modal-header">
+          <div><span class="inspect-kicker">资料导入</span><h2 id="localImportTitle">导入本地路径</h2></div>
+          <button class="icon-button" type="button" id="localImportClose" aria-label="关闭本地路径导入"><span data-icon="close" aria-hidden="true"></span></button>
+        </header>
+        <form class="local-import-form" id="localImportForm" novalidate>
+          <p class="job-edit-hint">输入本机简历、笔记或资料目录的完整路径。支持 PDF、Office、图片和文本等可读取资料；敏感路径、超限文件和不支持的二进制会跳过。上限：最多 1000 个文件、单文件 2 MiB、总计 20 MiB。导入后会放入当前消息，发送后读取。</p>
+          <label for="localImportPath">本地路径</label>
+          <input id="localImportPath" type="text" autocomplete="off" placeholder="例如 D:\\简历.pdf 或 /home/user/Documents/resume.pdf" required />
+          <div class="model-settings-status" id="localImportStatus" role="status" aria-live="polite"></div>
+          <div class="model-settings-actions">
+            <span></span>
+            <div class="model-settings-actions-right">
+              <button class="action-button secondary" type="button" id="localImportCancel">取消</button>
+              <button class="action-button primary" type="submit" id="localImportSubmit">导入路径</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
