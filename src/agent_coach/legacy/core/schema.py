@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -61,6 +61,11 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None  # role == "tool" 时对应调用 id
     name: str | None = None
+    # Browser-only provenance for transcript scoping.  Providers deliberately
+    # ignore this field when converting messages to their wire protocol; it is
+    # persisted so a practice window can show only its own tagged turns while
+    # the model still receives the complete session transcript.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolSpec(BaseModel):

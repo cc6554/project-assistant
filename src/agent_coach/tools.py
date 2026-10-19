@@ -9,20 +9,25 @@ after the returned :class:`~agent_coach.contracts.PendingApproval` is accepted.
 
 from __future__ import annotations
 
+import atexit
 import difflib
+from datetime import datetime, timezone
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from .contracts import (
     PendingApproval,
@@ -45,10 +50,21 @@ MAX_WRITE_BYTES = 4 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
 MAX_FETCH_BYTES = 4 * 1024 * 1024
 MAX_FETCH_REDIRECTS = 5
-DEFAULT_COMMAND_TIMEOUT = 30.0
-MAX_COMMAND_TIMEOUT = 120.0
+# A command has no implicit deadline.  A caller may still opt into a bounded
+# timeout, but the limit is deliberately measured in days rather than the old
+# arbitrary two-minute cap.  This keeps ordinary command sessions compatible
+# with long-running developer commands while retaining a finite guardrail for
+# malformed/model-generated values.
+DEFAULT_COMMAND_TIMEOUT: float | None = None
+MAX_COMMAND_TIMEOUT = 7 * 24 * 60 * 60.0
 DEFAULT_FETCH_TIMEOUT = 15.0
 MAX_FETCH_TIMEOUT = 60.0
+MAX_COMMAND_PURPOSE_BYTES = 2 * 1024
+MAX_COMMAND_SESSIONS = 128
+COMMAND_STOP_GRACE_SECONDS = 2.0
+MAX_COMMAND_POLL_WAIT_SECONDS = 30.0
+DEFAULT_COMMAND_POLL_WAIT_SECONDS = 0.0
+COMMAND_INITIAL_HANDOFF_WAIT_SECONDS = 0.25
 
 
 class PathSecurityError(PermissionError, ValueError):
@@ -136,6 +152,14 @@ def _require_mapping(args: Any) -> Mapping[str, Any]:
     if not isinstance(args, Mapping):
         raise ToolInputError("tool arguments must be an object")
     return args
+
+
+def _reject_unknown_arguments(args: Mapping[str, Any], allowed: set[str]) -> None:
+    """Keep sensitive integration arguments out of silently ignored fields."""
+
+    unknown = sorted(set(args) - allowed)
+    if unknown:
+        raise ToolInputError(f"unsupported tool arguments: {', '.join(unknown)}")
 
 
 def _workspace_root(ctx: ToolContext) -> Path:
@@ -251,16 +275,50 @@ def _safe_limit(value: Any, *, default: int, maximum: int, minimum: int = 1) -> 
     return number
 
 
+def _safe_bool(value: Any, *, default: bool, field: str) -> bool:
+    """Accept only a real JSON/Python boolean for boolean tool arguments.
+
+    ``bool('false')`` is ``True`` in Python and would make a model or HTTP
+    adapter accidentally change command semantics.  Keep coercion out of the
+    approval boundary so the prepared value and the approved value compare
+    exactly.
+    """
+
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ToolInputError(f"{field} must be a boolean")
+    return value
+
+
 def _safe_timeout(value: Any, *, default: float, maximum: float) -> float:
     if value is None:
         return default
+    if isinstance(value, bool):
+        raise ToolInputError("timeout must be a number")
     try:
         timeout = float(value)
     except (TypeError, ValueError) as exc:
         raise ToolInputError("timeout must be a number") from exc
+    if not timeout == timeout or timeout in (float("inf"), float("-inf")):
+        raise ToolInputError("timeout must be a finite number")
     if timeout <= 0 or timeout > maximum:
         raise ToolInputError(f"timeout must be greater than 0 and at most {maximum}")
     return timeout
+
+
+def _safe_optional_timeout(value: Any, *, maximum: float) -> float | None:
+    """Parse a command timeout where omitted/null means run until completion.
+
+    ``run_command`` is intentionally a session-style operation.  It must not
+    silently terminate a useful build/test command merely because a default
+    HTTP or model request window elapsed.  An explicit positive timeout still
+    gives callers a deterministic deadline.
+    """
+
+    if value is None:
+        return None
+    return _safe_timeout(value, default=0.0, maximum=maximum)
 
 
 def _hash_bytes(value: bytes) -> str:
@@ -449,7 +507,7 @@ def _write_prepare(args: dict, ctx: ToolContext) -> PendingApproval:
     return PendingApproval(
         tool_name="write_file",
         arguments=original,
-        summary=f"Write {len(new)} UTF-8 bytes to {display}",
+        summary=f"目的：将审批后的 UTF-8 内容写入工作区文件 {display}（{len(new)} 字节）\n预期结果：原子替换目标文件并保留完整内容。",
         preview=preview,
         prepared=prepared,
     )
@@ -538,6 +596,37 @@ def _normalise_argv(command: Any, shell: bool) -> list[str] | str:
     return argv
 
 
+def _command_purpose(value: Any) -> str:
+    """Return the short human-readable reason shown at the approval gate."""
+
+    if value is None:
+        # Keep compatibility with older model prompts while ensuring every
+        # approval still explains why the operation is being requested.  New
+        # callers should always provide ``purpose`` explicitly.
+        return "执行这条经过批准的本地命令，以完成当前任务"
+    if not isinstance(value, str) or not value.strip():
+        raise ToolInputError("purpose must be a non-empty human-readable string")
+    if len(value.encode("utf-8")) > MAX_COMMAND_PURPOSE_BYTES:
+        raise ToolInputError(f"purpose exceeds the {MAX_COMMAND_PURPOSE_BYTES}-byte limit")
+    return value.strip()
+
+
+def _command_scope(ctx: ToolContext) -> dict[str, str]:
+    """Build the owner binding copied into every command-session snapshot."""
+
+    metadata = getattr(ctx.session, "active_turn_metadata", None)
+    scope: dict[str, str] = {
+        "workspace": str(_workspace_root(ctx)),
+        "session_id": str(getattr(ctx.session, "id", "")),
+    }
+    if isinstance(metadata, Mapping):
+        for key in ("scope", "project_key", "practice_thread_id"):
+            value = metadata.get(key)
+            if value is not None and str(value).strip():
+                scope[key] = str(value).strip()
+    return scope
+
+
 def _command_display(command: list[str] | str, shell: bool) -> str:
     if isinstance(command, str):
         return command
@@ -578,37 +667,53 @@ def _clip_bytes(value: Any, limit: int) -> tuple[str, bool]:
     clipped = len(raw) > limit
     if clipped:
         raw = raw[:limit]
-    return raw.decode("utf-8", errors="replace"), clipped
+    # Do not decode a partial UTF-8 code point with ``errors='replace'``:
+    # U+FFFD takes three bytes and could make the returned text exceed the
+    # advertised byte bound.  Ignoring only an incomplete trailing sequence
+    # preserves valid UTF-8 and keeps the encoded result within ``limit``.
+    return raw.decode("utf-8", errors="ignore"), clipped
 
 
 def _drain_pipe(stream: Any, sink: dict[str, Any], limit: int) -> None:
-    """Drain one child pipe while retaining only a bounded prefix.
+    """Drain one child pipe into a bounded, pollable capture.
 
-    Keeping the reader alive after the cap is reached prevents a chatty child
-    from blocking on a full pipe, while the bounded bytearray prevents command
-    output from consuming unbounded agent memory.
+    The reader keeps consuming after the output cap is reached.  That is
+    necessary for a chatty process: stopping the reader would fill the OS pipe
+    buffer and make the child appear hung.  ``sink['data']`` is updated after
+    every chunk so a command session can be polled while it is still running.
     """
 
-    kept = bytearray()
-    total = 0
+    sink.setdefault("_lock", threading.Lock())
+    sink.setdefault("data", b"")
+    sink.setdefault("total", 0)
+    sink.setdefault("truncated", False)
     try:
+        read_chunk = getattr(stream, "read1", None)
+        if not callable(read_chunk):
+            read_chunk = getattr(stream, "read", None)
+        if not callable(read_chunk):
+            return
         while True:
-            chunk = stream.read(64 * 1024)
+            # BufferedReader.read1() returns bytes already available from the
+            # OS pipe, which makes Windows polling genuinely incremental;
+            # read() may wait for its whole requested size or EOF.
+            chunk = read_chunk(64 * 1024)
             if not chunk:
                 break
             if isinstance(chunk, str):
                 chunk = chunk.encode("utf-8", errors="replace")
             chunk = bytes(chunk)
-            total += len(chunk)
-            if len(kept) < limit:
-                kept.extend(chunk[: limit - len(kept)])
-    except (OSError, ValueError):
+            with sink["_lock"]:
+                sink["total"] = int(sink.get("total", 0)) + len(chunk)
+                current = bytes(sink.get("data", b""))
+                if len(current) < limit:
+                    sink["data"] = current + chunk[: limit - len(current)]
+                sink["truncated"] = int(sink["total"]) > limit
+    except (AttributeError, OSError, ValueError):
         # The process may be killed while a reader is blocked.  Preserve the
         # bytes already collected and let the caller report timeout state.
         pass
     finally:
-        sink["data"] = bytes(kept)
-        sink["truncated"] = total > limit
         close = getattr(stream, "close", None)
         if callable(close):
             try:
@@ -617,95 +722,697 @@ def _drain_pipe(stream: Any, sink: dict[str, Any], limit: int) -> None:
                 pass
 
 
+def _sink_snapshot(sink: Mapping[str, Any], limit: int) -> tuple[str, bool, int]:
+    lock = sink.get("_lock")
+    if lock is None:
+        raw = bytes(sink.get("data", b""))
+        total = int(sink.get("total", len(raw)))
+        truncated = bool(sink.get("truncated")) or len(raw) > limit or total > limit
+    else:
+        with lock:
+            raw = bytes(sink.get("data", b""))
+            total = int(sink.get("total", len(raw)))
+            truncated = bool(sink.get("truncated")) or len(raw) > limit or total > limit
+    text, clipped = _clip_bytes(raw, limit)
+    return text, bool(truncated or clipped), total
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _process_returncode(process: Any, fallback: int | None = None) -> int | None:
+    value = getattr(process, "returncode", None)
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+    return fallback
+
+
+def _process_running(process: Any) -> bool:
+    poll = getattr(process, "poll", None)
+    if callable(poll):
+        try:
+            return poll() is None
+        except (OSError, ValueError):
+            pass
+    value = getattr(process, "returncode", None)
+    # A small fake process used by callers/tests may not expose poll or
+    # returncode.  Treat it as running so the termination fallback is tried.
+    return value is None
+
+
+def _terminate_process_tree(process: Any, *, grace: float = COMMAND_STOP_GRACE_SECONDS) -> bool:
+    """Terminate a command and its descendants where the platform permits.
+
+    Commands are launched in their own process group/session.  POSIX can then
+    signal the entire group directly.  Windows has no equivalent portable
+    Python process-tree API, so ``taskkill /T`` is invoked with a fixed argv;
+    the direct ``kill`` fallback still handles test doubles and unusual child
+    process implementations.  The function returns whether the process was
+    observed stopped before the caller's final snapshot.
+    """
+
+    if process is None:
+        return True
+
+    pid = getattr(process, "pid", None)
+    process_group_owned = bool(getattr(process, "_agent_coach_process_group", False))
+    if not _process_running(process) and not process_group_owned:
+        return True
+    if os.name == "nt":
+        # CTRL_BREAK gives a well-behaved console process a chance to clean up
+        # before taskkill forcibly closes every descendant in its tree.
+        send_signal = getattr(process, "send_signal", None)
+        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+        if callable(send_signal) and ctrl_break is not None:
+            try:
+                send_signal(ctrl_break)
+            except (OSError, ValueError):
+                pass
+        if pid is not None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=max(1.0, float(grace)),
+                )
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
+    else:
+        # ``start_new_session=True`` makes the child PID the process-group ID.
+        # If a test double has no PID, the direct kill fallback below is used.
+        if pid is not None:
+            try:
+                os.killpg(int(pid), signal.SIGTERM)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            wait(timeout=max(0.05, float(grace)))
+        except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+            pass
+
+    # A shell can exit as soon as it receives SIGTERM while a descendant that
+    # inherited the process group keeps running.  Escalate the group even when
+    # the group leader has already reaped; ``killpg`` simply reports ESRCH when
+    # no member remains.  This is the part that prevents a timed-out command
+    # from leaving a detached ``sleep``/worker behind with open pipes.
+    if os.name != "nt" and pid is not None:
+        try:
+            os.killpg(int(pid), signal.SIGKILL)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    if _process_running(process):
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            try:
+                kill()
+            except (OSError, ValueError):
+                pass
+        if callable(wait):
+            try:
+                wait(timeout=max(0.05, float(grace)))
+            except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+                pass
+    return not _process_running(process)
+
+
+def _popen_command(
+    command: list[str] | str,
+    *,
+    shell: bool,
+    cwd: Path,
+    git: bool = False,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "shell": shell,
+        "cwd": str(cwd),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": _safe_environment(git=git),
+    }
+    if os.name == "nt":
+        flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
+        if flags:
+            kwargs["creationflags"] = flags
+    else:
+        # Make process-tree stop deterministic for commands that spawn child
+        # workers.  This is intentionally independent of shell=True/False.
+        kwargs["start_new_session"] = True
+    process = subprocess.Popen(command, **kwargs)
+    # Mark only processes whose group/session was created by this tool.  The
+    # marker lets a timeout clean up descendants even if the group leader
+    # exits in the small race between wait() and tree termination, without
+    # ever sending a guessed PID signal to an unrelated process.
+    try:
+        process._agent_coach_process_group = bool(os.name != "nt" or kwargs.get("creationflags"))
+    except Exception:
+        pass
+    return process
+
+
+class CommandSession:
+    """A bounded, pollable subprocess session.
+
+    The command starts exactly once.  ``poll`` only observes it, ``stop`` is
+    the sole explicit termination path, and ``wait`` is useful to the legacy
+    synchronous ToolDefinition adapter.  A session never retries a process,
+    which lets the engine keep its durable approval/execution claim as the
+    single replay guard across restarts.
+    """
+
+    def __init__(
+        self,
+        command: list[str] | str,
+        *,
+        shell: bool,
+        cwd: Path,
+        timeout: float | None,
+        output_limit: int,
+        purpose: str = "",
+        approval_id: str | None = None,
+        tool_call_id: str | None = None,
+        owner_workspace: Path | str | None = None,
+        owner_session_id: str | None = None,
+        scope: Mapping[str, Any] | None = None,
+        git: bool = False,
+    ) -> None:
+        self.id = uuid.uuid4().hex
+        self.execution_id = self.id
+        self.command = command
+        self.shell = bool(shell)
+        self.cwd = Path(cwd)
+        self.timeout = timeout
+        self.output_limit = output_limit
+        self.purpose = str(purpose or "").strip()
+        self.approval_id = str(approval_id or "") or None
+        self.tool_call_id = str(tool_call_id or "") or None
+        self.owner_workspace = str(owner_workspace or "")
+        self.owner_session_id = str(owner_session_id or "")
+        self.scope = {
+            str(key): str(value)
+            for key, value in dict(scope or {}).items()
+            if value is not None and str(value).strip()
+        }
+        if self.owner_workspace:
+            self.scope.setdefault("workspace", self.owner_workspace)
+        if self.owner_session_id:
+            self.scope.setdefault("session_id", self.owner_session_id)
+        if self.approval_id:
+            self.scope.setdefault("approval_id", self.approval_id)
+        if self.tool_call_id:
+            self.scope.setdefault("tool_call_id", self.tool_call_id)
+        self.display = _command_display(command, self.shell)
+        self.started_at = _utc_now()
+        self.finished_at: str | None = None
+        self._state_lock = threading.RLock()
+        self._done = threading.Event()
+        self._stop_requested = False
+        self._timed_out = False
+        self._termination_failed = False
+        self._returncode: int | None = None
+        self._status = "starting"
+        self._stdout_sink: dict[str, Any] = {"_lock": threading.Lock(), "data": b"", "total": 0}
+        self._stderr_sink: dict[str, Any] = {"_lock": threading.Lock(), "data": b"", "total": 0}
+        self._process = _popen_command(command, shell=self.shell, cwd=self.cwd, git=git)
+        self._status = "running"
+        self._readers: list[threading.Thread] = []
+        for stream, sink, name in (
+            (getattr(self._process, "stdout", None), self._stdout_sink, "stdout"),
+            (getattr(self._process, "stderr", None), self._stderr_sink, "stderr"),
+        ):
+            if stream is None:
+                continue
+            reader = threading.Thread(
+                target=_drain_pipe,
+                args=(stream, sink, output_limit),
+                name=f"agent-coach-command-{self.id[:8]}-{name}",
+                daemon=True,
+            )
+            self._readers.append(reader)
+            reader.start()
+        self._watcher = threading.Thread(
+            target=self._watch,
+            name=f"agent-coach-command-watch-{self.id[:8]}",
+            daemon=True,
+        )
+        self._watcher.start()
+
+    def _watch(self) -> None:
+        wait_result: int | None = None
+        timed_out = False
+        termination_failed = False
+        try:
+            if self.timeout is None:
+                wait_result = self._process.wait()
+            else:
+                wait_result = self._process.wait(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            termination_failed = not _terminate_process_tree(self._process)
+            try:
+                wait_result = self._process.wait(timeout=max(1.0, COMMAND_STOP_GRACE_SECONDS))
+            except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+                wait_result = None
+        except (OSError, ValueError):
+            # A process that exits between poll/stop calls can make wait raise;
+            # retain its best available return code and finish the session.
+            wait_result = _process_returncode(self._process)
+        finally:
+            # Descendants that inherited the pipe can delay EOF.  Joining for a
+            # short bounded interval keeps final polling responsive while the
+            # daemon readers continue to enforce the output cap if needed.
+            for reader in self._readers:
+                reader.join(timeout=COMMAND_STOP_GRACE_SECONDS)
+            returncode = _process_returncode(self._process, wait_result)
+            process_alive = _process_running(self._process)
+            with self._state_lock:
+                self._timed_out = bool(timed_out)
+                self._termination_failed = bool(
+                    self._termination_failed or termination_failed
+                )
+                self._returncode = returncode
+                # A failed stop/timeout is deliberately not reported as a
+                # normal terminal status.  The child may still be running,
+                # and allowing the engine to resume the model would make the
+                # saved transcript claim a completed side effect too early.
+                uncertain = bool(self._termination_failed or process_alive)
+                self.finished_at = None if process_alive else _utc_now()
+                if uncertain:
+                    self._status = "uncertain"
+                elif timed_out:
+                    self._status = "timed_out"
+                elif self._stop_requested:
+                    self._status = "stopped"
+                elif returncode == 0:
+                    self._status = "completed"
+                else:
+                    self._status = "failed"
+                self._done.set()
+
+    def wait(self, timeout: float | None = None) -> dict[str, Any]:
+        """Wait for completion, or return the current snapshot after a bound."""
+
+        self._done.wait(timeout=timeout)
+        return self.poll()
+
+    def poll(self, *, wait_seconds: float = DEFAULT_COMMAND_POLL_WAIT_SECONDS) -> dict[str, Any]:
+        if isinstance(wait_seconds, bool):
+            raise ToolInputError("wait_seconds must be a number")
+        try:
+            wait_value = float(wait_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ToolInputError("wait_seconds must be a number") from exc
+        if not math.isfinite(wait_value):
+            raise ToolInputError("wait_seconds must be a finite number")
+        if wait_value < 0 or wait_value > MAX_COMMAND_POLL_WAIT_SECONDS:
+            raise ToolInputError(
+                f"wait_seconds must be between 0 and {MAX_COMMAND_POLL_WAIT_SECONDS}"
+            )
+        if wait_value:
+            self._done.wait(timeout=wait_value)
+        with self._state_lock:
+            status = self._status
+            returncode = self._returncode
+            finished_at = self.finished_at
+            timed_out = self._timed_out
+            termination_failed = self._termination_failed
+            stop_requested = self._stop_requested
+        stdout, stdout_truncated, stdout_total = _sink_snapshot(self._stdout_sink, self.output_limit)
+        stderr, stderr_truncated, stderr_total = _sink_snapshot(self._stderr_sink, self.output_limit)
+        payload: dict[str, Any] = {
+            "execution_id": self.id,
+            "command_session_id": self.id,
+            # ``session_id`` mirrors the long-running command terminology used
+            # by the host runner; ``execution_id`` remains the durable engine
+            # claim binding and is the preferred approval/recovery key.
+            "session_id": self.id,
+            "status": status,
+            "purpose": self.purpose,
+            "command": self.display,
+            "shell": self.shell,
+            "cwd": str(self.cwd),
+            "timeout": self.timeout,
+            "output_limit": self.output_limit,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "stdout_total_bytes": stdout_total,
+            "stderr_total_bytes": stderr_total,
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "termination_failed": termination_failed,
+            "stop_requested": stop_requested,
+            "started_at": self.started_at,
+            "finished_at": finished_at,
+        }
+        if self.scope:
+            payload["scope"] = dict(self.scope)
+        if self.approval_id is not None:
+            payload["approval_id"] = self.approval_id
+        if self.tool_call_id is not None:
+            payload["tool_call_id"] = self.tool_call_id
+        if timed_out:
+            if termination_failed or status == "uncertain":
+                payload["timeout_note"] = (
+                    "The explicit command timeout elapsed, but stopping the direct child or its process tree could not be confirmed; the result is uncertain."
+                )
+            else:
+                payload["timeout_note"] = (
+                    "The explicit command timeout elapsed; the direct child and its entire process tree were asked to stop."
+                )
+        elif termination_failed:
+            payload["stop_note"] = (
+                "Stopping the direct child or its process tree could not be confirmed; the result is uncertain."
+            )
+        return payload
+
+    def stop(self) -> dict[str, Any]:
+        with self._state_lock:
+            done = self._done.is_set()
+            if done:
+                snapshot = self.poll()
+                # A watcher can publish ``uncertain`` after a failed timeout
+                # kill while the child remains alive.  Retry the owned
+                # process-tree termination during an orderly shutdown, but
+                # retain the uncertain claim even if the retry succeeds: the
+                # durable engine must still require human acknowledgement.
+                if snapshot.get("status") != "uncertain":
+                    return snapshot
+            else:
+                self._stop_requested = True
+            process = self._process
+        stopped = _terminate_process_tree(process)
+        if not stopped:
+            with self._state_lock:
+                self._termination_failed = True
+        if not done:
+            self._done.wait(timeout=max(1.0, COMMAND_STOP_GRACE_SECONDS + 1.0))
+        return self.poll()
+
+
+class CommandSessionManager:
+    """Process-local registry for approved command sessions.
+
+    The registry is deliberately not a durable replay queue.  The engine's
+    persisted ``execution`` claim remains authoritative after a restart; a
+    missing in-memory session is therefore an unknown result, never an
+    instruction to start the command again.
+    """
+
+    def __init__(self, *, max_sessions: int = MAX_COMMAND_SESSIONS) -> None:
+        self.max_sessions = max(1, int(max_sessions))
+        self._lock = threading.RLock()
+        self._sessions: dict[str, CommandSession] = {}
+
+    def start(
+        self,
+        command: list[str] | str,
+        *,
+        shell: bool,
+        cwd: Path,
+        timeout: float | None,
+        output_limit: int,
+        purpose: str = "",
+        approval_id: str | None = None,
+        tool_call_id: str | None = None,
+        owner_workspace: Path | str | None = None,
+        owner_session_id: str | None = None,
+        scope: Mapping[str, Any] | None = None,
+        git: bool = False,
+    ) -> CommandSession:
+        timeout = _safe_optional_timeout(timeout, maximum=MAX_COMMAND_TIMEOUT)
+        output_limit = _safe_limit(
+            output_limit,
+            default=MAX_COMMAND_OUTPUT_BYTES,
+            maximum=MAX_COMMAND_OUTPUT_BYTES,
+        )
+        purpose = _command_purpose(purpose or None)
+        with self._lock:
+            if len(self._sessions) >= self.max_sessions:
+                completed = [
+                    key
+                    for key, session in self._sessions.items()
+                    if session.poll().get("status") != "running"
+                ]
+                for key in completed:
+                    self._sessions.pop(key, None)
+                if len(self._sessions) >= self.max_sessions:
+                    raise ToolInputError("too many command sessions; stop or collect an existing session first")
+            session = CommandSession(
+                command,
+                shell=shell,
+                cwd=cwd,
+                timeout=timeout,
+                output_limit=output_limit,
+                purpose=purpose,
+                approval_id=approval_id,
+                tool_call_id=tool_call_id,
+                owner_workspace=owner_workspace,
+                owner_session_id=owner_session_id,
+                scope=scope,
+                git=git,
+            )
+            self._sessions[session.id] = session
+            return session
+
+    @staticmethod
+    def _scope_matches(session: CommandSession, scope: Mapping[str, Any] | None) -> bool:
+        if scope is None:
+            return True
+        expected = {
+            str(key): str(value)
+            for key, value in dict(scope).items()
+            if value is not None and str(value).strip()
+        }
+        actual = session.scope
+        for key, value in expected.items():
+            if key == "workspace":
+                try:
+                    if os.path.normcase(str(Path(value).resolve(strict=False))) != os.path.normcase(
+                        str(Path(actual.get(key, "")).resolve(strict=False))
+                    ):
+                        return False
+                except (OSError, RuntimeError):
+                    if os.path.normcase(value) != os.path.normcase(actual.get(key, "")):
+                        return False
+            elif actual.get(key) != value:
+                return False
+        return True
+
+    def get(
+        self,
+        execution_id: str,
+        *,
+        scope: Mapping[str, Any] | None = None,
+    ) -> CommandSession:
+        key = str(execution_id or "").strip()
+        if not key:
+            raise ToolInputError("execution_id is required")
+        with self._lock:
+            try:
+                session = self._sessions[key]
+            except KeyError as exc:
+                raise ToolInputError("command session was not found; it may belong to a previous process") from exc
+            if not self._scope_matches(session, scope):
+                raise ToolInputError("command session does not belong to this workspace or session")
+            return session
+
+    def poll(
+        self,
+        execution_id: str,
+        *,
+        wait_seconds: float = DEFAULT_COMMAND_POLL_WAIT_SECONDS,
+        scope: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.get(execution_id, scope=scope).poll(wait_seconds=wait_seconds)
+
+    def stop(
+        self,
+        execution_id: str,
+        *,
+        scope: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.get(execution_id, scope=scope).stop()
+
+    def list_sessions(
+        self,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        include_finished: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return bounded snapshots owned by the requested scope.
+
+        Listing is intentionally a filter rather than a lookup: callers that
+        provide a workspace/session/project scope only see sessions matching
+        every supplied field.  This lets a UI worker refresh its own command
+        panel without learning identifiers from another workspace or thread.
+        ``poll`` and ``stop`` still perform the strict single-session scope
+        check before returning or terminating anything.
+        """
+
+        if isinstance(include_finished, bool) is False:
+            raise ToolInputError("include_finished must be a boolean")
+        with self._lock:
+            sessions = list(self._sessions.values())
+        snapshots: list[dict[str, Any]] = []
+        for session in sessions:
+            if not self._scope_matches(session, scope):
+                continue
+            snapshot = session.poll()
+            if not include_finished and snapshot.get("status") not in {
+                "starting",
+                "running",
+                # An uncertain process may still be alive and always needs
+                # operator visibility even though it is not safely stoppable.
+                "uncertain",
+            }:
+                continue
+            snapshots.append(snapshot)
+        snapshots.sort(key=lambda item: str(item.get("started_at") or ""))
+        return snapshots
+
+    def forget(self, execution_id: str) -> None:
+        key = str(execution_id or "").strip()
+        with self._lock:
+            session = self._sessions.get(key)
+            if session is not None and session.poll().get("status") == "running":
+                raise ToolInputError("cannot forget a running command session")
+            self._sessions.pop(key, None)
+
+    def stop_all(self) -> None:
+        """Stop every owned live command during an orderly process shutdown."""
+
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            try:
+                if session.poll().get("status") in {"starting", "running", "uncertain"}:
+                    session.stop()
+            except Exception:
+                # Shutdown must not mask the interpreter's original exit;
+                # the durable engine claim remains available for uncertain
+                # recovery if the OS refused termination.
+                pass
+
+
+command_sessions = CommandSessionManager()
+atexit.register(command_sessions.stop_all)
+
+
+def start_command_session(
+    command: list[str] | str,
+    *,
+    shell: bool,
+    cwd: Path,
+    timeout: float | None,
+    output_limit: int = MAX_COMMAND_OUTPUT_BYTES,
+    purpose: str = "",
+    approval_id: str | None = None,
+    tool_call_id: str | None = None,
+    owner_workspace: Path | str | None = None,
+    owner_session_id: str | None = None,
+    scope: Mapping[str, Any] | None = None,
+    git: bool = False,
+) -> CommandSession:
+    """Start one approved command for callers that need UI polling."""
+
+    return command_sessions.start(
+        command,
+        shell=shell,
+        cwd=cwd,
+        timeout=timeout,
+        output_limit=output_limit,
+        purpose=purpose,
+        approval_id=approval_id,
+        tool_call_id=tool_call_id,
+        owner_workspace=owner_workspace,
+        owner_session_id=owner_session_id,
+        scope=scope,
+        git=git,
+    )
+
+
+def poll_command_session(
+    execution_id: str,
+    *,
+    wait_seconds: float = DEFAULT_COMMAND_POLL_WAIT_SECONDS,
+    scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Poll one command, optionally waiting up to 30 seconds for a change."""
+
+    return command_sessions.poll(execution_id, wait_seconds=wait_seconds, scope=scope)
+
+
+def stop_command_session(
+    execution_id: str,
+    *,
+    scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return command_sessions.stop(execution_id, scope=scope)
+
+
+def list_command_sessions(
+    *,
+    scope: Mapping[str, Any] | None = None,
+    include_finished: bool = True,
+) -> list[dict[str, Any]]:
+    """List bounded command snapshots visible to a workspace/session scope."""
+
+    return command_sessions.list_sessions(
+        scope=scope,
+        include_finished=include_finished,
+    )
+
+
 def _run_subprocess(
     command: list[str] | str,
     *,
     shell: bool,
     cwd: Path,
-    timeout: float,
+    timeout: float | None,
     output_limit: int,
     git: bool = False,
+    purpose: str = "",
+    approval_id: str | None = None,
+    tool_call_id: str | None = None,
 ) -> dict[str, Any]:
-    display = _command_display(command, shell)
-    stdout_sink: dict[str, Any] = {"data": b"", "truncated": False}
-    stderr_sink: dict[str, Any] = {"data": b"", "truncated": False}
-    process: Any = None
-    timed_out = False
+    session: CommandSession | None = None
     try:
-        process = subprocess.Popen(
+        session = CommandSession(
             command,
             shell=shell,
             cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_safe_environment(git=git),
+            timeout=timeout,
+            output_limit=output_limit,
+            purpose=purpose,
+            approval_id=approval_id,
+            tool_call_id=tool_call_id,
+            git=git,
         )
-        readers = [
-            threading.Thread(
-                target=_drain_pipe,
-                args=(process.stdout, stdout_sink, output_limit),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=_drain_pipe,
-                args=(process.stderr, stderr_sink, output_limit),
-                daemon=True,
-            ),
-        ]
-        for reader in readers:
-            reader.start()
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            # This kills the direct child.  Descendants that detach or retain
-            # the pipe may outlive it; this tool makes no process-tree sandbox
-            # promise, so the result says so explicitly.
-            try:
-                process.kill()
-            except OSError:
-                # It may have exited between wait timeout and kill.
-                pass
-            finally:
-                try:
-                    process.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
-            returncode = None
-        for reader in readers:
-            reader.join(timeout=2)
-        stdout, stdout_clipped = _clip_bytes(stdout_sink["data"], output_limit)
-        stderr, stderr_clipped = _clip_bytes(stderr_sink["data"], output_limit)
-        stdout_truncated = bool(stdout_sink.get("truncated")) or stdout_clipped
-        stderr_truncated = bool(stderr_sink.get("truncated")) or stderr_clipped
-        return {
-            "command": display,
-            "shell": shell,
-            "cwd": str(cwd),
-            "returncode": returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-            "timed_out": timed_out,
-            **(
-                {
-                    "timeout": timeout,
-                    "timeout_note": "Only the direct child was killed; descendants may outlive it.",
-                }
-                if timed_out
-                else {}
-            ),
-        }
+        result = session.wait()
+        # The synchronous git-clone adapter shares the same process-tree
+        # lifecycle as run_command.  Mark its snapshot so the engine can keep
+        # a timeout/termination failure as an uncertain claim instead of
+        # resuming the model while git may still be alive.
+        result["command_session"] = True
+        return result
     except OSError:
         # Preserve the normal subprocess error semantics for callers while
         # making sure a failed spawn cannot leave reader threads around.
-        if process is not None:
-            try:
-                process.kill()
-            except OSError:
-                pass
+        if session is not None:
+            _terminate_process_tree(session._process)
         raise
 
 
@@ -714,16 +1421,15 @@ def _run_prepare(args: dict, ctx: ToolContext) -> PendingApproval:
     command = _arg(args, "command", "cmd", "argv")
     if command is None:
         raise ToolInputError("command is required")
-    shell = bool(_arg(args, "shell", default=False))
+    shell = _safe_bool(_arg(args, "shell", default=False), default=False, field="shell")
     normalised = _normalise_argv(command, shell)
     cwd_arg = _arg(args, "cwd", default=".")
     cwd = resolve_path(ctx, cwd_arg, must_exist=True)
     if not cwd.is_dir():
         raise ToolInputError("cwd is not a directory")
-    timeout = _safe_timeout(
-        _arg(args, "timeout", default=None),
-        default=DEFAULT_COMMAND_TIMEOUT,
-        maximum=MAX_COMMAND_TIMEOUT,
+    purpose = _command_purpose(_arg(args, "purpose", "reason", "description"))
+    timeout = _safe_optional_timeout(
+        _arg(args, "timeout", default=None), maximum=MAX_COMMAND_TIMEOUT
     )
     output_limit = _safe_limit(
         _arg(args, "max_output_bytes", "output_limit"),
@@ -737,13 +1443,19 @@ def _run_prepare(args: dict, ctx: ToolContext) -> PendingApproval:
         "cwd": str(cwd),
         "timeout": timeout,
         "max_output_bytes": output_limit,
+        "purpose": purpose,
     }
     return PendingApproval(
         tool_name="run_command",
         arguments=dict(args),
-        summary=f"Run command (shell={shell}, cwd={_display_path(ctx, cwd)}): {display}",
+        summary=(
+            f"目的：{purpose}\n"
+            f"预期结果：在工作区 {_display_path(ctx, cwd)} 执行命令并返回受限输出。\n"
+            f"命令（shell={shell}）：{display}"
+        ),
         preview=_json(
             {
+                "purpose": purpose,
                 "shell": shell,
                 "cwd": _display_path(ctx, cwd),
                 "command": display,
@@ -758,7 +1470,7 @@ def _run_prepare(args: dict, ctx: ToolContext) -> PendingApproval:
 def _run_execute(pending: PendingApproval, ctx: ToolContext) -> ToolOutcome:
     args = _require_mapping(pending.arguments)
     command = _arg(args, "command", "cmd", "argv")
-    shell = bool(_arg(args, "shell", default=False))
+    shell = _safe_bool(_arg(args, "shell", default=False), default=False, field="shell")
     normalised = _normalise_argv(command, shell)
     cwd = resolve_path(ctx, _arg(args, "cwd", default="."), must_exist=True)
     if not cwd.is_dir():
@@ -772,12 +1484,13 @@ def _run_execute(pending: PendingApproval, ctx: ToolContext) -> ToolOutcome:
     prepared_shell = pending.prepared.get("shell")
     if prepared_shell is not None and shell != prepared_shell:
         raise ToolInputError("approved shell mode changed before execution")
-    timeout = _safe_timeout(
-        _arg(args, "timeout", default=None),
-        default=DEFAULT_COMMAND_TIMEOUT,
-        maximum=MAX_COMMAND_TIMEOUT,
+    purpose = _command_purpose(_arg(args, "purpose", "reason", "description"))
+    if pending.prepared.get("purpose") is not None and purpose != pending.prepared.get("purpose"):
+        raise ToolInputError("approved command purpose changed before execution")
+    timeout = _safe_optional_timeout(
+        _arg(args, "timeout", default=None), maximum=MAX_COMMAND_TIMEOUT
     )
-    if pending.prepared.get("timeout") is not None and timeout != pending.prepared.get("timeout"):
+    if "timeout" in pending.prepared and timeout != pending.prepared.get("timeout"):
         raise ToolInputError("approved command timeout changed before execution")
     output_limit = _safe_limit(
         _arg(args, "max_output_bytes", "output_limit"),
@@ -789,14 +1502,31 @@ def _run_execute(pending: PendingApproval, ctx: ToolContext) -> ToolOutcome:
         and output_limit != pending.prepared.get("max_output_bytes")
     ):
         raise ToolInputError("approved command output limit changed before execution")
-    result = _run_subprocess(
+    # Start once and return a bounded initial snapshot.  A short command often
+    # finishes during this hand-off, preserving the synchronous ToolDefinition
+    # behavior used by the CLI; a long command stays registered for UI/model
+    # polling and is never started again by a later poll.
+    command_session = start_command_session(
         normalised,
         shell=shell,
         cwd=cwd,
         timeout=timeout,
         output_limit=output_limit,
+        purpose=purpose,
+        approval_id=pending.id,
+        tool_call_id=pending.tool_call_id,
+        owner_workspace=_workspace_root(ctx),
+        owner_session_id=ctx.session.id,
+        scope=_command_scope(ctx),
     )
+    initial_wait = COMMAND_INITIAL_HANDOFF_WAIT_SECONDS
+    if timeout is not None:
+        initial_wait = min(timeout, COMMAND_INITIAL_HANDOFF_WAIT_SECONDS)
+    result = command_session.poll(wait_seconds=initial_wait)
     result["cwd"] = _display_path(ctx, cwd)
+    # Distinguish the registered, pollable run_command session from the
+    # synchronous CommandSession used internally by git_clone.
+    result["command_session"] = True
     return _outcome(result)
 
 
@@ -871,6 +1601,20 @@ def ensure_public_url(url: str) -> str:
         raise ToolInputError("URL port must be between 1 and 65535")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise ToolInputError("URL userinfo is not allowed")
+    query_keys = {
+        key.strip().casefold().replace("-", "_")
+        for key in parse_qs(parsed.query, keep_blank_values=True)
+    }
+    if query_keys & {
+        "token",
+        "access_token",
+        "api_key",
+        "apikey",
+        "key",
+        "auth",
+        "authorization",
+    }:
+        raise ToolInputError("URL query credentials are not allowed")
     host = parsed.hostname
     if not host:
         raise ToolInputError("URL must include a hostname")
@@ -947,7 +1691,44 @@ def _fetch_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
     # GitHub file links are routed through the API so a workspace-scoped token
     # can be used for private repositories without ever placing credentials in
     # a browser/raw-content redirect. Other URLs retain the public fetch path.
-    from .integrations import IntegrationError, parse_github_url, read_github
+    from .integrations import (
+        IntegrationError,
+        list_github_repositories,
+        parse_github_repository_list_url,
+        parse_github_url,
+        parse_github_user_url,
+        read_github,
+    )
+
+    github_user = parse_github_user_url(raw_url) if isinstance(raw_url, str) else None
+    if github_user is not None:
+        try:
+            payload = list_github_repositories(ctx.workspace, username=github_user)
+        except IntegrationError as exc:
+            raise ToolInputError(str(exc)) from exc
+        # Keep the original URL as provenance while returning only the bounded
+        # API projection.  No browser fetch or URL credential is involved.
+        return _outcome({"url": raw_url, **payload})
+
+    try:
+        github_list_target = (
+            parse_github_repository_list_url(raw_url) if isinstance(raw_url, str) else None
+        )
+    except IntegrationError as exc:
+        raise ToolInputError(str(exc)) from exc
+    if github_list_target is not None:
+        github_user, page, per_page = github_list_target
+        try:
+            payload = list_github_repositories(
+                ctx.workspace,
+                username=github_user,
+                page=page,
+                per_page=per_page,
+                timeout=timeout,
+            )
+        except IntegrationError as exc:
+            raise ToolInputError(str(exc)) from exc
+        return _outcome({"url": raw_url, **payload})
 
     github_target = parse_github_url(raw_url) if isinstance(raw_url, str) else None
     if github_target is not None:
@@ -1040,6 +1821,7 @@ def _read_github_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
     """Read one bounded GitHub path through the workspace integration."""
 
     args = _require_mapping(args)
+    _reject_unknown_arguments(args, {"repository", "repo", "path", "ref", "max_bytes"})
     from .integrations import IntegrationError, read_github
 
     repository = _arg(args, "repository", "repo")
@@ -1053,6 +1835,39 @@ def _read_github_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
             repository=repository,
             ref=ref,
             max_bytes=(2 * 1024 * 1024 if max_bytes is None else max_bytes),
+        )
+    except IntegrationError as exc:
+        raise ToolInputError(str(exc)) from exc
+    return _outcome(payload)
+
+
+def _github_identity_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
+    """Return the authenticated identity through GitHub's /user endpoint."""
+
+    args = _require_mapping(args)
+    _reject_unknown_arguments(args, set())
+    from .integrations import IntegrationError, github_identity
+
+    try:
+        payload = github_identity(ctx.workspace)
+    except IntegrationError as exc:
+        raise ToolInputError(str(exc)) from exc
+    return _outcome(payload)
+
+
+def _list_github_repositories_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
+    """List public or current-user private repositories without exposing a Token."""
+
+    args = _require_mapping(args)
+    _reject_unknown_arguments(args, {"username", "page", "per_page"})
+    from .integrations import IntegrationError, list_github_repositories
+
+    try:
+        payload = list_github_repositories(
+            ctx.workspace,
+            username=_arg(args, "username", default=None),
+            page=_arg(args, "page", default=1),
+            per_page=_arg(args, "per_page", default=30),
         )
     except IntegrationError as exc:
         raise ToolInputError(str(exc)) from exc
@@ -1131,13 +1946,18 @@ def _clone_prepare(args: dict, ctx: ToolContext) -> PendingApproval:
     return PendingApproval(
         tool_name="git_clone",
         arguments=dict(args),
-        summary=f"Clone {url} into {_display_path(ctx, destination)}",
+        summary=(
+            f"目的：把公开仓库 {url} 下载到工作区 {_display_path(ctx, destination)}。\n"
+            "预期结果：创建新的仓库目录并保留 Git 历史。"
+        ),
         preview=_json(
             {
+                "purpose": f"把公开仓库下载到工作区 {_display_path(ctx, destination)}",
                 "shell": False,
                 "cwd": _display_path(ctx, _workspace_root(ctx)),
                 "command": display,
                 "destination": _display_path(ctx, destination),
+                "timeout": prepared["timeout"],
             }
         ),
         prepared=prepared,
@@ -1164,7 +1984,7 @@ def _clone_execute(pending: PendingApproval, ctx: ToolContext) -> ToolOutcome:
         default=MAX_COMMAND_TIMEOUT,
         maximum=MAX_COMMAND_TIMEOUT,
     )
-    if pending.prepared.get("timeout") is not None and timeout != pending.prepared.get("timeout"):
+    if "timeout" in pending.prepared and timeout != pending.prepared.get("timeout"):
         raise ToolInputError("approved clone timeout changed before execution")
     argv = ["git", "-c", "credential.helper=", "clone", "--", url, str(destination)]
     result = _run_subprocess(
@@ -1174,6 +1994,9 @@ def _clone_execute(pending: PendingApproval, ctx: ToolContext) -> ToolOutcome:
         timeout=timeout,
         output_limit=MAX_COMMAND_OUTPUT_BYTES,
         git=True,
+        purpose=f"把公开仓库下载到工作区 {_display_path(ctx, destination)}",
+        approval_id=pending.id,
+        tool_call_id=pending.tool_call_id,
     )
     result["destination"] = _display_path(ctx, destination)
     result["url"] = url
@@ -1271,17 +2094,32 @@ def _specs(*, include_job_integrations: bool = True) -> list[ToolDefinition]:
         ToolDefinition(
             spec=ToolSpec(
                 name="run_command",
-                description="Prepare a command for approval; execution is not an OS sandbox and shows shell, cwd, and command.",
+                description=(
+                    "准备执行本地命令并等待用户审批。必须提供简短、用户可读的 purpose，审批界面会先说明操作目的；"
+                    "这不是操作系统沙箱。长时间命令可省略 timeout 后轮询 command session，也可以提供明确的正数 timeout。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
+                        "purpose": {
+                            "type": "string",
+                            "description": "Why this command is needed, shown to the user before approval.",
+                            "minLength": 1,
+                            "maxLength": MAX_COMMAND_PURPOSE_BYTES,
+                        },
                         "command": {"type": ["string", "array"]},
                         "shell": {"type": "boolean", "default": False},
                         "cwd": {"type": "string"},
-                        "timeout": {"type": "number"},
+                        "timeout": {
+                            "type": ["number", "null"],
+                            "description": "Optional explicit deadline in seconds; null/omitted means no deadline.",
+                        },
                         "max_output_bytes": {"type": "integer"},
                     },
-                    "required": ["command"],
+                    # Legacy persisted calls without purpose remain accepted
+                    # by the handler with a clear fallback, but new model
+                    # calls must supply the approval explanation explicitly.
+                    "required": ["command", "purpose"],
                 },
             ),
             handler=_run_prepare,
@@ -1293,7 +2131,12 @@ def _specs(*, include_job_integrations: bool = True) -> list[ToolDefinition]:
                 name="fetch_url",
                 description=(
                     "Fetch bounded public HTTP(S) content with validation on every redirect "
-                    "and no URL credentials; this is not an OS or network sandbox."
+                    "and no URL credentials; this is not an OS or network sandbox. "
+                    "For GitHub profiles use list_github_repositories and for GitHub identity "
+                    "use github_identity; GitHub links are routed through the controlled API "
+                    "compatibility path and never receive a Token in the URL. The fixed "
+                    "api.github.com user-repository list paths accept only page/per_page "
+                    "and never act as a general API proxy."
                 ),
                 parameters={
                     "type": "object",
@@ -1306,6 +2149,47 @@ def _specs(*, include_job_integrations: bool = True) -> list[ToolDefinition]:
                 },
             ),
             handler=_fetch_handler,
+            skill=None,
+        ),
+        ToolDefinition(
+            spec=ToolSpec(
+                name="github_identity",
+                description=(
+                    "Return the authenticated GitHub login for the current workspace Token. "
+                    "The Token is kept local and is never returned to the model."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            handler=_github_identity_handler,
+            skill=None,
+        ),
+        ToolDefinition(
+            spec=ToolSpec(
+                name="list_github_repositories",
+                description=(
+                    "List bounded GitHub repositories through api.github.com. "
+                    "With username equal to the authenticated Token login, include repositories "
+                    "the Token can read, including private ones; a different username uses only "
+                    "that user's public repositories. The Token is never a tool argument or result."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "username": {
+                            "type": "string",
+                            "description": "Optional GitHub login from a profile URL.",
+                        },
+                        "page": {"type": "integer", "minimum": 1, "maximum": 10000},
+                        "per_page": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            handler=_list_github_repositories_handler,
             skill=None,
         ),
         ToolDefinition(
@@ -1409,14 +2293,27 @@ def register_builtin_tools(
 
 
 __all__ = [
+    "CommandSession",
+    "CommandSessionManager",
+    "COMMAND_INITIAL_HANDOFF_WAIT_SECONDS",
+    "DEFAULT_COMMAND_TIMEOUT",
+    "DEFAULT_COMMAND_POLL_WAIT_SECONDS",
     "MAX_COMMAND_OUTPUT_BYTES",
+    "MAX_COMMAND_TIMEOUT",
+    "MAX_COMMAND_POLL_WAIT_SECONDS",
+    "MAX_COMMAND_PURPOSE_BYTES",
     "MAX_DOCUMENT_BYTES",
     "MAX_FETCH_BYTES",
     "MAX_READ_BYTES",
     "MAX_WRITE_BYTES",
     "PathSecurityError",
     "ToolInputError",
+    "command_sessions",
     "ensure_public_url",
+    "list_command_sessions",
+    "poll_command_session",
     "register_builtin_tools",
     "resolve_path",
+    "start_command_session",
+    "stop_command_session",
 ]

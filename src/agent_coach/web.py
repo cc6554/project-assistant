@@ -12,7 +12,9 @@ import argparse
 import base64
 import binascii
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -29,7 +31,12 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import job_radar
 from .bootstrap import build_engine
-from .contracts import AgentSession, ToolContext
+from .contracts import (
+    AgentSession,
+    ClarificationAction,
+    ClarificationAnswerRequest,
+    ToolContext,
+)
 from .engine import RunResult
 from .integrations import (
     clear_github_token,
@@ -47,7 +54,14 @@ from .settings import (
 )
 from .legacy.core.schema import Message
 from .store import SessionNotFound, StoreError, canonical_path, validate_session_id
-from .tools import PathSecurityError, ToolInputError, resolve_path
+from .tools import (
+    PathSecurityError,
+    ToolInputError,
+    list_command_sessions,
+    poll_command_session,
+    resolve_path,
+    stop_command_session,
+)
 
 
 APP_NAME = "agent-coach"
@@ -63,6 +77,7 @@ MAX_FILE_ENTRIES = 500
 MAX_STATIC_BYTES = 8 * 1024 * 1024
 MAX_JOBS = 512
 MAX_IMAGE_ATTACHMENTS = 10
+MAX_COMMAND_POLL_WAIT_SECONDS = 30.0
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 STATIC_NAMES = {"index.html", "app.js", "styles.css"}
 MODEL_TEST_TIMEOUT = 30.0
@@ -88,6 +103,14 @@ MODEL_TEST_MESSAGES = {
     "no_response": "模型未返回可用的连接探测响应。",
     "tool_call_failed": "模型已响应，但未完成连接探测。",
 }
+
+
+def _now() -> str:
+    """Return the UTC timestamp used by durable web session metadata."""
+
+    return datetime.now(timezone.utc).isoformat()
+
+
 UI_THEME_VALUES = frozenset({"dark", "light"})
 UI_SETTINGS_FILENAME = "ui-settings.json"
 MODEL_SOURCE_FILENAME = "model-source.json"
@@ -325,7 +348,91 @@ def _message_payload(message: Any) -> dict[str, Any]:
             else:
                 clean.append(block)
         payload["content"] = clean
+    # Keep the canonical metadata envelope and flat fields used by the current
+    # browser. Empty metadata means a legacy untagged turn; leave it
+    # unclassified so practice views fail closed instead of guessing.
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if isinstance(metadata, dict) and metadata:
+        scope = str(metadata.get("scope") or "").strip().casefold()
+        if scope == "practice":
+            project_key = str(metadata.get("project_key") or "").strip()
+            thread_id = str(metadata.get("practice_thread_id") or "").strip()
+            payload["scope"] = "practice"
+            payload["project_key"] = project_key
+            if thread_id:
+                payload["practice_thread_id"] = thread_id
+        elif scope == "main":
+            payload["scope"] = "main"
     return _safe_json(payload)
+
+
+def _scope_metadata(value: Any, *, default: str = "main") -> dict[str, Any]:
+    """Normalize browser scope hints into a bounded turn envelope."""
+
+    raw = value if isinstance(value, dict) else {}
+    scope = str(raw.get("scope") or default).strip().casefold()
+    if scope != "practice":
+        return {"scope": "main"}
+    project_key = str(raw.get("project_key") or "").strip()
+    thread_id = str(raw.get("practice_thread_id") or "").strip()
+    result: dict[str, Any] = {"scope": "practice", "project_key": project_key}
+    if thread_id:
+        result["practice_thread_id"] = thread_id
+    return result
+
+
+def _command_query(split: Any) -> dict[str, Any]:
+    """Decode the non-secret command scope query envelope."""
+
+    query = parse_qs(split.query, keep_blank_values=True)
+    result: dict[str, Any] = {}
+    for key in ("scope", "project_key", "practice_thread_id"):
+        values = query.get(key, [])
+        if len(values) > 1:
+            raise ValueError(f"{key} 只能出现一次")
+        if values:
+            result[key] = values[0]
+    include_values = query.get("include_finished", [])
+    if len(include_values) > 1:
+        raise ValueError("include_finished 只能出现一次")
+    if include_values:
+        value = str(include_values[0]).strip().casefold()
+        if value not in {"0", "1", "true", "false", "yes", "no"}:
+            raise ValueError("include_finished 必须是布尔值")
+        result["include_finished"] = value in {"1", "true", "yes"}
+    wait_values = query.get("wait_seconds", [])
+    if len(wait_values) > 1:
+        raise ValueError("wait_seconds 只能出现一次")
+    if wait_values:
+        result["wait_seconds"] = _command_wait_seconds(wait_values[0])
+    return result
+
+
+def _command_wait_seconds(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("wait_seconds 必须是数字")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("wait_seconds 必须是数字") from exc
+    if not math.isfinite(parsed) or parsed < 0 or parsed > MAX_COMMAND_POLL_WAIT_SECONDS:
+        raise ValueError(f"wait_seconds 必须在 0 到 {MAX_COMMAND_POLL_WAIT_SECONDS:g} 之间")
+    return parsed
+
+
+def _scope_public(value: Any) -> dict[str, Any]:
+    """Return the canonical scope envelope for pending/execution payloads."""
+
+    metadata = _scope_metadata(value)
+    payload: dict[str, Any] = {
+        "scope": metadata["scope"],
+        "metadata": dict(metadata),
+    }
+    if metadata["scope"] == "practice":
+        payload["project_key"] = metadata.get("project_key", "")
+        if metadata.get("practice_thread_id"):
+            payload["practice_thread_id"] = metadata["practice_thread_id"]
+    return payload
 
 
 def _attachments(value: Any) -> list[Any] | None:
@@ -356,23 +463,51 @@ def _attachments(value: Any) -> list[Any] | None:
     return result
 
 
-def _pending_payload(session: AgentSession) -> dict[str, str] | None:
+def _pending_payload(session: AgentSession) -> dict[str, Any] | None:
     pending = session.pending
     if pending is None:
         return None
-    return {
+    payload: dict[str, Any] = {
         "id": str(pending.id),
         "tool_name": str(pending.tool_name),
         "summary": str(pending.summary)[:1000],
         "preview": str(pending.preview),
     }
+    payload.update(_scope_public(pending.metadata))
+    return payload
+
+
+def _assistant_text_since(session: AgentSession, start: int) -> str:
+    """Return only assistant text appended after a turn's message baseline."""
+
+    messages = session.messages[max(0, int(start)) :]
+    for message in reversed(messages):
+        if message.role == "assistant" and isinstance(message.content, str):
+            text = message.content.strip()
+            if text:
+                return text
+    return ""
+
+
+def _message_baseline(session: AgentSession) -> tuple[int, bool]:
+    """Capture a turn baseline and whether the engine will prepend system."""
+
+    return len(session.messages), not (
+        session.messages and session.messages[0].role == "system"
+    )
 
 
 def _result_payload(result: Any) -> dict[str, Any]:
     if isinstance(result, RunResult):
-        return {
+        payload = {
             "status": result.status,
-            "message": str(result.message or result.assistant_text or "")[:4000],
+            # ``RunResult.assistant_text`` scans the complete persisted
+            # transcript for legacy CLI callers.  HTTP jobs must never show a
+            # previous turn as the result of this job, so engine boundaries
+            # provide their own message and action code supplies a baseline
+            # when a provider returned an empty assistant text.
+            "message": str(result.message or "")[:4000],
+            "data": _safe_json(result.data) if isinstance(result.data, dict) else result.data,
             "session_id": result.session_id,
             "steps": int(result.steps),
             "exit_code": int(result.exit_code),
@@ -382,11 +517,17 @@ def _result_payload(result: Any) -> dict[str, Any]:
                     "tool_name": str(result.pending.tool_name),
                     "summary": str(result.pending.summary)[:1000],
                     "preview": str(result.pending.preview),
+                    **_scope_public(result.pending.metadata),
                 }
                 if result.pending
                 else None
             ),
         }
+        if result.display_text:
+            payload["display_text"] = str(result.display_text)[:MAX_TEXT_BYTES]
+        if result.metadata is not None:
+            payload["metadata"] = _safe_json(result.metadata)
+        return payload
     if isinstance(result, AgentSession):
         return {"status": "completed", "message": "会话已更新", "session_id": result.id}
     if isinstance(result, dict):
@@ -1211,11 +1352,498 @@ class WebService:
         with self._lock:
             return session_id in self._busy
 
+    def _command_scope(
+        self,
+        session_id: str,
+        payload: Any = None,
+        *,
+        execution_id: str | None = None,
+    ) -> dict[str, str]:
+        """Build the exact owner scope used by the command-session registry.
+
+        Command sessions are process-local, but their owner binding still has
+        to be checked at the HTTP boundary.  In particular, a practice child
+        must not be able to poll or stop a command belonging to another
+        project/thread in the same durable Agent session.
+        """
+
+        session = self._session(session_id)
+        body = payload if isinstance(payload, dict) else {}
+        requested_scope = str(body.get("scope") or "main").strip().casefold()
+        if requested_scope not in {"main", "practice"}:
+            raise ValueError("scope 必须是 main 或 practice")
+        scope: dict[str, str] = {
+            "workspace": str(self.workspace),
+            "session_id": str(session.id),
+            "scope": requested_scope,
+        }
+        if requested_scope != "practice":
+            result = scope
+        else:
+            project_key = str(body.get("project_key") or "").strip()
+            thread_id = str(body.get("practice_thread_id") or "").strip()
+            if not project_key or len(project_key.encode("utf-8")) > 1024:
+                raise ValueError("practice project_key 必须是非空字符串")
+            if not thread_id:
+                raise ValueError("practice_thread_id 必须是非空字符串")
+            validate_session_id(thread_id)
+            selected_key, _project = self._selected_practice_project(session, project_key)
+            row = (session.practice_threads or {}).get(thread_id)
+            if not isinstance(row, dict) or str(row.get("project_key") or "") != selected_key:
+                raise ValueError("practice_thread_id 不属于当前选定项目")
+            scope.update({"project_key": selected_key, "practice_thread_id": thread_id})
+            result = scope
+
+        if execution_id:
+            command_id = str(execution_id).strip()
+            execution = session.execution if isinstance(session.execution, dict) else {}
+            current_id = str(execution.get("command_session_id") or "").strip()
+            if current_id == command_id:
+                expected = _scope_metadata(execution)
+            else:
+                last = session.last_command if isinstance(session.last_command, dict) else {}
+                last_id = str(last.get("command_session_id") or last.get("execution_id") or "").strip()
+                if last_id != command_id:
+                    # The process-local registry remains authoritative for a
+                    # live entry, but a missing entry must never permit an
+                    # engine action against a different durable command.
+                    expected = None
+                else:
+                    # ``last_command`` predates explicit scope fields in a few
+                    # persisted sessions.  The last turn metadata is the only
+                    # safe fallback; it defaults to main and therefore fails
+                    # closed for a practice request with no provenance.
+                    expected = _scope_metadata(session.last_turn_metadata)
+            requested = _scope_metadata(result)
+            if expected is not None and requested != expected:
+                raise ValueError("命令 scope 与当前执行 claim 不匹配")
+        return result
+
+    def command_sessions(
+        self,
+        session_id: str,
+        payload: Any = None,
+        *,
+        include_finished: bool = True,
+    ) -> dict[str, Any]:
+        """List command snapshots visible to one exact chat scope."""
+
+        scope = self._command_scope(session_id, payload)
+        snapshots = list_command_sessions(scope=scope, include_finished=include_finished)
+        session = self._session(session_id)
+        known_ids = {
+            str(item.get("execution_id") or item.get("command_session_id") or item.get("session_id") or "")
+            for item in snapshots
+            if isinstance(item, dict)
+        }
+        # The engine persists the latest bounded snapshot in its execution
+        # claim/last-command record. Include it when the process-local command
+        # registry has already forgotten the entry, while preserving the same
+        # exact scope boundary used by the registry.
+        durable_candidates: list[Any] = []
+        execution = session.execution if isinstance(session.execution, dict) else {}
+        if isinstance(execution.get("command_snapshot"), dict):
+            durable_candidates.append(execution["command_snapshot"])
+        last_command = session.last_command if isinstance(session.last_command, dict) else {}
+        if isinstance(last_command.get("result"), dict):
+            durable_candidates.append(last_command["result"])
+        for item in durable_candidates:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("execution_id") or item.get("command_session_id") or item.get("session_id") or "")
+            item_scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+            if not item_id or item_id in known_ids:
+                continue
+            if any(str(item_scope.get(key) or "") != str(value) for key, value in scope.items() if key != "workspace"):
+                continue
+            snapshots.append(_safe_json(item))
+            known_ids.add(item_id)
+        snapshots.sort(key=lambda item: str(item.get("started_at") or ""))
+        return {
+            "session_id": str(session_id),
+            "scope": {key: value for key, value in scope.items() if key != "workspace"},
+            "commands": snapshots,
+        }
+
+    def command_snapshot(
+        self,
+        session_id: str,
+        execution_id: str,
+        payload: Any = None,
+        *,
+        wait_seconds: float = 0.0,
+    ) -> dict[str, Any]:
+        """Poll a command without starting it again or broadening its scope."""
+
+        command_id = _bytes_text(execution_id, limit=256, field="execution_id")
+        wait_seconds = _command_wait_seconds(wait_seconds)
+        scope = self._command_scope(session_id, payload, execution_id=command_id)
+        return poll_command_session(command_id, wait_seconds=wait_seconds, scope=scope)
+
+    def poll_command(
+        self,
+        session_id: str,
+        execution_id: str,
+        payload: Any = None,
+        *,
+        wait_seconds: float = 0.0,
+    ) -> dict[str, Any]:
+        """Queue one idempotent engine continuation for a terminal command."""
+
+        command_id = _bytes_text(execution_id, limit=256, field="execution_id")
+        wait_seconds = _command_wait_seconds(wait_seconds)
+        scope = self._command_scope(session_id, payload, execution_id=command_id)
+        try:
+            # A scoped registry lookup prevents a main chat from asking the
+            # engine to act on a practice command (and vice versa).  A missing
+            # process-local entry is allowed through so the engine can record
+            # an uncertain process-boundary result instead of replaying it.
+            poll_command_session(command_id, wait_seconds=0, scope=scope)
+        except ToolInputError as exc:
+            if "previous process" not in str(exc):
+                raise
+        with self._lock:
+            existing_job = self._busy.get(session_id)
+        if existing_job:
+            return {"job_id": existing_job, "session_id": str(session_id), "execution_id": command_id}
+        job_id = self.submit(
+            session_id,
+            lambda: self.engine.poll_command(
+                session_id,
+                command_id,
+                wait_seconds=wait_seconds,
+            ),
+        )
+        return {"job_id": job_id, "session_id": str(session_id), "execution_id": command_id}
+
+    def stop_command(
+        self,
+        session_id: str,
+        execution_id: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        """Queue one scoped command stop and its durable engine continuation."""
+
+        command_id = _bytes_text(execution_id, limit=256, field="execution_id")
+        scope = self._command_scope(session_id, payload, execution_id=command_id)
+        registry_present = True
+        try:
+            poll_command_session(command_id, wait_seconds=0, scope=scope)
+        except ToolInputError as exc:
+            if "previous process" not in str(exc):
+                raise
+            registry_present = False
+        if registry_present:
+            # Signal the child outside WebService._busy.  The original worker
+            # is polling this same command and will wake, commit one terminal
+            # result, and resume the saved model turn exactly once.  Stopping
+            # a process waits for its reaper, so do that in a short-lived
+            # daemon thread while preserving the existing job id for the HTTP
+            # response.  Otherwise a fast child exit can let the worker clear
+            # ``_busy`` before this handler takes the lock and cause a second
+            # stop job (and, in turn, a duplicate engine continuation).
+            with self._lock:
+                existing_job = self._busy.get(session_id)
+            if existing_job:
+                def signal_stop() -> None:
+                    try:
+                        stop_command_session(command_id, scope=scope)
+                    except Exception:
+                        # The polling worker owns the durable completion/error
+                        # path.  A concurrent terminal transition is safe and
+                        # idempotent; the HTTP caller already received the
+                        # existing job id.
+                        return
+
+                threading.Thread(
+                    target=signal_stop,
+                    name=f"agent-coach-stop-{command_id[:8]}",
+                    daemon=True,
+                ).start()
+                return {"job_id": existing_job, "session_id": str(session_id), "execution_id": command_id}
+            else:
+                try:
+                    stop_command_session(command_id, scope=scope)
+                except ToolInputError as exc:
+                    if "previous process" not in str(exc):
+                        raise
+                    registry_present = False
+        if not registry_present:
+            # A previous-process snapshot has no live registry entry to stop.
+            # If the session worker is still busy, let that worker finish the
+            # durable uncertain/terminal transition instead of submitting a
+            # second stop job.
+            with self._lock:
+                existing_job = self._busy.get(session_id)
+            if existing_job:
+                return {"job_id": existing_job, "session_id": str(session_id), "execution_id": command_id}
+        with self._lock:
+            existing_job = self._busy.get(session_id)
+        if existing_job:
+            return {"job_id": existing_job, "session_id": str(session_id), "execution_id": command_id}
+        job_id = self.submit(
+            session_id,
+            lambda: self.engine.stop_command(session_id, command_id),
+        )
+        return {"job_id": job_id, "session_id": str(session_id), "execution_id": command_id}
+
+    @staticmethod
+    def _project_key(project: Any) -> str:
+        """Resolve the same stable identity used by job-radar history."""
+
+        try:
+            value = job_radar._project_key(project)  # type: ignore[attr-defined]
+        except Exception:
+            value = None
+        return str(value or "").strip()
+
+    def _selected_practice_project(
+        self,
+        session: AgentSession,
+        requested_key: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        state = job_radar.workflow_state(session)
+        selected = state.get("selected_project")
+        if not isinstance(selected, dict):
+            raise ValueError("请先选择一个练习项目")
+        key = self._project_key(selected)
+        if not key:
+            raise ValueError("当前练习项目缺少稳定 project_key")
+        requested = str(requested_key or "").strip()
+        if requested and requested != key:
+            # A stale browser or another project window must never attribute a
+            # new turn to a project that is no longer selected in this main
+            # session.
+            raise ValueError("project_key 与当前选定项目不一致，请刷新项目状态")
+        return key, deepcopy(selected)
+
+    @staticmethod
+    def _thread_public(row: dict[str, Any]) -> dict[str, Any]:
+        return _safe_json(
+            {
+                "id": str(row.get("id") or ""),
+                "scope": "practice",
+                "project_key": str(row.get("project_key") or ""),
+                "project": deepcopy(row.get("project") or {}),
+                "created_at": str(row.get("created_at") or ""),
+                "updated_at": str(row.get("updated_at") or ""),
+            }
+        )
+
+    def _ensure_practice_thread(
+        self,
+        session: AgentSession,
+        project_key: str,
+        project: dict[str, Any],
+        requested_thread_id: str | None = None,
+        *,
+        allow_create_requested: bool = True,
+    ) -> tuple[dict[str, Any], bool]:
+        """Find or create a durable practice window under a held session lock."""
+
+        threads = session.practice_threads if isinstance(session.practice_threads, dict) else {}
+        session.practice_threads = threads
+        requested = str(requested_thread_id or "").strip()
+        if requested:
+            validate_session_id(requested)
+            current = threads.get(requested)
+            if current is not None:
+                if str(current.get("project_key") or "") != project_key:
+                    raise ValueError("practice_thread_id 不属于当前选定项目")
+                return current, False
+            if not allow_create_requested:
+                raise ValueError("practice_thread_id 不存在，请先打开练习窗口")
+        candidates = [
+            item
+            for item in threads.values()
+            if isinstance(item, dict) and str(item.get("project_key") or "") == project_key
+        ]
+        if candidates and not requested:
+            candidates.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+            return candidates[0], False
+        now = _now()
+        thread_id = requested or uuid.uuid4().hex
+        row = {
+            "id": thread_id,
+            "scope": "practice",
+            "project_key": project_key,
+            "project": deepcopy(project),
+            "created_at": now,
+            "updated_at": now,
+        }
+        threads[thread_id] = row
+        return row, True
+
+    @staticmethod
+    def _message_metadata(message: Any) -> dict[str, Any]:
+        metadata = getattr(message, "metadata", None)
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _practice_turn_metadata(
+        self,
+        session_id: str,
+        payload: Any,
+        *,
+        thread_id: str | None = None,
+        require_practice: bool = False,
+    ) -> dict[str, Any]:
+        body = payload if isinstance(payload, dict) else {}
+        hinted = _scope_metadata(body)
+        is_practice = require_practice or hinted.get("scope") == "practice"
+        if not is_practice:
+            return {"scope": "main"}
+        requested_key = hinted.get("project_key") or body.get("project_key")
+        requested_thread = thread_id or hinted.get("practice_thread_id")
+        with self.engine.store.lock(session_id):
+            session = self.engine.store.get(session_id)
+            project_key, project = self._selected_practice_project(session, requested_key)
+            thread, created = self._ensure_practice_thread(
+                session,
+                project_key,
+                project,
+                requested_thread,
+                allow_create_requested=requested_thread is None,
+            )
+            if created or thread.get("project") != project:
+                thread["project"] = deepcopy(project)
+                thread["updated_at"] = _now()
+                self.engine.store.save(session)
+            return {
+                "scope": "practice",
+                "project_key": project_key,
+                "practice_thread_id": str(thread["id"]),
+            }
+
+    def practice_threads(self, session_id: str) -> dict[str, Any]:
+        session = self._session(session_id)
+        state = job_radar.workflow_state(session)
+        selected = state.get("selected_project")
+        selected_key = self._project_key(selected)
+        rows = [
+            self._thread_public(item)
+            for item in (session.practice_threads or {}).values()
+            if isinstance(item, dict)
+        ]
+        rows.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
+        return {
+            "session_id": session.id,
+            "project_key": selected_key or None,
+            "project": _safe_json(deepcopy(selected)) if isinstance(selected, dict) else None,
+            "practice_threads": rows,
+        }
+
+    def open_practice(self, session_id: str, payload: Any = None) -> dict[str, Any]:
+        body = payload if isinstance(payload, dict) else {}
+        requested_key = body.get("project_key")
+        requested_thread = body.get("practice_thread_id")
+        with self.engine.store.lock(session_id):
+            session = self.engine.store.get(session_id)
+            project_key, project = self._selected_practice_project(session, requested_key)
+            thread, created = self._ensure_practice_thread(
+                session,
+                project_key,
+                project,
+                requested_thread,
+            )
+            if created or thread.get("project") != project:
+                thread["project"] = deepcopy(project)
+                thread["updated_at"] = _now()
+                self.engine.store.save(session)
+            return self.practice_snapshot(session.id, str(thread["id"]))
+
+    def practice_snapshot(self, session_id: str, thread_id: str) -> dict[str, Any]:
+        validate_session_id(thread_id)
+        session = self._session(session_id)
+        row = (session.practice_threads or {}).get(thread_id)
+        if not isinstance(row, dict):
+            raise KeyError("practice thread 不存在")
+        project_key, project = self._selected_practice_project(session, row.get("project_key"))
+        messages: list[dict[str, Any]] = []
+        for message in session.messages:
+            metadata = self._message_metadata(message)
+            if (
+                str(metadata.get("scope") or "") == "practice"
+                and str(metadata.get("project_key") or "") == project_key
+                and str(metadata.get("practice_thread_id") or "") == thread_id
+            ):
+                messages.append(_message_payload(message))
+        events = []
+        for event in session.events:
+            if not isinstance(event, dict):
+                continue
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else event
+            if (
+                str(metadata.get("scope") or "") == "practice"
+                and str(metadata.get("project_key") or "") == project_key
+                and str(metadata.get("practice_thread_id") or "") == thread_id
+            ):
+                events.append(_safe_json(event))
+        pending = _pending_payload(session)
+        if not pending or pending.get("scope") != "practice" or pending.get("project_key") != project_key or pending.get("practice_thread_id") != thread_id:
+            pending = None
+        execution = _safe_json(session.execution or {})
+        if not execution or execution.get("scope") != "practice" or execution.get("project_key") != project_key or execution.get("practice_thread_id") != thread_id:
+            execution = {}
+        with self._lock:
+            busy = session.id in self._busy
+            last_result = _safe_json(self._last_results.get(session.id))
+        return {
+            "session_id": session.id,
+            "practice_thread_id": thread_id,
+            "project_key": project_key,
+            "project": _safe_json(project),
+            "messages": messages,
+            "events": events,
+            "pending": pending,
+            "execution": execution,
+            "queued_calls": len(session.queued_calls) if pending or execution else 0,
+            "busy": busy,
+            "practice_busy": busy and _scope_metadata(session.active_turn_metadata).get("scope") == "practice",
+            "last_result": last_result,
+            "practice_filter": {"scope": "practice", "project_key": project_key, "practice_thread_id": thread_id},
+        }
+
+    def prepare_practice_turn(
+        self,
+        session_id: str,
+        payload: Any,
+        *,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._practice_turn_metadata(
+            session_id,
+            payload,
+            thread_id=thread_id,
+            require_practice=True,
+        )
+
+    def validate_practice_turn(self, session: AgentSession, metadata: dict[str, Any]) -> None:
+        """Revalidate project/thread attribution inside the engine lock."""
+
+        if _scope_metadata(metadata).get("scope") != "practice":
+            raise ValueError("练习消息必须带 practice scope")
+        key, _project = self._selected_practice_project(session, metadata.get("project_key"))
+        thread_id = str(metadata.get("practice_thread_id") or "").strip()
+        row = (session.practice_threads or {}).get(thread_id)
+        if not thread_id or not isinstance(row, dict) or str(row.get("project_key") or "") != key:
+            raise ValueError("practice_thread_id 不属于当前选定项目")
+
     def session_snapshot(self, session_id: str) -> dict[str, Any]:
         session = self._session(session_id)
         with self._lock:
             busy = session.id in self._busy
             last_result = _safe_json(self._last_results.get(session.id))
+        active_scope = _scope_metadata(session.active_turn_metadata)
+        last_scope = _scope_metadata(session.last_turn_metadata)
+        thread_rows = [
+            self._thread_public(item)
+            for item in (session.practice_threads or {}).values()
+            if isinstance(item, dict)
+        ]
+        thread_rows.sort(
+            key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+            reverse=True,
+        )
         # Keep the browser's existing raw ``skill_state`` contract while
         # exposing the read-only lazy project-history migration for sessions
         # created before project portfolios existed.  ``workflow_state`` does
@@ -1240,6 +1868,20 @@ class WebService:
             "pending": _pending_payload(session),
             "execution": _safe_json(session.execution or {}),
             "events": _safe_json(session.events),
+            "practice_threads": thread_rows,
+            # A durable view/turn filter lets a reloaded browser recover the
+            # last explicit practice project without classifying old untagged
+            # messages.  Main requests replace the scope with ``main``.
+            "practice_filter": (
+                active_scope
+                if active_scope.get("scope") == "practice"
+                else last_scope
+                if last_scope.get("scope") == "practice"
+                else {"scope": "main"}
+            ),
+            "practice_busy": bool(
+                busy and active_scope.get("scope") == "practice"
+            ),
             "busy": busy,
             "last_result": last_result,
         }
@@ -1289,6 +1931,7 @@ class WebService:
                     "message_count": len(session.messages),
                     "active_skills": list(session.active_skills),
                     "pending": session.pending is not None,
+                    "queued_calls": len(session.queued_calls),
                     "busy": busy,
                 }
             )
@@ -1298,6 +1941,61 @@ class WebService:
         # Product job-radar tools are deterministic and must never receive the
         # provider router, even when called by an HTTP UI mutation.
         return ToolContext(workspace=self.workspace, session=session, router=None)
+
+    @staticmethod
+    def _workflow_action(payload: Any) -> dict[str, Any] | None:
+        """Validate the small server action envelope sent by workflow UI buttons.
+
+        The model still receives the ordinary user message and decides which
+        tools to call.  The only browser action persisted here is the bounded
+        ``project_filter`` object, which is normalized before the request is
+        queued so malformed input cannot claim a worker or partially update a
+        session.
+        """
+
+        if not isinstance(payload, dict) or "workflow_action" not in payload:
+            return None
+        raw = payload.get("workflow_action")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("workflow_action 必须是对象")
+        if "project_filter" not in raw:
+            return None
+        return {
+            "project_filter": job_radar.normalize_project_filter(raw.get("project_filter")),
+        }
+
+    def _persist_workflow_action(
+        self,
+        session: AgentSession,
+        workflow_action: dict[str, Any] | None,
+    ) -> None:
+        """Apply a validated UI action while the engine owns the session lock."""
+
+        if not workflow_action or "project_filter" not in workflow_action:
+            return
+        job_radar.set_project_filter(
+            {"project_filter": workflow_action["project_filter"]},
+            self._workflow_context(session),
+        )
+
+    def _message_action_guard(
+        self,
+        metadata: dict[str, Any],
+        workflow_action: dict[str, Any] | None,
+    ) -> Callable[[AgentSession], None] | None:
+        """Compose scope validation and durable UI-action persistence."""
+
+        if metadata.get("scope") != "practice" and not workflow_action:
+            return None
+
+        def guard(current: AgentSession) -> None:
+            if metadata.get("scope") == "practice":
+                self.validate_practice_turn(current, metadata)
+            self._persist_workflow_action(current, workflow_action)
+
+        return guard
 
     def _mutate_session(self, session_id: str, operation: Callable[[AgentSession], Any]) -> Any:
         """Run one synchronous UI mutation under the same busy/Store lock."""
@@ -1451,6 +2149,182 @@ class WebService:
 
         return self._mutate_session(session_id, operation)
 
+    @staticmethod
+    def _profile_questions(session: AgentSession) -> list[str]:
+        """Read the current profile questions without trusting UI state."""
+
+        state = job_radar.workflow_state(session)
+        profile = state.get("profile")
+        if not isinstance(profile, dict):
+            raise ValueError("当前会话尚未建立个人技能档案")
+        raw = profile.get("open_questions")
+        if not isinstance(raw, list):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    @classmethod
+    def _assert_clarification_question(cls, session: AgentSession, question: str) -> None:
+        """Ensure a stale or cross-session question cannot drive an action."""
+
+        if question not in cls._profile_questions(session):
+            raise ValueError("待澄清问题已不属于当前会话的个人档案")
+
+    def answer_clarification(self, session_id: str, payload: Any) -> dict[str, Any]:
+        """Queue a modal clarification answer in the existing main session.
+
+        The endpoint accepts only the question text and the user's answer.  It
+        builds the trusted action envelope on the server, validates the current
+        profile under the session lock, and then uses the normal model job
+        runner.  ``set_profile`` remains the only path that can remove the
+        question after the model has confirmed the answer.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("请求体必须是对象")
+        allowed = {"question", "answer", "question_id", "request_id"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError("澄清请求只允许 question 和 answer")
+        question = _bytes_text(payload.get("question"), limit=MAX_NOTE_BYTES, field="question")
+        answer = _bytes_text(payload.get("answer"), limit=MAX_TEXT_BYTES, field="answer")
+        # Validate the public envelope before any job is claimed.  The optional
+        # IDs are correlation hints only; they never select a different
+        # question or session and are intentionally excluded from the action
+        # instruction.
+        ClarificationAnswerRequest(question=question, answer=answer)
+        self._session(session_id)
+        with self._lock:
+            if session_id in self._busy:
+                raise RuntimeError("会话正在执行另一个操作")
+        with self.engine.store.lock(session_id):
+            session = self.engine.store.get(session_id)
+            self._assert_clarification_question(session, question)
+            if session.pending is not None:
+                raise RuntimeError("会话有待处理的审批，请先完成或拒绝审批")
+            if session.queued_calls:
+                raise RuntimeError("会话有待恢复的工具队列，请先继续执行")
+            execution_status = (session.execution or {}).get("status")
+            if execution_status not in {None, "cancelled", "resolved_uncertain"}:
+                raise RuntimeError("会话有未完成的 Agent 执行，请先完成、取消或确认结果")
+
+        action = ClarificationAction.from_answer(question, answer)
+        request_id = payload.get("request_id", payload.get("question_id"))
+        if request_id is not None:
+            request_id = _bytes_text(request_id, limit=128, field="request_id")
+            action.metadata["request_id"] = request_id
+
+        def operation() -> dict[str, Any]:
+            baseline = self.engine.store.get(session_id)
+            message_start, system_inserted = _message_baseline(baseline)
+            result = self.engine.run_action(
+                action,
+                session_id,
+                action_guard=lambda current: self._assert_clarification_question(current, question),
+            )
+            current = self.engine.store.get(session_id)
+            state = job_radar.workflow_state(current)
+            remaining = self._profile_questions(current)
+            confirmed = result.status == "completed" and question not in remaining
+            metadata = {
+                **action.metadata,
+                "confirmed": confirmed,
+                "question_remaining": question in remaining,
+            }
+            message = str(
+                result.message
+                or _assistant_text_since(current, message_start + int(system_inserted))
+                or ""
+            ).strip()
+            if not confirmed and result.status == "completed":
+                message = message or "模型尚未确认已完成这项澄清，问题仍保留在档案中。"
+            return {
+                "status": result.status,
+                "message": message[:4000],
+                "session_id": session_id,
+                "display_text": action.display_text,
+                "metadata": metadata,
+                "action": {
+                    **action.public(),
+                    "metadata": metadata,
+                },
+                "profile": state.get("profile"),
+                "clarification": state.get("clarification"),
+                "pending": (
+                    {
+                        "id": str(result.pending.id),
+                        "tool_name": str(result.pending.tool_name),
+                        "summary": str(result.pending.summary)[:1000],
+                        "preview": str(result.pending.preview),
+                    }
+                    if result.pending
+                    else None
+                ),
+                "steps": int(result.steps),
+                "exit_code": int(result.exit_code),
+            }
+
+        job_id = self.submit(session_id, operation)
+        return {"job_id": job_id, "session_id": session_id, "action": action.public()}
+
+    def _resume_clarification_action(
+        self,
+        session_id: str,
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Resume a paused clarification and preserve its result envelope.
+
+        Approve/continue are deliberately generic engine operations.  When a
+        modal answer paused at one of those boundaries, the browser still
+        needs the action's confirmation metadata on the recovery job; without
+        it the modal cannot distinguish a confirmed profile update from an
+        unrelated completed assistant turn.  The durable marker is captured
+        before the engine resumes and is only used to decorate this result.
+        """
+
+        baseline = self.engine.store.get(session_id)
+        marker = baseline.background_action
+        message_start, system_inserted = _message_baseline(baseline)
+        result = operation()
+        if not isinstance(result, RunResult):
+            return result
+        if not isinstance(marker, dict) or marker.get("kind") != "clarification_answer":
+            return result
+        marker_metadata = marker.get("metadata")
+        metadata = dict(marker_metadata) if isinstance(marker_metadata, dict) else {}
+        question = str(metadata.get("question") or metadata.get("source_question") or "").strip()
+        profile_available = True
+        try:
+            remaining = self._profile_questions(self.engine.store.get(session_id))
+        except ValueError:
+            profile_available = False
+            remaining = []
+        confirmed = bool(
+            profile_available
+            and result.status == "completed"
+            and question
+            and question not in remaining
+        )
+        metadata.update(
+            {
+                "confirmed": confirmed,
+                # A missing/malformed profile is not evidence that the
+                # question was removed. Keep this conservative for the UI.
+                "question_remaining": (not profile_available)
+                or bool(question and question in remaining),
+            }
+        )
+        current = self.engine.store.get(session_id)
+        if not result.message:
+            result.message = _assistant_text_since(current, message_start + int(system_inserted))
+        result.display_text = str(marker.get("display_text") or result.display_text or "")
+        result.metadata = metadata
+        return result
+
+    # Names kept as small compatibility shims for UI adapters that used an
+    # earlier wording while the endpoint protocol was being coordinated.
+    answer_question = answer_clarification
+    clarify = answer_clarification
+
     def github_token(self) -> dict[str, Any]:
         return github_token_status(self.workspace)
 
@@ -1505,6 +2379,13 @@ class WebService:
         def worker() -> None:
             try:
                 result = operation()
+                # A long approved command is an engine boundary, not a
+                # completed HTTP job.  Keep this same WebService job claimed
+                # while the command is alive so closing every browser window
+                # cannot strand the durable model turn.  ``poll_command``
+                # never executes the approved command again; it only observes
+                # the process and commits the saved tool call once terminal.
+                result = self._auto_resume_command(session_id, result)
                 safe_result = _result_payload(result)
             except Exception as exc:  # keep worker failures inside the job record
                 safe_error = _safe_error(exc)
@@ -1528,6 +2409,27 @@ class WebService:
 
         threading.Thread(target=worker, name=f"agent-coach-job-{job_id[:8]}", daemon=True).start()
         return job_id
+
+    def _auto_resume_command(self, session_id: str, result: Any) -> Any:
+        """Keep one submitted job alive until its command boundary resolves."""
+
+        current = result
+        while isinstance(current, RunResult) and current.status == "running_command":
+            data = current.data if isinstance(current.data, dict) else {}
+            command_id = str(
+                data.get("command_session_id")
+                or data.get("execution_id")
+                or data.get("session_id")
+                or ""
+            ).strip()
+            if not command_id:
+                return current
+            current = self.engine.poll_command(
+                session_id,
+                command_id,
+                wait_seconds=1.0,
+            )
+        return current
 
     def job(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1856,6 +2758,32 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/jobs/"):
             self._json(HTTPStatus.OK, self.service.job(path.rsplit("/", 1)[1]))
             return
+        parts = path.split("/")
+        if len(parts) == 5 and parts[1:3] == ["api", "sessions"] and parts[4] == "commands":
+            command_query = _command_query(split)
+            include_finished = command_query.pop("include_finished", True)
+            self._json(
+                HTTPStatus.OK,
+                self.service.command_sessions(
+                    parts[3],
+                    command_query,
+                    include_finished=include_finished,
+                ),
+            )
+            return
+        if len(parts) == 6 and parts[1:3] == ["api", "sessions"] and parts[4] == "commands":
+            command_query = _command_query(split)
+            wait_seconds = command_query.pop("wait_seconds", 0.0)
+            self._json(
+                HTTPStatus.OK,
+                self.service.command_snapshot(
+                    parts[3],
+                    unquote(parts[5]),
+                    command_query,
+                    wait_seconds=wait_seconds,
+                ),
+            )
+            return
         if path == "/api/files":
             query = parse_qs(split.query, keep_blank_values=True)
             requested = query.get("path", ["."])[0]
@@ -1866,7 +2794,12 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             requested = query.get("path", [""])[0]
             self._json(HTTPStatus.OK, self._file(requested))
             return
-        parts = path.split("/")
+        if len(parts) == 5 and parts[1:3] == ["api", "sessions"] and parts[4] == "practice":
+            self._json(HTTPStatus.OK, self.service.practice_threads(parts[3]))
+            return
+        if len(parts) == 6 and parts[1:3] == ["api", "sessions"] and parts[4] == "practice":
+            self._json(HTTPStatus.OK, self.service.practice_snapshot(parts[3], unquote(parts[5])))
+            return
         if len(parts) == 5 and parts[1:3] == ["api", "sessions"]:
             session_id, resource = parts[3], parts[4]
             if resource == "jd":
@@ -1928,6 +2861,69 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.CREATED, self.service.upload(body.get("name"), body.get("content_base64")))
             return
         parts = path.split("/")
+        if len(parts) == 7 and parts[1:3] == ["api", "sessions"] and parts[4] == "commands" and parts[6] in {"poll", "stop"}:
+            body = self._read_json()
+            allowed = {"scope", "project_key", "practice_thread_id"}
+            if parts[6] == "poll":
+                allowed.add("wait_seconds")
+            if any(key not in allowed for key in body):
+                raise ValueError("命令请求包含未知字段")
+            query_scope = _command_query(split)
+            query_scope.pop("include_finished", None)
+            query_wait = query_scope.pop("wait_seconds", None)
+            payload = dict(query_scope)
+            for key in ("scope", "project_key", "practice_thread_id"):
+                if key in body:
+                    if key in payload and str(payload[key]) != str(body[key]):
+                        raise ValueError(f"{key} 在查询和请求体中不一致")
+                    payload[key] = body[key]
+            wait_seconds = query_wait if query_wait is not None else 0.0
+            if "wait_seconds" in body:
+                body_wait = _command_wait_seconds(body["wait_seconds"])
+                if query_wait is not None and body_wait != query_wait:
+                    raise ValueError("wait_seconds 在查询和请求体中不一致")
+                wait_seconds = body_wait
+            self._json(
+                HTTPStatus.ACCEPTED if parts[6] == "poll" else HTTPStatus.OK,
+                (
+                    self.service.poll_command(
+                        parts[3],
+                        unquote(parts[5]),
+                        payload,
+                        wait_seconds=wait_seconds,
+                    )
+                    if parts[6] == "poll"
+                    else self.service.stop_command(parts[3], unquote(parts[5]), payload)
+                ),
+            )
+            return
+        if len(parts) == 5 and parts[1:3] == ["api", "sessions"] and parts[4] == "practice":
+            body = self._read_json()
+            self._json(HTTPStatus.OK, self.service.open_practice(parts[3], body))
+            return
+        if len(parts) == 7 and parts[1:3] == ["api", "sessions"] and parts[4] == "practice" and parts[6] == "message":
+            session_id, thread_id = parts[3], unquote(parts[5])
+            body = self._read_json()
+            text = _bytes_text(body.get("text"), limit=MAX_TEXT_BYTES, field="text")
+            attachments = _attachments(body.get("attachments", body.get("attachment")))
+            metadata = self.service.prepare_practice_turn(
+                session_id,
+                body,
+                thread_id=thread_id,
+            )
+            operation = lambda: self.service.engine.run(
+                text,
+                session_id=session_id,
+                attachments=attachments,
+                message_metadata=metadata,
+                action_guard=lambda current: self.service.validate_practice_turn(current, metadata),
+            )
+            job_id = self.service.submit(session_id, operation)
+            self._json(
+                HTTPStatus.ACCEPTED,
+                {"job_id": job_id, "session_id": session_id, "practice_thread_id": metadata["practice_thread_id"], "project_key": metadata["project_key"]},
+            )
+            return
         if len(parts) == 5 and parts[1:3] == ["api", "sessions"]:
             session_id, resource = parts[3], parts[4]
             if resource == "jd":
@@ -1938,6 +2934,16 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 self._json(HTTPStatus.OK, self.service.update_profile(session_id, body))
                 return
+            if resource in {"clarification", "clarify", "clarification-answer", "answer-clarification"}:
+                body = self._read_json()
+                self._json(HTTPStatus.ACCEPTED, self.service.answer_clarification(session_id, body))
+                return
+        # Accept the explicit nested spelling as well; the one-segment route
+        # above is the canonical browser protocol.
+        if len(parts) == 6 and parts[1:3] == ["api", "sessions"] and parts[4:] == ["clarification", "answer"]:
+            body = self._read_json()
+            self._json(HTTPStatus.ACCEPTED, self.service.answer_clarification(parts[3], body))
+            return
         if len(parts) != 5 or parts[1:3] != ["api", "sessions"]:
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -1946,17 +2952,27 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if action == "message":
             text = _bytes_text(body.get("text"), limit=MAX_TEXT_BYTES, field="text")
             attachments = _attachments(body.get("attachments", body.get("attachment")))
+            workflow_action = self.service._workflow_action(body)
+            metadata = self.service.prepare_practice_turn(session_id, body) if _scope_metadata(body).get("scope") == "practice" else {"scope": "main"}
             operation = lambda: self.service.engine.run(
                 text,
                 session_id=session_id,
                 attachments=attachments,
+                message_metadata=metadata,
+                action_guard=self.service._message_action_guard(metadata, workflow_action),
             )
         elif action in {"approve", "reject"}:
             approval_id = _bytes_text(body.get("id"), limit=256, field="id")
             method = self.service.engine.approve if action == "approve" else self.service.engine.reject
-            operation = lambda: method(session_id, approval_id)
+            operation = lambda: self.service._resume_clarification_action(
+                session_id,
+                lambda: method(session_id, approval_id),
+            )
         elif action == "continue":
-            operation = lambda: self.service.engine.continue_session(session_id)
+            operation = lambda: self.service._resume_clarification_action(
+                session_id,
+                lambda: self.service.engine.continue_session(session_id),
+            )
         elif action == "resolve":
             execution_id = _bytes_text(body.get("id"), limit=256, field="id")
             note = body.get("note", "")

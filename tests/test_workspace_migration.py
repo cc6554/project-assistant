@@ -14,6 +14,46 @@ from agent_coach.tools import PathSecurityError, _write_execute
 from scripts.migrate_workspace import MigrationError, main, migrate_workspace
 
 
+@pytest.mark.parametrize("tool_name", ["fetch_url", "unknown_plugin_write"])
+def test_migrated_queue_can_resume_or_be_acknowledged(tmp_path, tool_name):
+    from agent_coach.contracts import ToolDefinition, ToolOutcome
+    from agent_coach.legacy.core.schema import Message, ToolSpec
+
+    source, target = tmp_path / "old", tmp_path / "new"
+    source_store = SessionStore(source)
+    session = source_store.create()
+    call = ToolCall(id="queued-call", name=tool_name, arguments={})
+    session.messages.append(Message(role="assistant", content="", tool_calls=[call]))
+    session.queued_calls = [call]
+    source_store.save(session)
+    migrate_workspace(source, target)
+    store = SessionStore(target)
+    calls = []
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        spec=ToolSpec(name=tool_name, description="test", parameters={"type": "object"}),
+        handler=lambda args, ctx: (calls.append(tool_name) or ToolOutcome(content="read ok")),
+    ))
+
+    class Router:
+        def complete(self, *args, **kwargs):
+            return LLMResponse(text="done")
+
+    engine = AgentEngine(store, registry, Router())
+    if tool_name == "fetch_url":
+        assert engine.continue_session(session.id).status == "completed"
+        assert calls == [tool_name]
+        assert not store.get(session.id).queued_calls
+    else:
+        assert engine.continue_session(session.id).status == "uncertain"
+        execution = store.get(session.id).execution
+        assert execution["approval_id"].startswith("migration-")
+        engine.resolve_uncertain(session.id, execution["approval_id"], "checked")
+        assert calls == []
+        assert not any(m.role == "tool" for m in store.get(session.id).messages)
+        assert store.get(session.id).queued_calls[0].id == call.id
+
+
 def _snapshot(root: Path) -> dict[str, str]:
     rows: dict[str, str] = {}
     for path in sorted(item for item in root.rglob("*") if item.is_file()):

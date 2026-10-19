@@ -34,12 +34,23 @@ def test_registry_contains_domain_neutral_tools(registry: ToolRegistry) -> None:
         "read_document",
         "run_command",
         "fetch_url",
+        "github_identity",
+        "list_github_repositories",
         "read_github",
         "search_jobs",
         "git_clone",
         "update_plan",
     }
     assert all(definition.skill is None for definition in registry._tools.values())
+
+
+def test_github_tools_reject_caller_supplied_credentials(context: ToolContext, registry: ToolRegistry) -> None:
+    with pytest.raises(ValueError, match="unsupported tool arguments"):
+        registry.get("github_identity").handler({"token": "do-not-accept"}, context)
+    with pytest.raises(ValueError, match="unsupported tool arguments"):
+        registry.get("list_github_repositories").handler(
+            {"username": "owner", "token": "do-not-accept"}, context
+        )
 
 
 def test_resolve_path_rejects_escape_and_sensitive_names(context: ToolContext) -> None:
@@ -293,6 +304,7 @@ def test_fetch_rejects_private_and_credential_urls() -> None:
         "http://localhost/",
         "http://169.254.169.254/latest/meta-data",
         "https://user:pass@example.com/private",
+        "https://example.com/?access_token=should-not-be-sent",
     ):
         with pytest.raises(ValueError):
             tools.ensure_public_url(url)

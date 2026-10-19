@@ -81,6 +81,23 @@ def plan_artifact() -> dict:
     ).model_dump(mode="json")
 
 
+def verified_repo(full_name: str) -> GitHubRepo:
+    """Build a search fixture with the same provenance real candidates carry."""
+
+    source_path = "src/main.py"
+    evidence = f"https://github.com/{full_name}/blob/main/{source_path}"
+    return GitHubRepo(
+        full_name=full_name,
+        html_url=f"https://github.com/{full_name}",
+        source_verified=True,
+        source_paths=[source_path],
+        source_evidence=[evidence],
+        code_verified=True,
+        code_paths=[source_path],
+        code_evidence=[evidence],
+    )
+
+
 def test_registry_gates_and_runs_structured_single_agent_workflow(monkeypatch, tmp_path: Path):
     calls: list[dict] = []
 
@@ -88,7 +105,7 @@ def test_registry_gates_and_runs_structured_single_agent_workflow(monkeypatch, t
         calls.append({"router": router, "queries": queries, "profile": profile, "kwargs": kwargs})
         assert router is None
         assert kwargs["llm_rerank"] is False
-        return [GitHubRepo(full_name="demo/project", html_url="https://github.com/demo/project")]
+        return [verified_repo("demo/project")]
 
     monkeypatch.setattr(job_radar, "search_github_projects", deterministic_search)
     registry = register_job_radar_tools(ToolRegistry())
@@ -154,7 +171,7 @@ def test_artifact_validation_is_atomic_and_changes_invalidate_downstream(monkeyp
     monkeypatch.setattr(
         job_radar,
         "search_github_projects",
-        lambda *_args, **_kwargs: [GitHubRepo(full_name="demo/project", html_url="https://github.com/demo/project")],
+        lambda *_args, **_kwargs: [verified_repo("demo/project")],
     )
     ctx = context(tmp_path)
     registry = register_job_radar_tools(ToolRegistry())
@@ -265,7 +282,12 @@ def test_structured_tool_specs_inline_domain_schema_refs():
         assert schema["properties"][key]["type"] == "object"
         assert list(refs(schema)) == []
     source_schema = registry.get("set_jd", active_skills=["job-radar"]).spec.parameters["properties"]["source"]
-    assert source_schema["required"] == ["kind", "evidence"]
+    assert source_schema["required"] == ["kind"]
+    assert source_schema["anyOf"] == [
+        {"required": ["evidence"]},
+        {"required": ["source_evidence"]},
+        {"required": ["code_evidence"]},
+    ]
 
 
 def test_search_rejects_nested_rerank_request(monkeypatch, tmp_path: Path):
@@ -299,6 +321,12 @@ def test_search_preferences_keep_ddpg_and_exclude_isaac_deterministically(monkey
                 "stargazers_count": 5,
                 "updated_at": "",
                 "det_score": 1,
+                "source_verified": True,
+                "source_paths": ["src/main.py"],
+                "source_evidence": ["https://github.com/o/ddpg/blob/main/src/main.py"],
+                "code_verified": True,
+                "code_paths": ["src/main.py"],
+                "code_evidence": ["https://github.com/o/ddpg/blob/main/src/main.py"],
             },
             {
                 "full_name": "o/isaac-ddpg",
@@ -308,6 +336,12 @@ def test_search_preferences_keep_ddpg_and_exclude_isaac_deterministically(monkey
                 "stargazers_count": 5,
                 "updated_at": "",
                 "det_score": 1,
+                "source_verified": True,
+                "source_paths": ["src/main.py"],
+                "source_evidence": ["https://github.com/o/isaac-ddpg/blob/main/src/main.py"],
+                "code_verified": True,
+                "code_paths": ["src/main.py"],
+                "code_evidence": ["https://github.com/o/isaac-ddpg/blob/main/src/main.py"],
             },
         ],
     )
@@ -393,8 +427,8 @@ def test_copy_profile_state_does_not_copy_job_context(tmp_path: Path):
 
 def _prepare_projects(monkeypatch, tmp_path: Path):
     projects = {
-        "A": GitHubRepo(full_name="demo/a", html_url="https://github.com/demo/a"),
-        "B": GitHubRepo(full_name="demo/b", html_url="https://github.com/demo/b"),
+        "A": verified_repo("demo/a"),
+        "B": verified_repo("demo/b"),
     }
     searches = iter([[projects["A"], projects["B"]], [projects["B"]]])
 
@@ -495,7 +529,12 @@ def test_legacy_project_history_migrates_lazily_and_survives_restart(tmp_path: P
 
     ctx = ToolContext(workspace=tmp_path, session=session, router=None)
     registry = register_job_radar_tools(ToolRegistry())
-    registry.get("select_project", active_skills=["job-radar"]).handler({"full_name": "demo/b"}, ctx)
+    # A stale historical metadata-only candidate cannot be selected after the
+    # provenance gate was introduced.  The exact active project remains a
+    # compatibility continuation so migration does not strand existing work.
+    registry.get("select_project", active_skills=["job-radar"]).handler({"full_name": "demo/a"}, ctx)
+    with pytest.raises(ValueError):
+        registry.get("select_project", active_skills=["job-radar"]).handler({"full_name": "demo/b"}, ctx)
     assert {item["project_key"] for item in session.skill_state["job-radar"]["project_history"]} == {
         "demo/a",
         "demo/b",

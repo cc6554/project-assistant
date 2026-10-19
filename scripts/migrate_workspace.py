@@ -70,6 +70,10 @@ _PREPARED_PATH_KEYS = frozenset(
     }
 )
 _UNFINISHED_EXECUTION_STATUSES = frozenset({"pending", "queued", "running"})
+_READ_ONLY_QUEUE_TOOLS = frozenset({
+    "fetch_url", "read_github", "github_identity", "list_github_repositories",
+    "read_file", "read_document", "list_dir", "job_radar_status",
+})
 _MAX_SESSION_BYTES = 64 * 1024 * 1024
 _COPY_CHUNK_BYTES = 1024 * 1024
 _MIGRATION_CONFIRMATION = "工作区迁移后需要人工确认，未自动执行未完成操作"
@@ -323,12 +327,27 @@ def _migrate_execution(data: dict[str, Any], stats: _Stats) -> None:
     if isinstance(queued, list) and queued:
         current = dict(data.get("execution") or {})
         status = str(current.get("status") or "").casefold()
-        if status != "uncertain":
+        read_only = all(
+            isinstance(call, Mapping) and call.get("name") in _READ_ONLY_QUEUE_TOOLS
+            for call in queued
+        )
+        # A durable read queue is resumable work, not evidence of a possibly
+        # executed write. Preserve any real uncertain claim above, however.
+        if status != "uncertain" and not read_only:
             current["status"] = "uncertain"
             current.setdefault("reason", _QUEUE_CONFIRMATION)
             current["migration_requires_confirmation"] = True
             data["execution"] = current
             stats.sessions_marked_uncertain += 1
+
+    current = dict(data.get("execution") or {})
+    if current.get("status") == "uncertain" and not (
+        current.get("call_id") or current.get("approval_id")
+    ):
+        # Give migration-only holds an acknowledgement ID without pretending
+        # that a queued tool has executed or fabricating its tool result.
+        current["approval_id"] = "migration-" + uuid.uuid4().hex
+        data["execution"] = current
 
 
 def _declared_workspace(payload: Mapping[str, Any]) -> Path | None:

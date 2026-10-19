@@ -149,6 +149,35 @@ def test_demo_message_approval_and_restart_restore(live_server, tmp_path: Path):
         thread.join(timeout=2)
 
 
+def test_web_can_resume_persisted_tool_queue(live_server):
+    service, server = live_server
+    session_id = create_session(service, server)
+
+    class Router:
+        def complete(self, task, messages, *, tools=None, **kwargs):
+            return LLMResponse(text="队列已恢复")
+
+    service.engine.router = Router()
+    session = service.engine.store.get(session_id)
+    session.queued_calls = [ToolCall(id="interrupted-1", name="missing", arguments={})]
+    service.engine.store.save(session)
+
+    status, summaries = request(service, server, "GET", "/api/sessions")
+    assert status == 200
+    row = next(item for item in summaries["sessions"] if item["id"] == session_id)
+    assert row["queued_calls"] == 1
+
+    status, queued = request(service, server, "POST", f"/api/sessions/{session_id}/continue", {})
+    assert status == 202
+    result = wait_job(service, server, queued["job_id"])
+    assert result["status"] == "completed"
+    assert result["result"]["status"] == "completed"
+
+    status, snapshot = request(service, server, "GET", f"/api/sessions/{session_id}")
+    assert status == 200
+    assert snapshot["queued_calls"] == 0
+
+
 def test_files_upload_and_skill_toggle(live_server, tmp_path: Path):
     service, server = live_server
     (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")

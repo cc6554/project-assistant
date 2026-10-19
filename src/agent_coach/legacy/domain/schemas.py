@@ -98,3 +98,27 @@ class GitHubRepo(BaseModel):
     updated_at: str = ""
     reason: str = Field("", description="为什么适合该用户复现/学习")
     match_score: float = 0.0
+    # A paper-oriented GitHub query is only a discovery signal.  These fields
+    # deliberately keep verification separate from the signal so a star count
+    # or a repository description can never become an invented venue or
+    # citation claim.
+    paper_candidate: bool = False
+    paper_verified: bool = False
+    paper_title: str | None = None
+    paper_url: str | None = None
+    venue: str | None = None
+    citation_count: int | None = Field(None, ge=0)
+    paper_evidence: list[str] = Field(default_factory=list)
+    # Repository metadata is not enough to establish that a candidate is an
+    # implementation.  The collector fills these fields only after it has
+    # inspected the repository tree and found at least one source file.  Keep
+    # ``None`` as the default for old, caller-created fixtures; real search
+    # results always carry an explicit boolean and provenance.
+    source_verified: bool | None = None
+    source_paths: list[str] = Field(default_factory=list)
+    source_evidence: list[str] = Field(default_factory=list)
+    # Canonical names for callers that treat provenance as implementation-code
+    # evidence.  The source_* aliases above remain for older integrations.
+    code_verified: bool | None = None
+    code_paths: list[str] = Field(default_factory=list)
+    code_evidence: list[str] = Field(default_factory=list)

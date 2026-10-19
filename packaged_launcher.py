@@ -21,6 +21,7 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.parse import parse_qsl, urlsplit
 
 
 # PyInstaller resolves imports from the bundle, while a source-checkout smoke
@@ -229,6 +230,152 @@ def _serve_headless(server: Any, url: str, workspace: Path | None = None) -> int
     return 0
 
 
+def _practice_scope_from_url(value: str) -> tuple[str, str] | None:
+    try:
+        parsed = urlsplit(str(value or ""))
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        values: dict[str, list[str]] = {}
+        for key, item in pairs:
+            values.setdefault(str(key).strip().lower(), []).append(str(item).strip())
+        if values.get("view") != ["practice"] or len(values.get("session_id", [])) != 1 or len(values.get("project_key", [])) != 1:
+            return None
+        session_id = values["session_id"][0]
+        project_key = values["project_key"][0]
+        if not session_id or not project_key or len(session_id) > 256 or len(project_key) > 1024:
+            return None
+        if any(ord(char) < 0x20 for char in f"{session_id}{project_key}"):
+            return None
+        return session_id, project_key
+    except ValueError:
+        return None
+
+
+def _is_safe_practice_url(value: str, base_url: str | None = None) -> bool:
+    """Allow child windows to load only the exact loopback workbench route.
+
+    The practice child receives its session/project scope in the query and the
+    short lived API credential in the URL fragment.  Rejecting credential-like
+    query keys protects native window diagnostics and referrer metadata if a
+    stale or hand-written browser call reaches the bridge.
+    """
+
+    try:
+        parsed = urlsplit(str(value or ""))
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        if base_url:
+            base = urlsplit(str(base_url))
+            if (parsed.scheme, parsed.hostname, parsed.port) != (base.scheme, base.hostname, base.port):
+                return False
+            if (parsed.path or "/") != (base.path or "/"):
+                return False
+        blocked = {"token", "api_key", "apikey", "access_token", "authorization", "secret", "password"}
+        if any(str(key).strip().lower() in blocked for key, _value in parse_qsl(parsed.query, keep_blank_values=True)):
+            return False
+        return _practice_scope_from_url(value) is not None
+    except ValueError:
+        return False
+
+
+class _PracticeWindowApi:
+    """Small pywebview bridge for independent practice windows.
+
+    No model or API credential is stored here.  The child URL is validated and
+    then loaded in a sibling WebView, so closing/minimizing that window cannot
+    stop the shared HTTP worker or a running job.
+    """
+
+    def __init__(self, webview: Any, base_url: str):
+        self._webview = webview
+        self._base_url = str(base_url or "")
+        self._windows: dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _scope_key(scope: tuple[str, str]) -> str:
+        return f"{scope[0]}\x00{scope[1]}"
+
+    def _forget(self, key: str, child: Any) -> None:
+        with self._lock:
+            if self._windows.get(key) is child:
+                self._windows.pop(key, None)
+
+    def _close(self, key: str) -> dict[str, bool]:
+        with self._lock:
+            child = self._windows.pop(key, None)
+        if child is None:
+            return {"closed": False}
+        try:
+            destroy = getattr(child, "destroy", None)
+            if callable(destroy):
+                destroy()
+            else:
+                hide = getattr(child, "hide", None)
+                if callable(hide):
+                    hide()
+        except Exception:
+            return {"closed": False}
+        return {"closed": True}
+
+    def open_practice_window(self, url: str) -> dict[str, bool]:
+        scope = _practice_scope_from_url(url)
+        if scope is None or not _is_safe_practice_url(url, self._base_url):
+            return {"opened": False}
+        key = self._scope_key(scope)
+        with self._lock:
+            existing = self._windows.get(key)
+        if existing is not None:
+            try:
+                restore = getattr(existing, "restore", None)
+                if callable(restore):
+                    restore()
+                show = getattr(existing, "show", None)
+                if callable(show):
+                    show()
+                return {"opened": True, "reused": True}
+            except Exception:
+                self._forget(key, existing)
+        try:
+            child = self._webview.create_window(
+                "校招雷达 · Agent 实操",
+                url=str(url),
+                width=1160,
+                height=860,
+                min_size=(960, 640),
+                text_select=True,
+                confirm_close=False,
+                background_color="#F7F8FA",
+                js_api=_PracticeWindowChildApi(self, key),
+            )
+        except Exception:
+            return {"opened": False}
+        with self._lock:
+            self._windows[key] = child
+        events = getattr(child, "events", None)
+        closing = getattr(events, "closing", None)
+        if closing is not None:
+            closing += lambda *_args, _key=key, _child=child: self._forget(_key, _child)
+        return {"opened": True}
+
+    def close_practice_window(self, session_id: str = "", project_key: str = "") -> dict[str, bool]:
+        session = str(session_id or "").strip()
+        project = str(project_key or "").strip()
+        return self._close(self._scope_key((session, project))) if session and project else {"closed": False}
+
+
+class _PracticeWindowChildApi:
+    """Per-child bridge so close requests cannot destroy another scope."""
+
+    def __init__(self, parent: _PracticeWindowApi, key: str):
+        self._parent = parent
+        self._key = key
+
+    def close_practice_window(self, *_args: Any, **_kwargs: Any) -> dict[str, bool]:
+        return self._parent._close(self._key)
+
+
 def _run_native(server: Any, url: str, storage_path: Path | None = None) -> int:
     """Run the native EdgeChromium window and close the API server with it."""
 
@@ -253,6 +400,7 @@ def _run_native(server: Any, url: str, storage_path: Path | None = None) -> int:
             stopped = True
         _stop_server(server, server_thread)
 
+    api = _PracticeWindowApi(webview, url)
     try:
         window = webview.create_window(
             APP_TITLE,
@@ -263,6 +411,7 @@ def _run_native(server: Any, url: str, storage_path: Path | None = None) -> int:
             text_select=True,
             confirm_close=False,
             background_color="#F7F8FA",
+            js_api=api,
         )
         # pywebview exposes an event container on all supported Windows
         # backends.  Keep this defensive branch for headless test doubles.

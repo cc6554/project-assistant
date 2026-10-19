@@ -2,7 +2,9 @@
 
 This module is intentionally separate from the HTTP service.  The service can
 call the small token and import APIs for explicit UI actions, while the agent
-only receives the read-only ``read_github`` tool registered by ``tools.py``.
+only receives the read-only GitHub tools registered by ``tools.py``.  GitHub
+credentials are loaded for each operation, never captured by a model/router
+closure, and are sent only to the fixed ``api.github.com`` origin.
 The sole environment compatibility path is the explicitly named
 ``AGENT_COACH_GITHUB_TOKEN`` variable; Git credential helpers are never read.
 """
@@ -21,7 +23,7 @@ import re
 import stat
 import tempfile
 from typing import Any, Iterator, Mapping
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 import uuid
 
 import requests
@@ -43,12 +45,42 @@ MAX_GITHUB_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_GITHUB_CONTENT_BYTES = 2 * 1024 * 1024
 MAX_GITHUB_REDIRECTS = 3
 MAX_GITHUB_TIMEOUT = 60.0
+MAX_GITHUB_PAGE = 10_000
+MAX_GITHUB_PER_PAGE = 100
 MAX_IMPORT_FILES = 1000
 MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024
 MAX_IMPORT_TOTAL_BYTES = 20 * 1024 * 1024
 MAX_IMPORT_DIRECTORY_ENTRIES = 4096
 
 _GITHUB_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_CREDENTIAL_QUERY_KEYS = frozenset(
+    {"token", "access_token", "api_key", "apikey", "key", "auth", "authorization"}
+)
+_GITHUB_RESERVED_PROFILE_ROUTES = frozenset(
+    {
+        "about",
+        "collections",
+        "dashboard",
+        "events",
+        "explore",
+        "features",
+        "issues",
+        "login",
+        "marketplace",
+        "new",
+        "notifications",
+        "organizations",
+        "pricing",
+        "pulls",
+        "security",
+        "settings",
+        "sponsors",
+        "topics",
+        "trending",
+    }
+)
+_GITHUB_REPOSITORY_LIST_QUERY_KEYS = frozenset({"page", "per_page"})
 _BLOCKED_IMPORT_NAMES = frozenset(
     {
         ".agent-coach",
@@ -336,6 +368,25 @@ def _normalize_repository(repository: Any) -> str:
     return f"{owner}/{repo}"
 
 
+def _normalize_github_username(username: Any) -> str:
+    """Validate a GitHub login before putting it into an API path."""
+
+    if not isinstance(username, str) or not username.strip():
+        raise IntegrationError("GitHub 用户名不能为空")
+    value = username.strip()
+    if not _GITHUB_USERNAME_RE.fullmatch(value):
+        raise IntegrationError("GitHub 用户名格式无效")
+    return value
+
+
+def _query_has_credential_key(query: str) -> bool:
+    keys = {
+        unquote(key).strip().casefold().replace("-", "_")
+        for key in parse_qs(query, keep_blank_values=True)
+    }
+    return bool(keys & _CREDENTIAL_QUERY_KEYS)
+
+
 def _normalize_repo_path(path: Any) -> str:
     if path is None:
         return ""
@@ -424,6 +475,11 @@ def _redirect_target(current: str, location: Any) -> str:
         port = parsed.port
     except ValueError as exc:
         raise IntegrationError("GitHub 重定向目标不受信任") from exc
+    # A redirect is allowed only inside the API origin.  Reject credential-
+    # looking query keys as an additional guard against accepting a URL that
+    # asks the client to carry a secret in the address bar or access logs.
+    if _query_has_credential_key(parsed.query):
+        raise IntegrationError("GitHub 重定向不得携带凭据")
     if (
         parsed.scheme.casefold() != "https"
         or (parsed.hostname or "").casefold() != "api.github.com"
@@ -488,9 +544,13 @@ def _github_json(
             if callable(close):
                 close()
             if status == 401:
-                raise IntegrationError("GitHub 认证失败")
+                raise IntegrationError(
+                    "GitHub 认证失败：Token 无效或已过期，请在工作区设置页重新保存 GitHub Token"
+                )
             if status == 403:
-                raise IntegrationError("GitHub 请求受限或无权访问")
+                raise IntegrationError(
+                    "GitHub 请求受限或无权访问：请检查 Token 权限，或稍后重试"
+                )
             if status == 404:
                 raise IntegrationError("GitHub 仓库或路径不存在，或当前 Token 无权访问")
             if status >= 400:
@@ -630,6 +690,243 @@ def read_github(
         "size_bytes": file_size,
         "response_bytes": response_bytes,
         "status": status,
+    }
+
+
+def _require_github_token(workspace: str | Path) -> str:
+    """Load the current workspace token with an actionable missing-token error."""
+
+    token = load_github_token(workspace)
+    if token is None:
+        raise IntegrationError(
+            "当前操作需要 GitHub Token；请先在工作区设置页保存 Token，"
+            "并确认它至少有读取目标私有仓库的权限"
+        )
+    return token
+
+
+def _github_identity_row(payload: Any) -> dict[str, Any]:
+    """Project the /user response to a small, non-secret identity record."""
+
+    if not isinstance(payload, dict):
+        raise IntegrationError("GitHub 身份响应格式无效")
+    login = payload.get("login")
+    try:
+        login = _normalize_github_username(login)
+    except IntegrationError as exc:
+        raise IntegrationError("GitHub 身份响应缺少有效 login") from exc
+    row: dict[str, Any] = {"login": login}
+    account_id = payload.get("id")
+    if isinstance(account_id, int) and not isinstance(account_id, bool) and account_id >= 0:
+        row["id"] = account_id
+    for key in ("name", "company", "blog", "location", "type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            row[key] = value.strip()[:512]
+    return row
+
+
+def github_identity(
+    workspace: str | Path,
+    *,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Return the authenticated GitHub identity without exposing its Token."""
+
+    timeout = _safe_timeout(timeout, default=20.0, maximum=MAX_GITHUB_TIMEOUT)
+    token = _require_github_token(workspace)
+    with github_token_scope(token):
+        payload, status, response_bytes = _github_json(
+            f"{GITHUB_API_ROOT}/user",
+            token=token,
+            params=None,
+            max_bytes=MAX_GITHUB_RESPONSE_BYTES,
+            timeout=timeout,
+        )
+    identity = _github_identity_row(payload)
+    return {
+        "ok": True,
+        "kind": "identity",
+        "identity": identity,
+        "status": status,
+        "response_bytes": response_bytes,
+    }
+
+
+def _github_repository_row(item: Any) -> dict[str, Any] | None:
+    """Keep only bounded, non-credential repository metadata from GitHub."""
+
+    if not isinstance(item, dict):
+        return None
+    full_name = item.get("full_name")
+    if not isinstance(full_name, str):
+        owner = item.get("owner")
+        owner_login = owner.get("login") if isinstance(owner, dict) else None
+        name = item.get("name")
+        if isinstance(owner_login, str) and isinstance(name, str):
+            full_name = f"{owner_login}/{name}"
+    try:
+        full_name = _normalize_repository(full_name)
+    except IntegrationError:
+        return None
+    owner_login = full_name.split("/", 1)[0]
+    row: dict[str, Any] = {
+        "full_name": full_name,
+        "name": full_name.split("/", 1)[1],
+        "owner": owner_login,
+        "private": bool(item.get("private")),
+        "visibility": str(item.get("visibility") or ("private" if item.get("private") else "public")),
+    }
+    for key in ("description", "default_branch", "language", "updated_at", "pushed_at"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            row[key] = value[:4096] if key == "description" else value[:512]
+    for key in ("archived", "disabled", "fork"):
+        if isinstance(item.get(key), bool):
+            row[key] = item[key]
+    for source_key, result_key in (
+        ("stargazers_count", "stargazers_count"),
+        ("forks_count", "forks_count"),
+        ("open_issues_count", "open_issues_count"),
+    ):
+        value = item.get(source_key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            row[result_key] = value
+    for key in ("html_url", "url"):
+        value = item.get(key)
+        if isinstance(value, str) and value.startswith("https://github.com/"):
+            row[key] = value[:2048]
+    return row
+
+
+def list_github_repositories(
+    workspace: str | Path,
+    *,
+    username: str | None = None,
+    page: int = 1,
+    per_page: int = 30,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """List public repositories or the authenticated user's private repositories.
+
+    When ``username`` matches the current Token's login, the authenticated
+    ``/user/repos`` endpoint is used and private repositories are included.
+    A different username always uses ``/users/{username}/repos`` so a caller
+    can never accidentally receive the authenticated user's unrelated private
+    repositories.  Each invocation loads the current workspace Token again;
+    changing the setting therefore takes effect on the next call.
+    """
+
+    if username is not None:
+        username = _normalize_github_username(username)
+    page = _safe_limit(page, default=1, maximum=MAX_GITHUB_PAGE, name="page")
+    per_page = _safe_limit(
+        per_page,
+        default=30,
+        maximum=MAX_GITHUB_PER_PAGE,
+        name="per_page",
+    )
+    timeout = _safe_timeout(timeout, default=20.0, maximum=MAX_GITHUB_TIMEOUT)
+    token = load_github_token(workspace)
+    authenticated_login: str | None = None
+    source: str
+    if username is None:
+        if token is None:
+            raise IntegrationError(
+                "当前操作需要 GitHub Token；请先在工作区设置页保存 Token，"
+                "并确认它至少有读取目标私有仓库的权限"
+            )
+        source = "authenticated_user"
+    elif token is None:
+        source = "public_user"
+    else:
+        # Resolve the login once before choosing the endpoint.  This keeps a
+        # request for another user's repositories from being served by
+        # /user/repos, which would otherwise reveal the Token owner's private
+        # repository names to the model.
+        with github_token_scope(token):
+            identity_payload, _identity_status, _identity_bytes = _github_json(
+                f"{GITHUB_API_ROOT}/user",
+                token=token,
+                params=None,
+                max_bytes=MAX_GITHUB_RESPONSE_BYTES,
+                timeout=timeout,
+            )
+        authenticated_login = _github_identity_row(identity_payload)["login"]
+        source = (
+            "authenticated_user"
+            if authenticated_login.casefold() == username.casefold()
+            else "public_user"
+        )
+
+    if source == "authenticated_user":
+        endpoint = f"{GITHUB_API_ROOT}/user/repos"
+        params: dict[str, Any] = {
+            "visibility": "all",
+            "affiliation": (
+                "owner"
+                if username is not None
+                else "owner,collaborator,organization_member"
+            ),
+            "sort": "updated",
+            "direction": "desc",
+            "per_page": per_page,
+            "page": page,
+        }
+    else:
+        # username is guaranteed non-None in this branch.
+        assert username is not None
+        endpoint = f"{GITHUB_API_ROOT}/users/{quote(username, safe='')}/repos"
+        params = {
+            "type": "all",
+            "sort": "updated",
+            "direction": "desc",
+            "per_page": per_page,
+            "page": page,
+        }
+
+    with github_token_scope(token):
+        payload, status, response_bytes = _github_json(
+            endpoint,
+            token=token,
+            params=params,
+            max_bytes=MAX_GITHUB_RESPONSE_BYTES,
+            timeout=timeout,
+        )
+    if not isinstance(payload, list):
+        raise IntegrationError("GitHub 仓库列表响应格式无效")
+
+    repositories: list[dict[str, Any]] = []
+    for item in payload:
+        row = _github_repository_row(item)
+        if row is None:
+            continue
+        if username is not None and row["owner"].casefold() != username.casefold():
+            continue
+        repositories.append(row)
+    next_page = page + 1 if len(payload) >= per_page else None
+    note = (
+        "当前列表来自 workspace Token 可访问的 GitHub 仓库范围，可能包含私有仓库；"
+        "private_available 不代表该 Token 可以访问账户的全部私有仓库。"
+        if source == "authenticated_user"
+        else "当前仅返回公开仓库；未配置 Token 或 Token 身份与目标用户不同，"
+        "不能据此判断该用户没有私有仓库。"
+    )
+    return {
+        "ok": True,
+        "kind": "repositories",
+        "username": username,
+        "authenticated_login": authenticated_login,
+        "source": source,
+        "private_available": source == "authenticated_user" and token is not None,
+        "note": note,
+        "page": page,
+        "per_page": per_page,
+        "next_page": next_page,
+        "count": len(repositories),
+        "repositories": repositories,
+        "status": status,
+        "response_bytes": response_bytes,
     }
 
 
@@ -1037,6 +1334,107 @@ def import_local_path(
     }
 
 
+def parse_github_repository_list_url(
+    url: str,
+) -> tuple[str | None, int, int] | None:
+    """Parse the two fixed GitHub repository-list API URLs used by old calls.
+
+    This compatibility parser deliberately accepts only ``page`` and
+    ``per_page`` query parameters.  It never turns an arbitrary API URL into
+    a model-controlled request, and callers still route the resulting target
+    through :func:`list_github_repositories` so the workspace token remains
+    internal.
+    """
+
+    if not isinstance(url, str) or any(ord(char) < 32 for char in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.casefold() != "https"
+        or (parsed.hostname or "").casefold() != "api.github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port not in (None, 443)
+    ):
+        return None
+    segments = [unquote(part) for part in parsed.path.split("/") if part]
+    username: str | None
+    if segments == ["user", "repos"]:
+        username = None
+    elif len(segments) == 3 and segments[0] == "users" and segments[2] == "repos":
+        try:
+            username = _normalize_github_username(segments[1])
+        except IntegrationError:
+            return None
+    else:
+        return None
+
+    if _query_has_credential_key(parsed.query):
+        raise IntegrationError("GitHub URL 查询参数不得包含凭据")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    unknown = set(query) - _GITHUB_REPOSITORY_LIST_QUERY_KEYS
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise IntegrationError(
+            f"GitHub 仓库列表 URL 只允许 page/per_page 参数（不支持：{names}）"
+        )
+
+    def query_limit(name: str, default: int, maximum: int) -> int:
+        values = query.get(name)
+        if values is None:
+            return default
+        if len(values) != 1 or not re.fullmatch(r"[0-9]+", values[0]):
+            raise IntegrationError(f"GitHub {name} 参数无效")
+        try:
+            numeric = int(values[0])
+        except (TypeError, ValueError) as exc:
+            raise IntegrationError(f"GitHub {name} 参数无效") from exc
+        return _safe_limit(numeric, default=default, maximum=maximum, name=name)
+
+    return (
+        username,
+        query_limit("page", 1, MAX_GITHUB_PAGE),
+        query_limit("per_page", 30, MAX_GITHUB_PER_PAGE),
+    )
+
+
+def parse_github_user_url(url: str) -> str | None:
+    """Return a GitHub profile login from a safe one-segment profile URL."""
+
+    if not isinstance(url, str) or any(ord(char) < 32 for char in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold()
+    if (
+        parsed.scheme.casefold() != "https"
+        or host not in {"github.com", "www.github.com"}
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or _query_has_credential_key(parsed.query)
+        or port not in (None, 443)
+    ):
+        return None
+    segments = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(segments) != 1:
+        return None
+    if segments[0].casefold() in _GITHUB_RESERVED_PROFILE_ROUTES:
+        return None
+    try:
+        return _normalize_github_username(segments[0])
+    except IntegrationError:
+        return None
+
+
 def parse_github_url(url: str) -> tuple[str, str, str | None] | None:
     """Translate a safe GitHub web/API file URL to ``(repo, path, ref)``."""
 
@@ -1044,10 +1442,18 @@ def parse_github_url(url: str) -> tuple[str, str, str | None] | None:
         return None
     try:
         parsed = urlsplit(url)
+        port = parsed.port
     except ValueError:
         return None
     host = (parsed.hostname or "").casefold()
-    if parsed.scheme.casefold() != "https" or parsed.username or parsed.password or parsed.fragment:
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or _query_has_credential_key(parsed.query)
+        or port not in (None, 443)
+    ):
         return None
     segments = [part for part in parsed.path.split("/") if part]
     if host in {"github.com", "www.github.com"}:
@@ -1095,6 +1501,8 @@ __all__ = [
     "GITHUB_TOKEN_DISABLED_FILENAME",
     "IntegrationError",
     "MAX_GITHUB_CONTENT_BYTES",
+    "MAX_GITHUB_PAGE",
+    "MAX_GITHUB_PER_PAGE",
     "MAX_GITHUB_RESPONSE_BYTES",
     "MAX_GITHUB_TIMEOUT",
     "MAX_IMPORT_FILE_BYTES",
@@ -1105,9 +1513,13 @@ __all__ = [
     "get_github_token",
     "github_token_context",
     "github_token_status",
+    "github_identity",
     "import_local_path",
+    "list_github_repositories",
     "load_github_token",
     "parse_github_url",
+    "parse_github_repository_list_url",
+    "parse_github_user_url",
     "read_github",
     "save_github_token",
     "search_jobs",

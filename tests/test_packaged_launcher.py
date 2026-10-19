@@ -69,6 +69,18 @@ class _FakeEvent:
 class _FakeWindow:
     def __init__(self):
         self.events = type("Events", (), {"closing": _FakeEvent()})()
+        self.destroyed = False
+        self.restored = 0
+        self.shown = 0
+
+    def destroy(self):
+        self.destroyed = True
+
+    def restore(self):
+        self.restored += 1
+
+    def show(self):
+        self.shown += 1
 
 
 class _FakeWebview:
@@ -85,6 +97,16 @@ class _FakeWebview:
     def start(self, **kwargs):
         self.start_kwargs = kwargs
         self.window.events.closing.fire()
+
+
+class _PracticeWebview:
+    def __init__(self):
+        self.windows = []
+
+    def create_window(self, *args, **kwargs):
+        window = _FakeWindow()
+        self.windows.append((args, kwargs, window))
+        return window
 
 
 class _FakeServer:
@@ -124,6 +146,24 @@ def test_native_window_uses_edgechromium_and_stops_server(monkeypatch, tmp_path)
         time.sleep(0.01)
     assert server.shutdown_called
     assert server.close_called
+def test_practice_bridge_is_exact_origin_scoped_and_reuses_windows():
+    base = "http://127.0.0.1:43123/#token=abc"
+    first = "http://127.0.0.1:43123/?view=practice&session_id=A&project_key=owner%2Frepo#token=abc"
+    second = "http://127.0.0.1:43123/?view=practice&session_id=A&project_key=other%2Frepo#token=abc"
+    webview = _PracticeWebview()
+    api = packaged_launcher._PracticeWindowApi(webview, base)
+
+    assert api.open_practice_window(first) == {"opened": True}
+    assert api.open_practice_window(first) == {"opened": True, "reused": True}
+    assert len(webview.windows) == 1
+    assert api.open_practice_window(second) == {"opened": True}
+    assert len(webview.windows) == 2
+    assert api.close_practice_window("A", "owner/repo") == {"closed": True}
+    assert webview.windows[0][2].destroyed
+    assert api.close_practice_window("A", "other/repo") == {"closed": True}
+    assert not packaged_launcher._is_safe_practice_url(first.replace("43123", "43124"), base)
+    assert not packaged_launcher._is_safe_practice_url(first.replace("view=practice", "view=main"), base)
+    assert not packaged_launcher._is_safe_practice_url(first.replace("project_key=owner%2Frepo", "token=secret&project_key=owner%2Frepo"), base)
 
 
 def test_headless_windowed_mode_leaves_local_discovery_marker(tmp_path, monkeypatch):

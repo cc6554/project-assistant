@@ -114,7 +114,16 @@ def test_full_skill_flow_returns_to_general_tools_and_requires_real_approvals(tm
         job_radar,
         "search_github_projects",
         lambda *a, **kw: [
-            GitHubRepo(full_name="fixture/http-practice", html_url="https://github.com/fixture/http-practice")
+            GitHubRepo(
+                full_name="fixture/http-practice",
+                html_url="https://github.com/fixture/http-practice",
+                source_verified=True,
+                source_paths=["src/main.py"],
+                source_evidence=["https://github.com/fixture/http-practice/blob/main/src/main.py"],
+                code_verified=True,
+                code_paths=["src/main.py"],
+                code_evidence=["https://github.com/fixture/http-practice/blob/main/src/main.py"],
+            )
         ],
     )
     router = WorkflowRouter()

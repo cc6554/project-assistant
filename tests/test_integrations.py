@@ -136,6 +136,204 @@ def test_read_github_file_directory_and_readme_use_api_auth(tmp_path: Path, monk
     assert session_type.instances[2].calls[0][0].endswith("/repos/owner/private/readme")
 
 
+def test_github_identity_and_private_repository_listing_are_scoped_and_paginated(
+    tmp_path: Path, monkeypatch
+):
+    integrations.save_github_token(tmp_path, "ghp-current-token")
+    identity_payload = {"login": "owner", "id": 17, "name": "Owner"}
+    repositories_payload = [
+        {
+            "full_name": "owner/private-one",
+            "name": "private-one",
+            "private": True,
+            "visibility": "private",
+            "default_branch": "main",
+            "html_url": "https://github.com/owner/private-one",
+        },
+        # The API should not return this for /user/repos, but the projection
+        # still filters it so a malformed upstream response cannot cross the
+        # requested username boundary.
+        {"full_name": "someone-else/private", "private": True},
+    ]
+    session_type = _patch_session(
+        monkeypatch,
+        _Response(200, identity_payload),
+        _Response(200, identity_payload),
+        _Response(200, repositories_payload),
+    )
+
+    identity = integrations.github_identity(tmp_path)
+    assert identity["identity"] == {"login": "owner", "id": 17, "name": "Owner"}
+    assert "ghp-current-token" not in json.dumps(identity, ensure_ascii=False)
+
+    listed = integrations.list_github_repositories(
+        tmp_path, username="owner", per_page=2
+    )
+    assert listed["source"] == "authenticated_user"
+    assert listed["private_available"] is True
+    assert listed["authenticated_login"] == "owner"
+    assert "Token 可访问" in listed["note"]
+    assert "全部私有仓库" in listed["note"]
+    assert [row["full_name"] for row in listed["repositories"]] == ["owner/private-one"]
+    assert listed["next_page"] == 2
+    assert session_type.instances[2].headers["Authorization"] == "Bearer ghp-current-token"
+    assert session_type.instances[2].calls[0][0].endswith("/user/repos")
+    assert session_type.instances[2].calls[0][1]["params"]["affiliation"] == "owner"
+
+
+def test_github_repository_listing_other_username_never_uses_private_user_endpoint(
+    tmp_path: Path, monkeypatch
+):
+    integrations.save_github_token(tmp_path, "ghp-current-token")
+    session_type = _patch_session(
+        monkeypatch,
+        _Response(200, {"login": "owner", "id": 17}),
+        _Response(
+            200,
+            [
+                {"full_name": "other/public", "private": False},
+                {"full_name": "owner/private", "private": True},
+            ],
+        ),
+    )
+
+    listed = integrations.list_github_repositories(
+        tmp_path, username="other", per_page=2
+    )
+    assert listed["source"] == "public_user"
+    assert listed["private_available"] is False
+    assert "仅返回公开仓库" in listed["note"]
+    assert "不能据此判断" in listed["note"]
+    assert [row["full_name"] for row in listed["repositories"]] == ["other/public"]
+    assert session_type.instances[1].calls[0][0].endswith("/users/other/repos")
+
+
+def test_github_profile_url_parser_and_fetch_route_use_api(monkeypatch, tmp_path: Path):
+    assert integrations.parse_github_user_url(
+        "https://github.com/cc6554?tab=repositories"
+    ) == "cc6554"
+    assert integrations.parse_github_user_url(
+        "https://github.com/cc6554?access_token=should-not-echo"
+    ) is None
+    assert integrations.parse_github_user_url("https://github.com/settings") is None
+    assert integrations.parse_github_user_url("https://github.com:444/cc6554") is None
+    assert integrations.parse_github_user_url("https://github.com/owner/repo") is None
+
+    registry = ToolRegistry()
+    register_builtin_tools(registry)
+    context = ToolContext(
+        workspace=tmp_path,
+        session=AgentSession(workspace=str(tmp_path)),
+        router=None,
+    )
+    seen = {}
+
+    def fake_list(workspace, **kwargs):
+        seen.update({"workspace": workspace, **kwargs})
+        return {"ok": True, "kind": "repositories", "repositories": []}
+
+    monkeypatch.setattr(integrations, "list_github_repositories", fake_list)
+    result = registry.get("fetch_url").handler(
+        {"url": "https://github.com/cc6554?tab=repositories"}, context
+    )
+    payload = json.loads(result.content)
+    assert payload["kind"] == "repositories"
+    assert seen == {"workspace": tmp_path, "username": "cc6554"}
+
+
+def test_legacy_github_repository_list_api_urls_use_bounded_list_tool(
+    monkeypatch, tmp_path: Path
+):
+    assert integrations.parse_github_repository_list_url(
+        "https://api.github.com/user/repos?page=2&per_page=100"
+    ) == (None, 2, 100)
+    assert integrations.parse_github_repository_list_url(
+        "https://api.github.com/users/cc6554/repos?per_page=50"
+    ) == ("cc6554", 1, 50)
+    assert integrations.parse_github_repository_list_url(
+        "https://api.github.com/repos/owner/repo"
+    ) is None
+    with pytest.raises(integrations.IntegrationError, match="只允许"):
+        integrations.parse_github_repository_list_url(
+            "https://api.github.com/user/repos?affiliation=owner"
+        )
+    with pytest.raises(integrations.IntegrationError, match="凭据"):
+        integrations.parse_github_repository_list_url(
+            "https://api.github.com/user/repos?access_token=should-not-be-used"
+        )
+
+    registry = ToolRegistry()
+    register_builtin_tools(registry)
+    context = ToolContext(
+        workspace=tmp_path,
+        session=AgentSession(workspace=str(tmp_path)),
+        router=None,
+    )
+    seen = {}
+
+    def fake_list(workspace, **kwargs):
+        seen.update({"workspace": workspace, **kwargs})
+        return {
+            "ok": True,
+            "kind": "repositories",
+            "repositories": [],
+            "next_page": None,
+        }
+
+    monkeypatch.setattr(integrations, "list_github_repositories", fake_list)
+    result = registry.get("fetch_url").handler(
+        {
+            "url": "https://api.github.com/users/cc6554/repos?page=2&per_page=50"
+        },
+        context,
+    )
+    payload = json.loads(result.content)
+    assert payload["kind"] == "repositories"
+    assert seen == {
+        "workspace": tmp_path,
+        "username": "cc6554",
+        "page": 2,
+        "per_page": 50,
+        "timeout": 15.0,
+    }
+
+    with pytest.raises(ValueError, match="只允许"):
+        registry.get("fetch_url").handler(
+            {"url": "https://api.github.com/user/repos?direction=desc"},
+            context,
+        )
+
+
+def test_github_token_is_loaded_for_each_operation_after_workspace_rotation(
+    tmp_path: Path, monkeypatch
+):
+    first_payload = {
+        "type": "file",
+        "path": "README.md",
+        "size": 5,
+        "encoding": "base64",
+        "content": base64.b64encode(b"first").decode(),
+    }
+    second_payload = {
+        "type": "file",
+        "path": "README.md",
+        "size": 6,
+        "encoding": "base64",
+        "content": base64.b64encode(b"second").decode(),
+    }
+    session_type = _patch_session(
+        monkeypatch,
+        _Response(200, first_payload),
+        _Response(200, second_payload),
+    )
+    integrations.save_github_token(tmp_path, "ghp-first-token")
+    assert integrations.read_github(tmp_path, "README.md", repository="owner/repo")["content"] == "first"
+    integrations.save_github_token(tmp_path, "ghp-second-token")
+    assert integrations.read_github(tmp_path, "README.md", repository="owner/repo")["content"] == "second"
+    assert session_type.instances[0].headers["Authorization"] == "Bearer ghp-first-token"
+    assert session_type.instances[1].headers["Authorization"] == "Bearer ghp-second-token"
+
+
 def test_read_github_rejects_sensitive_path_and_cross_domain_redirect(tmp_path: Path, monkeypatch):
     integrations.save_github_token(tmp_path, "ghp-private-token")
     with pytest.raises(integrations.IntegrationError, match="敏感"):
@@ -187,7 +385,7 @@ def test_bootstrap_registers_search_jobs_with_integrations():
     from agent_coach.bootstrap import build_registry
 
     names = {spec.name for spec in build_registry().specs([])}
-    assert {"read_github", "search_jobs"}.issubset(names)
+    assert {"github_identity", "list_github_repositories", "read_github", "search_jobs"}.issubset(names)
 
 
 def test_fetch_url_delegates_github_file_to_api(monkeypatch, tmp_path: Path):

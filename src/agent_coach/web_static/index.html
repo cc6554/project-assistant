@@ -96,7 +96,7 @@
         </div>
 
         <section class="workflow-page hidden" id="workflowPage" aria-label="求职步骤页面">
-          <header class="workflow-page-heading"><div><h2 id="workflowPageTitle"></h2><p id="workflowPageHint"></p></div><button class="action-button secondary" type="button" id="backToChat">返回对话 / 查看回复</button></header>
+          <header class="workflow-page-heading"><div><h2 id="workflowPageTitle"></h2><p id="workflowPageHint"></p></div><button class="action-button secondary" type="button" id="backToChat" aria-haspopup="dialog" aria-controls="workflowChatBackdrop">打开对话</button></header>
           <div id="workflowPageStatus" role="status"></div>
           <div class="step-page hidden" id="jdPage"><div id="jdPageImport"></div><div id="jdPageResults" class="page-results"></div></div>
           <div class="step-page hidden" id="profilePage">
@@ -110,9 +110,18 @@
               <div class="workflow-actions"><button class="action-button primary" type="submit" id="profileImportSubmit">整理并更新技能档案</button><button class="action-button secondary" type="button" id="profileManual">手动编辑档案</button><button class="action-button secondary" type="button" id="profileCopy">复制档案到新会话</button></div><p id="profileImportStatus" role="status"></p>
             </form><div id="profilePageResults" class="page-results"></div>
           </div>
-          <div class="step-page hidden" id="planPage"><p class="workflow-prerequisite hidden" id="planPrerequisite" role="status"></p><form id="planPageForm" class="page-form"><h3>项目搜索偏好</h3><div class="page-form-grid"><div><label for="planInclude">包含关键词</label><input type="text" id="planInclude" placeholder="例如 DDPG；多个词用逗号分隔"></div><div><label for="planExclude">排除关键词</label><input type="text" id="planExclude" placeholder="例如 Isaac；只影响当前会话"></div><div><label for="planMinStars">GitHub 最低 star 数</label><input type="number" min="0" step="1" value="50" id="planMinStars"></div></div><label class="page-checkbox"><input type="checkbox" id="planRerank" checked> 使用 AI 教练比较项目（更贴合你的差距）</label><button type="submit" class="action-button primary" id="planGenerate">生成差距分析、学习计划和复现项目</button><p id="planPageStatus" role="status"></p></form><div id="planPageResults" class="page-results"></div></div>
-          <div class="step-page hidden" id="practicePage"><p class="workflow-prerequisite hidden" id="practicePrerequisite" role="status"></p><div class="practice-context"><div id="practicePageResults"></div><div class="workflow-actions"><button type="button" class="action-button secondary" id="practiceStarter">开始今天的实操</button><button type="button" class="action-button secondary" id="practiceFiles">工作区文件</button></div></div><div id="practiceChatHost"></div></div>
+          <div class="step-page hidden" id="planPage"><p class="workflow-prerequisite hidden" id="planPrerequisite" role="status"></p><form id="planPageForm" class="page-form"><h3>项目搜索偏好</h3><div class="page-form-grid"><div><label for="planInclude">包含关键词</label><input type="text" id="planInclude" placeholder="例如 DDPG；多个词用逗号分隔"></div><div><label for="planExclude">排除关键词</label><input type="text" id="planExclude" placeholder="例如 Isaac；只影响当前会话"></div><div><label for="planMinStars">GitHub 最低 star 数</label><input type="number" min="0" step="1" value="50" id="planMinStars"></div></div><div class="page-form-field"><label for="planOther">其他要求</label><textarea id="planOther" rows="3" placeholder="例如：优先轻量、文档完整、能在 Windows 本地复现的项目"></textarea><div class="plan-other-actions"><button type="button" class="action-button secondary" id="planOtherDiscuss">和教练讨论筛选要求</button></div><p class="page-form-hint">会保存到当前会话，并在后续项目搜索与计划调整中继续提供给教练。</p></div><label class="page-checkbox"><input type="checkbox" id="planRerank" checked> 使用 AI 教练比较项目（更贴合你的差距）</label><label class="page-checkbox"><input type="checkbox" id="planPaperProjects" checked> 查找相关高影响力论文的开源实现</label><p class="page-form-hint">核对论文来源、代码关联及影响力依据；不足时标为待核实。</p><section class="plan-project-source" id="planProjectSource" aria-labelledby="planProjectSourceTitle"><div class="plan-project-source-heading"><div><h3 id="planProjectSourceTitle">我的复现项目（可选）</h3><p>提供项目链接，或附上代码与说明材料，供教练阅读和评估；不会自动执行代码。</p></div></div><label for="planProjectUrl">项目 URL</label><input type="url" id="planProjectUrl" inputmode="url" placeholder="例如 https://github.com/owner/repo 或论文实现链接"><div class="plan-project-resource-actions"><input type="file" id="planProjectFileInput" class="sr-only" multiple aria-label="上传复现项目文件"><button type="button" class="action-button secondary" id="planProjectUpload">上传项目文件</button><button type="button" class="action-button secondary" id="planProjectLocalImport">导入本地文件 / 文件夹</button></div><p class="page-form-hint">支持添加代码和说明材料；导入后会显示工作区相对路径。</p><div id="planProjectResourceList" class="plan-project-resource-list" aria-live="polite"></div><div class="plan-project-source-submit"><button type="button" class="action-button secondary" id="planProjectRegister">评估并加入项目候选</button></div></section><button type="submit" class="action-button primary" id="planGenerate">生成差距分析、学习计划和复现项目</button><p id="planPageStatus" role="status"></p></form><div id="planPageResults" class="page-results"></div></div>
+          <div class="step-page hidden" id="practicePage"><p class="workflow-prerequisite hidden" id="practicePrerequisite" role="status"></p><div class="practice-context"><div id="practicePageResults"></div><div class="workflow-actions"><button type="button" class="action-button secondary" id="practiceStarter">开始今天的实操</button><button type="button" class="action-button secondary" id="practiceFiles">工作区文件</button></div></div></div>
         </section>
+        <div class="modal-backdrop hidden workflow-chat-backdrop" id="workflowChatBackdrop" aria-hidden="true">
+          <section class="workflow-chat-modal" role="dialog" aria-modal="true" aria-labelledby="workflowChatTitle">
+            <header class="modal-header workflow-chat-header">
+              <div><span class="inspect-kicker">当前会话</span><h2 id="workflowChatTitle">求职辅导对话</h2></div>
+              <button class="icon-button" type="button" id="workflowChatClose" aria-label="关闭对话窗口"><span data-icon="close" aria-hidden="true"></span></button>
+            </header>
+            <div id="practiceChatHost" class="workflow-chat-host"></div>
+          </section>
+        </div>
         <div class="content-grid" id="chatHome">
           <main class="chat-column" aria-label="求职辅导对话">
             <div class="chat-scroll" id="chatScroll">
@@ -130,6 +139,10 @@
               <details class="activity-panel hidden" id="activityPanel">
                 <summary class="activity-heading"><span class="activity-pulse"></span><span>运行记录</span><span class="activity-live" id="activityStatus">处理中</span></summary>
                 <div class="activity-list" id="activityList"></div>
+                <section class="command-runtime hidden" id="commandRuntime" aria-live="polite" aria-label="命令执行状态">
+                  <div class="command-runtime-heading"><span>命令执行</span><span class="command-runtime-status" id="commandRuntimeStatus">等待命令</span></div>
+                  <div class="command-runtime-list" id="commandRuntimeList"></div>
+                </section>
               </details>
               <div class="busy-bar hidden" id="busyBar"><span class="spinner"></span><span id="busyText">正在处理…</span></div>
               <section class="approval-region" id="approvalRegion" aria-live="assertive"></section>
@@ -275,6 +288,31 @@
       </section>
     </div>
 
+    <div class="modal-backdrop hidden" id="clarificationBackdrop">
+      <section class="clarification-modal" role="dialog" aria-modal="true" aria-labelledby="clarificationTitle" aria-describedby="clarificationDescription">
+        <header class="modal-header">
+          <div><span class="inspect-kicker">技能档案</span><h2 id="clarificationTitle">回答待澄清问题</h2></div>
+          <button class="icon-button" type="button" id="clarificationClose" aria-label="关闭待澄清回答"><span data-icon="close" aria-hidden="true"></span></button>
+        </header>
+        <form class="clarification-form" id="clarificationForm" novalidate>
+          <p class="job-edit-hint" id="clarificationDescription">只填写与问题相关的事实、项目、日志或材料路径。回答与结果会保存到当前会话。</p>
+          <div class="clarification-question-box" aria-live="polite"><span class="clarification-question-label">问题</span><p id="clarificationQuestion"></p></div>
+          <label class="clarification-answer-label" for="clarificationAnswer">你的事实回答</label>
+          <textarea id="clarificationAnswer" rows="6" placeholder="例如：在哪个项目中使用、负责什么、结果如何；不确定的内容可以说明不知道。" autocomplete="off"></textarea>
+          <p class="clarification-feedback hidden" id="clarificationFeedback" role="status" aria-live="polite"></p>
+          <p class="clarification-status-message" id="clarificationStatus" role="status" aria-live="polite"></p>
+          <div class="clarification-actions">
+              <button class="action-button secondary hidden" type="button" id="clarificationRecovery">打开对话处理当前操作</button>
+            <span></span>
+            <div class="model-settings-actions-right">
+              <button class="action-button secondary" type="button" id="clarificationCancel">关闭</button>
+              <button class="action-button primary" type="submit" id="clarificationSend">发送回答</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+
 
     <div class="modal-backdrop hidden" id="jdImportBackdrop">
       <section class="jd-import-modal" aria-labelledby="jdImportTitle">
@@ -332,7 +370,7 @@
           <button class="icon-button" type="button" id="localImportClose" aria-label="关闭本地路径导入"><span data-icon="close" aria-hidden="true"></span></button>
         </header>
         <form class="local-import-form" id="localImportForm" novalidate>
-          <p class="job-edit-hint">输入本机简历、笔记或资料目录的完整路径。支持 PDF、Office、图片和文本等可读取资料；敏感路径、超限文件和不支持的二进制会跳过。上限：最多 1000 个文件、单文件 2 MiB、总计 20 MiB。导入后会放入当前消息，发送后读取。</p>
+          <p class="job-edit-hint" id="localImportHint">输入本机简历、笔记或资料目录的完整路径。支持 PDF、Office、图片和文本等可读取资料；敏感路径、超限文件和不支持的二进制会跳过。上限：最多 1000 个文件、单文件 2 MiB、总计 20 MiB。导入后会放入当前消息，发送后读取。</p>
           <label for="localImportPath">本地路径</label>
           <input id="localImportPath" type="text" autocomplete="off" placeholder="例如 D:\\简历.pdf 或 /home/user/Documents/resume.pdf" required />
           <div class="model-settings-status" id="localImportStatus" role="status" aria-live="polite"></div>

@@ -13,6 +13,9 @@
   const API_ROOT = "/api";
   const MODEL_SETTINGS_PATH = "/settings/models";
   const UI_SETTINGS_PATH = "/settings/ui";
+  const PRACTICE_WINDOW_VIEW = "practice";
+  const PRACTICE_WINDOW_NAME = "agent-coach-practice";
+  const PRACTICE_WINDOW_FEATURES = "popup=yes,resizable=yes,scrollbars=yes,width=1160,height=860,left=80,top=60";
 
   const ICONS = {
     plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
@@ -52,14 +55,27 @@
     selectedStep: "jd",
     sidebarCollapsed: false,
     sidebarOpen: false,
+    inspectorCollapsed: false,
     filePath: ".",
     fileEntries: [],
     fileLoading: false,
     fileError: "",
     jobs: new Map(),
     followUpJobs: new Map(),
+    commandRuntime: {
+      sessionId: "",
+      scopeKey: "",
+      items: [],
+      error: "",
+      refreshTimer: null,
+      refreshInFlight: false,
+      stopping: new Set(),
+      completionJobs: new Map(),
+      settled: new Set()
+    },
     pollTimer: null,
     pollTarget: null,
+    pollInFlight: null,
     optimisticMessage: null,
     uploadedAttachment: null,
     uploadedAttachments: [],
@@ -77,14 +93,78 @@
       open: false,
       kind: "",
       value: null,
+      sessionId: "",
+      busy: false,
+      serial: 0,
       previousFocus: null
     },
     jdImport: { open: false, opening: false, busy: false, sessionId: "", drafts: new Map(), previousFocus: null },
+    clarification: {
+      open: false,
+      busy: false,
+      sessionId: "",
+      question: "",
+      questionKey: "",
+      answer: "",
+      completed: false,
+      status: "",
+      statusKind: "",
+      feedback: "",
+      previousFocus: null,
+      serial: 0,
+      drafts: new Map(),
+      jobs: new Map()
+    },
+    workflowChat: {
+      open: false,
+      // The workflow modal reuses the chat DOM so approvals/recovery keep the
+      // same session semantics.  ``scope`` controls which durable transcript
+      // is rendered while the modal is open; the home chat always uses main.
+      scope: "main",
+      practiceProjectKey: "",
+      // Composer drafts are keyed by session, scope, and (for practice) the
+      // exact project.  A shared chat DOM must not make an unsent A turn appear
+      // in B's practice window after a project or session switch.
+      drafts: new Map(),
+      draftAttachments: new Map(),
+      previousFocus: null
+    },
+    practice: {
+      optimisticMessage: null,
+      sessionId: "",
+      projectKey: "",
+      projectTitle: "",
+      threadId: "",
+      messages: [],
+      events: [],
+      loaded: false,
+      loading: false,
+      error: "",
+      startPending: false,
+      viewSerial: 0
+    },
+    practiceWindow: {
+      standalone: false,
+      sessionId: "",
+      projectKey: "",
+      startRequested: false,
+      startConsumed: false,
+      child: null,
+      children: new Map(),
+      launchPending: false,
+      stale: false,
+      error: "",
+      refreshTimer: null,
+      refreshInFlight: false
+    },
+    pendingWorkflowAction: null,
     newSession: {
       open: false,
       busy: false,
       previousFocus: null
     },
+    localImportTarget: "composer",
+    localImportSessionId: "new",
     github: {
       hasToken: false,
       busy: false
@@ -93,6 +173,7 @@
     lastResultSeen: new Map(),
     dismissTokenNotice: false,
     loadingSession: false,
+    mainReturnRefreshInFlight: false,
     sessionRequestSerial: 0,
     modelSettings: {
       open: false,
@@ -270,6 +351,151 @@
     window.location.reload();
   }
 
+  function readPracticeWindowParams() {
+    let params = null;
+    try { params = new URLSearchParams(window.location.search || ""); } catch (_error) { params = null; }
+    const view = String(params?.get("view") || "").trim().toLowerCase();
+    if (view !== PRACTICE_WINDOW_VIEW) return { standalone: false, sessionId: "", projectKey: "", start: false };
+    return {
+      standalone: true,
+      sessionId: String(params?.get("session_id") || "").trim(),
+      projectKey: String(params?.get("project_key") || "").trim(),
+      start: ["1", "true", "yes"].includes(String(params?.get("start") || "").trim().toLowerCase())
+    };
+  }
+
+  function applyPracticeWindowChrome() {
+    if (!state.practiceWindow.standalone) return;
+    document.documentElement.dataset.windowView = PRACTICE_WINDOW_VIEW;
+    document.body.classList.add("practice-window");
+    setText($("modeBreadcrumb"), "Agent 实操");
+    setText($("currentTitle"), state.practiceWindow.projectKey ? `实操 · ${state.practiceWindow.projectKey}` : "Agent 实操");
+  }
+
+  function practiceWindowUrl(sessionId, projectKey, start = false) {
+    const id = String(sessionId || "").trim();
+    const key = String(projectKey || "").trim();
+    if (!id || !key) return "";
+    try {
+      const target = new URL(window.location.href);
+      // Preserve the server path but scrub any legacy credential query keys
+      // before constructing a child URL. New credentials always stay in the
+      // fragment below.
+      for (const keyName of Array.from(target.searchParams.keys())) {
+        if (/^(?:token|api[_-]?key|access[_-]?token|authorization|secret|password)$/i.test(keyName)) target.searchParams.delete(keyName);
+      }
+      target.searchParams.set("view", PRACTICE_WINDOW_VIEW);
+      target.searchParams.set("session_id", id);
+      target.searchParams.set("project_key", key);
+      if (start) target.searchParams.set("start", "1");
+      else target.searchParams.delete("start");
+      // API authorization remains in the fragment. Never put it in a query
+      // string, where browser history, referrers, and native window logs can
+      // expose it.
+      target.hash = state.token ? `#token=${encodeURIComponent(state.token)}` : "";
+      return target.href;
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function focusPracticeWindow(child) {
+    try { if (child && typeof child.focus === "function") child.focus(); } catch (_error) { /* optional */ }
+  }
+
+  function practiceBrowserWindowKey(sessionId, projectKey) {
+    return String(sessionId || "").trim() + "\u0000" + String(projectKey || "").trim();
+  }
+
+  function practiceBrowserWindowName(sessionId, projectKey) {
+    // A bounded deterministic name lets the browser reuse one popup per
+    // session/project without navigating an existing popup and losing its
+    // independent draft.
+    const value = practiceBrowserWindowKey(sessionId, projectKey);
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return PRACTICE_WINDOW_NAME + "-" + (hash >>> 0).toString(36);
+  }
+
+  function openPracticeWindow(sessionId, projectKey, start = false) {
+    if (state.practiceWindow.standalone) return false;
+    const id = String(sessionId || "").trim();
+    const key = String(projectKey || "").trim();
+    const url = practiceWindowUrl(id, key, start);
+    if (!url) return false;
+    const browserKey = practiceBrowserWindowKey(id, key);
+    const existing = state.practiceWindow.children.get(browserKey);
+    if (existing && !existing.closed) {
+      state.practiceWindow.child = existing;
+      focusPracticeWindow(existing);
+      return true;
+    }
+    if (existing && existing.closed) state.practiceWindow.children.delete(browserKey);
+
+    // pywebview exposes a small native bridge from packaged_launcher.py. It
+    // creates a real sibling window with native minimize/maximize controls,
+    // while keeping this page's WebView and backend session untouched.
+    const nativeApi = window.pywebview && window.pywebview.api;
+    const nativeOpen = nativeApi && nativeApi.open_practice_window;
+    if (typeof nativeOpen === "function") {
+      try {
+        const result = nativeOpen.call(nativeApi, url);
+        if (result && typeof result.then === "function") {
+          state.practiceWindow.launchPending = true;
+          result.then((payload) => {
+            state.practiceWindow.launchPending = false;
+            if (payload && payload.opened === false) openPracticeBrowserWindow(url, id, key);
+          }).catch(() => {
+            state.practiceWindow.launchPending = false;
+            openPracticeBrowserWindow(url, id, key);
+          });
+          return true;
+        }
+        state.practiceWindow.launchPending = false;
+        if (result !== false) return true;
+      } catch (_error) {
+        // A browser-backed dev run may expose a stale pywebview object. Use the
+        // ordinary same-origin popup path below instead of trapping the user.
+      }
+    }
+    return openPracticeBrowserWindow(url, id, key);
+  }
+
+  function openPracticeBrowserWindow(url, sessionId, projectKey) {
+    if (!url || typeof window.open !== "function") return false;
+    try {
+      const key = practiceBrowserWindowKey(sessionId, projectKey);
+      const existing = state.practiceWindow.children.get(key);
+      if (existing && !existing.closed) {
+        state.practiceWindow.child = existing;
+        focusPracticeWindow(existing);
+        return true;
+      }
+      const child = window.open(url, practiceBrowserWindowName(sessionId, projectKey), PRACTICE_WINDOW_FEATURES);
+      if (!child) return false;
+      state.practiceWindow.child = child;
+      state.practiceWindow.children.set(key, child);
+      focusPracticeWindow(child);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function requestPracticeWindowClose() {
+    const nativeApi = window.pywebview && window.pywebview.api;
+    const nativeClose = nativeApi && nativeApi.close_practice_window;
+    if (typeof nativeClose === "function") {
+      try { nativeClose.call(nativeApi, state.practiceWindow.sessionId, state.practiceWindow.projectKey); } catch (_error) { /* browser fallback below */ }
+    }
+    try {
+      if (window.opener || String(window.name || "").startsWith(PRACTICE_WINDOW_NAME + "-")) window.close();
+    } catch (_error) { /* optional */ }
+  }
+
   async function request(path, options = {}) {
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
@@ -321,12 +547,23 @@
     return Boolean(session.busy || state.jobs.has(String(session.id)));
   }
 
+  function sessionHasQueue(session) {
+    if (!session) return false;
+    return Number(session.queued_calls || 0) > 0;
+  }
+
+  function sessionTurnBlocked(session) {
+    return Boolean(sessionBusy(session) || sessionHasQueue(session));
+  }
+
   function currentJob() {
     return state.currentSessionId ? state.jobs.get(String(state.currentSessionId)) || null : null;
   }
 
   function persistCurrentSession() {
-    if (!state.currentSessionId) return;
+    // A child window is pinned by its URL. Do not overwrite the parent's
+    // shared last-session preference while it opens that pinned session.
+    if (!state.currentSessionId || state.practiceWindow.standalone) return;
     try { window.localStorage.setItem(SESSION_STORAGE_KEY, String(state.currentSessionId)); } catch (_error) { /* optional */ }
   }
 
@@ -575,7 +812,11 @@
     state.lastResultSeen.set(String(id), signature);
     const message = String(result.message || result.error || "").trim();
     if (!message) return;
-    toast(message, String(result.status || "").toLowerCase() === "failed" ? "error" : "success");
+    // Successful model replies are rendered in the transcript. Showing the
+    // whole reply again in a green toast makes long answers cover the page.
+    // Keep the toast for failures because the failed state can be discovered
+    // from a later session refresh without a visible transcript entry.
+    if (["failed", "error"].includes(String(result.status || "").toLowerCase())) toast(message, "error");
   }
 
   function sessionTitle(session) {
@@ -594,6 +835,209 @@
 
   function visibleMessages(session) {
     return ((session && session.messages) || []).filter((message) => message && message.role !== "system");
+  }
+
+  // Practice turns are persisted by the service with an explicit metadata
+  // envelope.  Main and legacy messages have no practice metadata and must
+  // never be inferred into the project window after a reload or switch.
+  function messageScope(message) {
+    if (!message || typeof message !== "object") return "main";
+    const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+    return metadata.scope === "practice" ? "practice" : "main";
+  }
+
+  function messageProjectKey(message) {
+    if (!message || typeof message !== "object") return "";
+    const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+    return String(metadata.project_key || "").trim();
+  }
+
+  function messagePracticeThreadId(message) {
+    if (!message || typeof message !== "object") return "";
+    const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+    return String(metadata.practice_thread_id || "").trim();
+  }
+
+  // Events are also projected with their canonical scope fields at the top
+  // level. Accept the nested envelope emitted by the current service and the
+  // exact projection used by session snapshots, while keeping message
+  // attribution metadata-only and fail-closed.
+  function eventScope(event) {
+    if (!event || typeof event !== "object") return "main";
+    const metadata = event.metadata && typeof event.metadata === "object" ? event.metadata : {};
+    return metadata.scope === "practice" || event.scope === "practice" ? "practice" : "main";
+  }
+
+  function eventProjectKey(event) {
+    if (!event || typeof event !== "object") return "";
+    const metadata = event.metadata && typeof event.metadata === "object" ? event.metadata : {};
+    return String(metadata.project_key || event.project_key || "").trim();
+  }
+
+  function eventPracticeThreadId(event) {
+    if (!event || typeof event !== "object") return "";
+    const metadata = event.metadata && typeof event.metadata === "object" ? event.metadata : {};
+    return String(metadata.practice_thread_id || event.practice_thread_id || "").trim();
+  }
+
+  function selectedProjectKey(data = workflowData()) {
+    return projectIdentity(data && data.selected_project);
+  }
+
+  function practiceWindowSelectionMatches() {
+    if (!state.practiceWindow.standalone) return true;
+    const expected = String(state.practiceWindow.projectKey || "").trim();
+    const actual = selectedProjectKey();
+    return Boolean(expected && actual && expected === actual);
+  }
+
+  function markPracticeWindowStale() {
+    if (!state.practiceWindow.standalone || !state.practiceWindow.projectKey) return false;
+    const stale = !practiceWindowSelectionMatches();
+    if (state.practiceWindow.stale !== stale) {
+      state.practiceWindow.stale = stale;
+      if (!stale) state.practiceWindow.error = "";
+      if (state.workflowChat.open && state.workflowChat.scope === "practice") renderAll();
+    }
+    return stale;
+  }
+
+  function practiceMessages(session, projectKey = "", threadId = state.practice.threadId) {
+    const key = String(projectKey || "").trim();
+    const thread = String(threadId || "").trim();
+    // A practice window is intentionally fail-closed.  There is no safe way
+    // to attribute an unkeyed legacy turn to the current project or thread.
+    if (!key || !thread) return [];
+    const currentId = String(session && session.id || "");
+    const source = state.practice.loaded && state.practice.sessionId === currentId && state.practice.threadId === thread
+      ? state.practice.messages
+      : visibleMessages(session);
+    return source.filter((message) => {
+      if (!message || typeof message !== "object") return false;
+      return messageScope(message) === "practice"
+        && messageProjectKey(message) === key
+        && messagePracticeThreadId(message) === thread;
+    });
+  }
+
+  function chatMessages(session) {
+    if (state.workflowChat.open && state.workflowChat.scope === "practice") {
+      return practiceMessages(session, state.workflowChat.practiceProjectKey || selectedProjectKey(), state.practice.threadId);
+    }
+    return visibleMessages(session).filter((message) => messageScope(message) !== "practice");
+  }
+
+  function practiceHasMessages(session = state.currentSession, projectKey = state.workflowChat.practiceProjectKey || selectedProjectKey(), threadId = state.practice.threadId) {
+    return practiceMessages(session, projectKey, threadId).length > 0;
+  }
+
+  function practiceThreadEntries(session = state.currentSession) {
+    const raw = session && session.practice_threads;
+    return Array.isArray(raw) ? raw.filter((item) => item && typeof item === "object") : [];
+  }
+
+  function practiceThreadFor(session, projectKey) {
+    const key = String(projectKey || "").trim();
+    if (!key) return null;
+    if (state.practice.sessionId === String(session && session.id || "") && state.practice.projectKey === key && state.practice.threadId) {
+      return { id: state.practice.threadId, project_key: key };
+    }
+    const filter = session && session.practice_filter && typeof session.practice_filter === "object" ? session.practice_filter : {};
+    const filteredKey = String(filter.project_key || "").trim();
+    const filteredId = String(filter.practice_thread_id || "").trim();
+    if (filteredKey === key && filteredId) return { id: filteredId, project_key: key, project: filter.project || null };
+    return practiceThreadEntries(session).find((item) => String(item.project_key || "").trim() === key && String(item.id || "").trim()) || null;
+  }
+
+  function practiceThreadMessages(payload) {
+    if (payload && Array.isArray(payload.messages)) return payload.messages;
+    return [];
+  }
+
+  function practiceThreadEvents(payload) {
+    return payload && Array.isArray(payload.events) ? payload.events : [];
+  }
+
+  function scopedPracticeEvent(event, projectKey, threadId) {
+    return event && typeof event === "object"
+      && eventScope(event) === "practice"
+      && eventProjectKey(event) === String(projectKey || "").trim()
+      && eventPracticeThreadId(event) === String(threadId || "").trim();
+  }
+
+  function practiceScopeChangedError() {
+    const error = new Error("实操窗口已切换");
+    error.practiceScopeChanged = true;
+    return error;
+  }
+
+  function practiceContextMatches(sessionId, projectKey, threadId = "", viewSerial = null) {
+    const id = String(sessionId || "");
+    const key = String(projectKey || "").trim();
+    const thread = String(threadId || "").trim();
+    if (!id || String(state.currentSessionId || "") !== id || String(state.practice.sessionId || "") !== id || state.practice.projectKey !== key) return false;
+    if (thread && state.practice.threadId !== thread) return false;
+    if (viewSerial !== null && (state.practice.viewSerial !== viewSerial || !state.workflowChat.open || state.workflowChat.scope !== "practice" || state.workflowChat.practiceProjectKey !== key)) return false;
+    return true;
+  }
+
+  async function ensurePracticeThread(sessionId, projectKey, viewSerial = null) {
+    const id = String(sessionId || "");
+    const key = String(projectKey || "").trim();
+    if (!id || !key) throw new ApiError("当前会话没有选定练习项目。");
+    if (viewSerial !== null && !practiceContextMatches(id, key, "", viewSerial)) throw practiceScopeChangedError();
+    const existing = practiceThreadFor(state.currentSession, key);
+    if (existing) {
+      if (viewSerial !== null && !practiceContextMatches(id, key, "", viewSerial)) throw practiceScopeChangedError();
+      state.practice.threadId = String(existing.id || "").trim();
+      state.practice.projectKey = key;
+      state.practice.loaded = false;
+      state.practice.messages = [];
+      state.practice.events = [];
+      return state.practice.threadId;
+    }
+    const payload = await request(`/sessions/${encodeURIComponent(id)}/practice`, { method: "POST", body: { project_key: key } });
+    const threadId = String(payload && payload.practice_thread_id || "").trim();
+    const returnedKey = String(payload && payload.project_key || "").trim();
+    if (!threadId || returnedKey !== key) throw new ApiError("服务没有返回当前项目的实操窗口。");
+    if (viewSerial !== null && !practiceContextMatches(id, key, "", viewSerial)) throw practiceScopeChangedError();
+    state.practice.threadId = threadId;
+    state.practice.projectKey = returnedKey;
+    state.practice.loaded = false;
+    state.practice.messages = [];
+    state.practice.events = [];
+    return threadId;
+  }
+
+  async function refreshPracticeThread(sessionId = state.currentSessionId, threadId = state.practice.threadId, viewSerial = null) {
+    const id = String(sessionId || "");
+    const thread = String(threadId || "").trim();
+    const key = String(state.practice.projectKey || state.workflowChat.practiceProjectKey || selectedProjectKey()).trim();
+    if (!id || !thread || !key) return [];
+    if (viewSerial !== null && !practiceContextMatches(id, key, thread, viewSerial)) throw practiceScopeChangedError();
+    state.practice.loading = true;
+    state.practice.error = "";
+    try {
+      const payload = await request(`/sessions/${encodeURIComponent(id)}/practice/${encodeURIComponent(thread)}`);
+      if (!practiceContextMatches(id, key, thread, viewSerial)) return [];
+      state.practice.messages = practiceThreadMessages(payload).filter((message) => messageScope(message) === "practice" && messageProjectKey(message) === key && messagePracticeThreadId(message) === thread);
+      state.practice.events = practiceThreadEvents(payload).filter((event) => scopedPracticeEvent(event, key, thread));
+      state.practice.loaded = true;
+      return state.practice.messages;
+    } catch (error) {
+      if (practiceContextMatches(id, key, thread, viewSerial)) {
+        state.practice.loaded = true;
+        state.practice.error = error.message || "读取实操记录失败";
+        state.practice.messages = [];
+        state.practice.events = [];
+      }
+      throw error;
+    } finally {
+      if (practiceContextMatches(id, key, thread, viewSerial)) {
+        state.practice.loading = false;
+        renderAll();
+      }
+    }
   }
 
   function visibleUserCount(messages) {
@@ -652,7 +1096,7 @@
     else if (mode === "configured") { setText(label, "模型已配置"); }
     else if (mode === "error") { badge.classList.add("error"); setText(label, "服务异常"); }
     else { badge.classList.add("unconfigured"); setText(label, "未配置模型"); }
-    setText($("modeBreadcrumb"), mode === "demo" ? "岗位雷达 · 演示模式" : "岗位雷达");
+    setText($("modeBreadcrumb"), state.practiceWindow.standalone ? "Agent 实操" : mode === "demo" ? "岗位雷达 · 演示模式" : "岗位雷达");
     setText($("workspacePath"), info.workspace || "等待服务返回工作区");
     setText($("workspaceMeta"), mode === "configured" ? "内容将发送到已配置的模型" : mode === "demo" ? "离线脚本模型 · 不代表真实模型" : "本地服务已连接");
     $("workspaceStatusDot").classList.toggle("offline", mode === "error");
@@ -705,7 +1149,8 @@
       dot.className = "session-state-dot";
       const busy = Boolean(summary.busy || state.jobs.has(id));
       const pending = Boolean(summary.pending);
-      if (busy) dot.classList.add("busy"); else if (pending) dot.classList.add("pending");
+      const queued = Number(summary.queued_calls || 0) > 0;
+      if (busy) dot.classList.add("busy"); else if (pending || queued) dot.classList.add("pending");
       meta.appendChild(dot);
       const count = sidebarMessageCount(summary);
       if (Number.isFinite(count)) meta.appendChild(document.createTextNode(`${count} 条消息`));
@@ -725,7 +1170,9 @@
 
   function renderHeader() {
     const session = state.currentSession;
-    setText($("currentTitle"), session ? sessionTitle(session) : "新会话");
+    setText($("currentTitle"), state.practiceWindow.standalone
+      ? `实操 · ${state.practiceWindow.projectKey || "当前项目"}`
+      : session ? sessionTitle(session) : "新会话");
     renderSessions();
     updateMode();
   }
@@ -810,7 +1257,8 @@
   function renderMessages(shouldScroll = false) {
     const list = $("messageList");
     list.replaceChildren();
-    const messages = visibleMessages(state.currentSession);
+    const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const messages = chatMessages(state.currentSession);
     const toolMap = new Map(messages.filter((message) => message.role === "tool" && message.tool_call_id).map((message) => [String(message.tool_call_id), message]));
     messages.forEach((message) => {
       if (message.role === "tool" && message.tool_call_id && toolMap.has(String(message.tool_call_id))) {
@@ -819,8 +1267,31 @@
       }
       list.appendChild(createMessageElement(message, toolMap));
     });
-    if (state.optimisticMessage && state.optimisticMessage.sessionId === String(state.currentSessionId || "") && !serverHasOptimisticUser(state.currentSession, state.optimisticMessage)) {
-      const optimistic = createMessageElement({ role: "user", content: state.optimisticMessage.text }, new Map());
+    if (practiceScope && state.practiceWindow.standalone && state.practiceWindow.stale) {
+      const stale = document.createElement("div");
+      stale.className = "practice-stale-state";
+      stale.textContent = state.practiceWindow.error || "主窗口已切换到另一个练习项目。为避免把消息写入错误项目，请关闭此窗口并从当前项目重新打开实操。";
+      list.prepend(stale);
+    }
+    if (practiceScope && !messages.length && !state.practice.optimisticMessage) {
+      const empty = document.createElement("div");
+      empty.className = "practice-empty-state";
+      empty.textContent = state.practice.loading
+        ? "正在加载当前项目的实操记录…"
+        : state.practice.error
+          ? `暂时无法读取实操记录：${state.practice.error}`
+          : "这是当前项目的独立实操记录。发送第一条消息后，教练会沿用同一求职会话的完整背景。";
+      list.appendChild(empty);
+    }
+    const optimisticState = practiceScope ? state.practice.optimisticMessage : state.optimisticMessage;
+    const optimisticMatches = optimisticState && optimisticState.sessionId === String(state.currentSessionId || "")
+      && (!practiceScope || !optimisticState.projectKey || optimisticState.projectKey === (state.workflowChat.practiceProjectKey || selectedProjectKey()));
+    const serverHasPracticeOptimistic = practiceScope && optimisticState
+      ? messages.some((message) => message.role === "user" && messageScope(message) === "practice" && (!optimisticState.projectKey || messageProjectKey(message) === optimisticState.projectKey) && messagePracticeThreadId(message) === state.practice.threadId && contentText(message.content).includes(String(optimisticState.text || "").slice(0, 80)))
+      : false;
+    const serverHasCurrentOptimistic = practiceScope ? serverHasPracticeOptimistic : serverHasOptimisticUser(state.currentSession, optimisticState);
+    if (optimisticMatches && !serverHasCurrentOptimistic) {
+      const optimistic = createMessageElement({ role: "user", content: optimisticState.text, scope: practiceScope ? "practice" : "main", project_key: optimisticState.projectKey }, new Map());
       optimistic.classList.add("pending-message");
       list.appendChild(optimistic);
     }
@@ -829,10 +1300,271 @@
     if (shouldScroll) requestAnimationFrame(() => { $("chatScroll").scrollTop = $("chatScroll").scrollHeight; });
   }
 
+  function commandScopeEnvelope() {
+    const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    if (!practiceScope) return { scope: "main" };
+    return {
+      scope: "practice",
+      project_key: String(state.workflowChat.practiceProjectKey || state.practice.projectKey || "").trim(),
+      practice_thread_id: String(state.practice.threadId || "").trim()
+    };
+  }
+
+  function commandScopeKey(scope = commandScopeEnvelope()) {
+    try { return JSON.stringify(scope); } catch (_error) { return String(scope.scope || "main"); }
+  }
+
+  function commandStatusLabel(status) {
+    const value = String(status || "").trim().toLowerCase();
+    return ({
+      starting: "启动中",
+      running: "运行中",
+      completed: "已完成",
+      stopped: "已停止",
+      timed_out: "已超时",
+      uncertain: "结果不确定，需人工确认",
+      failed: "失败"
+    })[value] || (value || "未知状态");
+  }
+
+  function commandIsRunning(item) {
+    return ["starting", "running"].includes(String(item && item.status || "").trim().toLowerCase());
+  }
+
+  function commandOutput(item) {
+    const chunks = [];
+    const stdout = String(item && item.stdout || "");
+    const stderr = String(item && item.stderr || "");
+    if (stdout) chunks.push(`标准输出\n${stdout}`);
+    if (stderr) chunks.push(`标准错误\n${stderr}`);
+    return chunks.join("\n\n");
+  }
+
+  function commandId(item) {
+    return String(item && (item.execution_id || item.command_session_id || item.session_id) || "").trim();
+  }
+
+  function commandIsTerminal(item) {
+    return ["completed", "failed", "timed_out", "stopped"].includes(String(item && item.status || "").trim().toLowerCase());
+  }
+
+  function renderCommandRuntime() {
+    const panel = $("commandRuntime");
+    const list = $("commandRuntimeList");
+    if (!panel || !list) return;
+    const runtime = state.commandRuntime;
+    const sameScope = runtime.sessionId === String(state.currentSessionId || "")
+      && runtime.scopeKey === commandScopeKey();
+    const items = sameScope && Array.isArray(runtime.items) ? runtime.items : [];
+    panel.classList.toggle("hidden", !items.length && !runtime.error);
+    list.replaceChildren();
+    if (runtime.error && !items.length) {
+      const error = document.createElement("div");
+      error.className = "command-runtime-error";
+      error.textContent = runtime.error;
+      list.appendChild(error);
+    }
+    items.slice(-6).reverse().forEach((item) => {
+      const row = document.createElement("article");
+      row.className = "command-runtime-item";
+      const head = document.createElement("div");
+      head.className = "command-runtime-item-head";
+      const command = document.createElement("code");
+      command.className = "command-runtime-command";
+      command.textContent = String(item.command || "命令");
+      command.title = String(item.command || "");
+      head.appendChild(command);
+      const status = document.createElement("span");
+      status.className = "command-runtime-state";
+      status.textContent = commandStatusLabel(item.status);
+      head.appendChild(status);
+      const executionId = commandId(item);
+      if (commandIsRunning(item) && executionId) {
+        const stop = document.createElement("button");
+        stop.type = "button";
+        stop.className = "command-runtime-stop";
+        stop.dataset.commandStop = executionId;
+        const stopping = runtime.stopping.has(executionId);
+        const completing = runtime.completionJobs.has(executionId);
+        stop.disabled = stopping || completing;
+        stop.textContent = stopping ? "停止中…" : completing ? "同步中…" : "停止命令";
+        stop.setAttribute("aria-label", `停止命令 ${executionId}`);
+        head.appendChild(stop);
+      }
+      row.appendChild(head);
+      if (item.purpose) {
+        const purpose = document.createElement("p");
+        purpose.className = "command-runtime-purpose";
+        purpose.textContent = String(item.purpose);
+        row.appendChild(purpose);
+      }
+      const output = commandOutput(item);
+      if (output || commandIsRunning(item)) {
+        const pre = document.createElement("pre");
+        pre.className = "command-runtime-output";
+        pre.textContent = output || "正在等待命令输出…";
+        row.appendChild(pre);
+      }
+      list.appendChild(row);
+    });
+    const running = items.some(commandIsRunning);
+    setText($("commandRuntimeStatus"), runtime.error && !items.length ? "读取失败" : running ? "运行中" : items.length ? "已同步" : "等待命令");
+  }
+
+  function clearCommandRuntime() {
+    state.commandRuntime.sessionId = "";
+    state.commandRuntime.scopeKey = "";
+    state.commandRuntime.items = [];
+    state.commandRuntime.error = "";
+    state.commandRuntime.stopping.clear();
+    state.commandRuntime.completionJobs.clear();
+    state.commandRuntime.settled.clear();
+    renderCommandRuntime();
+  }
+
+  async function refreshCommandRuntime() {
+    const id = String(state.currentSessionId || "");
+    if (!id || document.visibilityState === "hidden" || state.commandRuntime.refreshInFlight) return;
+    const scope = commandScopeEnvelope();
+    const scopeKey = commandScopeKey(scope);
+    if (state.commandRuntime.sessionId !== id || state.commandRuntime.scopeKey !== scopeKey) {
+      state.commandRuntime.sessionId = id;
+      state.commandRuntime.scopeKey = scopeKey;
+      state.commandRuntime.items = [];
+      state.commandRuntime.error = "";
+      state.commandRuntime.stopping.clear();
+      state.commandRuntime.completionJobs.clear();
+      state.commandRuntime.settled.clear();
+    }
+    state.commandRuntime.refreshInFlight = true;
+    try {
+      const query = new URLSearchParams(scope).toString();
+      const payload = await request(`/sessions/${encodeURIComponent(id)}/commands?${query}`);
+      if (String(state.currentSessionId || "") !== id || commandScopeKey() !== scopeKey) return;
+      state.commandRuntime.items = Array.isArray(payload && payload.commands) ? payload.commands : [];
+      state.commandRuntime.error = "";
+      renderActivity();
+      const execution = state.currentSession && state.currentSession.execution;
+      const liveCommandId = execution && execution.status === "running"
+        ? commandId(execution)
+        : "";
+      for (const item of state.commandRuntime.items) {
+        if (!commandIsTerminal(item)) continue;
+        const executionId = commandId(item);
+        // The backend keeps the original submit job alive and normally
+        // resumes the model without browser help.  A POST fallback is only
+        // valid for the one durable command claim still marked running;
+        // historical terminal rows must remain display-only.
+        if (!executionId || executionId !== liveCommandId) continue;
+        if (!executionId || state.commandRuntime.settled.has(executionId) || state.commandRuntime.completionJobs.has(executionId)) continue;
+        // GET only observes the process. Commit one terminal result and
+        // continue the saved model turn through an async engine job.
+        state.commandRuntime.completionJobs.set(executionId, { pending: true, kind: "command-poll" });
+        try {
+          const completion = await request("/sessions/" + encodeURIComponent(id) + "/commands/" + encodeURIComponent(executionId) + "/poll", {
+            method: "POST",
+            body: { ...scope, wait_seconds: 0 }
+          });
+          const jobId = String(completion && completion.job_id || "").trim();
+          if (!jobId) throw new Error("服务没有返回命令结果任务");
+          state.commandRuntime.completionJobs.set(executionId, { jobId, kind: "command-poll" });
+          state.jobs.set(id, { id: jobId, commandId: executionId, kind: "command-poll" });
+          startPolling(id);
+        } catch (error) {
+          state.commandRuntime.completionJobs.delete(executionId);
+          if (String(state.currentSessionId || "") === id) state.commandRuntime.error = error.message || "同步命令结果失败";
+        }
+      }
+      renderCommandRuntime();
+      const needsRefresh = state.practiceWindow.standalone
+        || sessionBusy(state.currentSession)
+        || state.commandRuntime.items.some(commandIsRunning);
+      if (needsRefresh && !state.commandRuntime.refreshTimer && document.visibilityState !== "hidden") {
+        state.commandRuntime.refreshTimer = window.setInterval(() => { void refreshCommandRuntime(); }, 1000);
+      } else if (!needsRefresh) {
+        clearCommandRuntimeRefresh();
+      }
+    } catch (error) {
+      if (String(state.currentSessionId || "") !== id || commandScopeKey() !== scopeKey) return;
+      state.commandRuntime.error = error.message || "暂时无法读取命令状态";
+      state.commandRuntime.items = [];
+      renderActivity();
+    } finally {
+      state.commandRuntime.refreshInFlight = false;
+    }
+  }
+
+  function clearCommandRuntimeRefresh() {
+    if (state.commandRuntime.refreshTimer) {
+      window.clearInterval(state.commandRuntime.refreshTimer);
+      state.commandRuntime.refreshTimer = null;
+    }
+  }
+
+  function startCommandRuntimeRefresh() {
+    if (document.visibilityState === "hidden") return;
+    clearCommandRuntimeRefresh();
+    void refreshCommandRuntime();
+    if (!state.practiceWindow.standalone && !sessionBusy(state.currentSession) && !state.commandRuntime.items.some(commandIsRunning)) return;
+    state.commandRuntime.refreshTimer = window.setInterval(() => { void refreshCommandRuntime(); }, 1000);
+  }
+
+  async function stopCommandRuntime(executionId) {
+    const id = String(state.currentSessionId || "");
+    const commandId = String(executionId || "").trim();
+    if (!id || !commandId || state.commandRuntime.stopping.has(commandId) || state.commandRuntime.completionJobs.has(commandId)) return;
+    const scope = commandScopeEnvelope();
+    state.commandRuntime.stopping.add(commandId);
+    renderCommandRuntime();
+    try {
+      const completion = await request("/sessions/" + encodeURIComponent(id) + "/commands/" + encodeURIComponent(commandId) + "/stop", {
+        method: "POST",
+        body: scope
+      });
+      const jobId = String(completion && completion.job_id || "").trim();
+      if (!jobId) throw new Error("服务没有返回停止任务");
+      state.commandRuntime.completionJobs.set(commandId, { jobId, kind: "command-stop" });
+      state.jobs.set(id, { id: jobId, commandId, kind: "command-stop" });
+      startPolling(id);
+      await refreshCommandRuntime();
+    } catch (error) {
+      state.commandRuntime.error = error.message || "停止命令失败";
+      renderCommandRuntime();
+    } finally {
+      state.commandRuntime.stopping.delete(commandId);
+      renderCommandRuntime();
+    }
+  }
+
   function renderActivity() {
     const panel = $("activityPanel");
-    const events = Array.isArray(state.currentSession && state.currentSession.events) ? state.currentSession.events.slice(-5) : [];
-    panel.classList.toggle("hidden", events.length === 0 && !sessionBusy(state.currentSession));
+    const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const practiceKey = state.workflowChat.practiceProjectKey || selectedProjectKey();
+    const scopedSnapshotLoaded = practiceScope
+      && state.practice.loaded
+      && state.practice.sessionId === String(state.currentSessionId || "")
+      && state.practice.projectKey === String(practiceKey || "").trim()
+      && Boolean(state.practice.threadId);
+    const allEvents = scopedSnapshotLoaded
+      ? state.practice.events
+      : (Array.isArray(state.currentSession && state.currentSession.events) ? state.currentSession.events : []);
+    const events = allEvents.filter((event) => {
+      if (!practiceScope) return !event || eventScope(event) !== "practice";
+      if (eventScope(event) !== "practice") return false;
+      const eventKey = eventProjectKey(event);
+      const eventThread = eventPracticeThreadId(event);
+      return Boolean(practiceKey && eventKey && eventKey === practiceKey && state.practice.threadId && eventThread === state.practice.threadId);
+    }).slice(-5);
+    const busy = sessionBusy(state.currentSession);
+    const queued = sessionHasQueue(state.currentSession);
+    const queuedForScope = practiceScope ? practiceQueueMatches(state.currentSession) : queued;
+    const commandScope = commandScopeEnvelope();
+    const commandScopeMatches = state.commandRuntime.sessionId === String(state.currentSessionId || "")
+      && state.commandRuntime.scopeKey === commandScopeKey(commandScope);
+    const commands = commandScopeMatches ? state.commandRuntime.items : [];
+    const commandBusy = commands.some(commandIsRunning);
+    const scopeBusy = practiceScope ? Boolean(state.currentSession && state.currentSession.practice_busy) || Boolean(state.practice.optimisticMessage) && busy : busy;
+    panel.classList.toggle("hidden", events.length === 0 && !scopeBusy && !queuedForScope && !commands.length && !state.commandRuntime.error);
     const list = $("activityList");
     list.replaceChildren();
     [...events].reverse().forEach((event) => {
@@ -847,9 +1579,9 @@
       row.appendChild(message);
       list.appendChild(row);
     });
-    const busy = sessionBusy(state.currentSession);
-    setText($("activityStatus"), busy ? "处理中" : events.length ? "已记录" : "等待操作");
-    $("activityPanel").querySelector(".activity-pulse").style.animationPlayState = busy ? "running" : "paused";
+    setText($("activityStatus"), scopeBusy ? "处理中" : commandBusy ? "命令运行中" : queuedForScope ? "待继续" : events.length ? "已记录" : "等待操作");
+    $("activityPanel").querySelector(".activity-pulse").style.animationPlayState = scopeBusy || commandBusy ? "running" : "paused";
+    renderCommandRuntime();
   }
 
   function approvalIdFor(session) {
@@ -860,6 +1592,42 @@
     return String(execution.approval_id || execution.call_id || "");
   }
 
+  function practiceApprovalMatches(session) {
+    if (!session) return false;
+    const practiceKey = state.workflowChat.practiceProjectKey || selectedProjectKey();
+    const thread = String(state.practice.threadId || "").trim();
+    return [session.pending, session.execution].some((record) => scopedTurnMatches(record, practiceKey, thread));
+  }
+
+  function scopedTurnEnvelope(record) {
+    if (!record || typeof record !== "object") return { scope: "main" };
+    const metadata = record.metadata && typeof record.metadata === "object" ? record.metadata : {};
+    const scope = String(record.scope || metadata.scope || "main").trim().toLowerCase();
+    if (scope !== "practice") return { scope: "main" };
+    return {
+      scope: "practice",
+      project_key: String(record.project_key || metadata.project_key || "").trim(),
+      practice_thread_id: String(record.practice_thread_id || metadata.practice_thread_id || "").trim()
+    };
+  }
+
+  function scopedTurnMatches(record, projectKey, threadId) {
+    const envelope = scopedTurnEnvelope(record);
+    return envelope.scope === "practice"
+      && Boolean(String(projectKey || "").trim())
+      && envelope.project_key === String(projectKey || "").trim()
+      && Boolean(String(threadId || "").trim())
+      && envelope.practice_thread_id === String(threadId || "").trim();
+  }
+
+  function practiceQueueMatches(session) {
+    if (!session || Number(session.queued_calls || 0) <= 0) return false;
+    const execution = session.execution && typeof session.execution === "object" && Object.keys(session.execution).length ? session.execution : null;
+    const active = session.pending || execution || session.practice_filter;
+    const practiceKey = state.workflowChat.practiceProjectKey || selectedProjectKey();
+    return scopedTurnMatches(active, practiceKey, state.practice.threadId);
+  }
+
   function renderApproval() {
     const region = $("approvalRegion");
     region.replaceChildren();
@@ -867,7 +1635,37 @@
     if (!session) return;
     const pending = session.pending;
     const execution = session.execution || {};
-    const isUnknown = !sessionBusy(session) && ["uncertain", "running"].includes(String(execution.status || "")) && approvalIdFor(session);
+    const liveWorker = Boolean(session.busy || state.jobs.has(String(session.id)));
+    const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    if (practiceScope && pending && !practiceApprovalMatches(session)) {
+      const notice = document.createElement("article");
+      notice.className = "approval-card practice-main-approval-notice";
+      notice.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">主对话需要处理</div><h3>当前会话有一项待确认操作</h3></div></div>`;
+      const body = document.createElement("div"); body.className = "approval-body";
+      const summary = document.createElement("p"); summary.className = "approval-summary";
+      summary.textContent = "这项操作属于主教练对话，练习窗口不会替它批准。打开主对话后核对完整预览。";
+      body.appendChild(summary);
+      const actions = document.createElement("div"); actions.className = "approval-actions";
+      const open = document.createElement("button"); open.type = "button"; open.className = "action-button resolve"; open.textContent = "打开主对话处理";
+      open.addEventListener("click", () => { closeWorkflowChatDialog(); openWorkflowChatDialog(); });
+      actions.appendChild(open); body.appendChild(actions); notice.appendChild(body); region.appendChild(notice); hydrateIcons(notice);
+      return;
+    }
+    const isUnknown = !liveWorker && ["uncertain", "running"].includes(String(execution.status || "")) && approvalIdFor(session);
+    if (practiceScope && isUnknown && !practiceApprovalMatches(session)) {
+      const notice = document.createElement("article");
+      notice.className = "approval-card practice-main-approval-notice";
+      notice.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">主对话需要处理</div><h3>主对话的执行结果待核实</h3></div></div>`;
+      const body = document.createElement("div"); body.className = "approval-body";
+      const summary = document.createElement("p"); summary.className = "approval-summary";
+      summary.textContent = "这项结果没有当前练习项目的精确标记，练习窗口不会替主对话核实。打开主对话后记录核实结果。";
+      body.appendChild(summary);
+      const actions = document.createElement("div"); actions.className = "approval-actions";
+      const open = document.createElement("button"); open.type = "button"; open.className = "action-button resolve"; open.textContent = "打开主对话处理";
+      open.addEventListener("click", () => { closeWorkflowChatDialog(); openWorkflowChatDialog({ scrollApproval: true }); });
+      actions.appendChild(open); body.appendChild(actions); notice.appendChild(body); region.appendChild(notice); hydrateIcons(notice);
+      return;
+    }
     if (pending && !isUnknown) {
       const card = document.createElement("article");
       card.className = "approval-card";
@@ -914,6 +1712,54 @@
       hydrateIcons(card);
       return;
     }
+    const queuedCalls = Number(session.queued_calls || 0);
+    if (practiceScope && !practiceQueueMatches(session) && !pending && !liveWorker && !isUnknown && Number.isFinite(queuedCalls) && queuedCalls > 0) {
+      const notice = document.createElement("article");
+      notice.className = "approval-card practice-main-approval-notice";
+      notice.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">主对话需要处理</div><h3>主对话工具队列待恢复</h3></div></div>`;
+      const body = document.createElement("div"); body.className = "approval-body";
+      const summary = document.createElement("p"); summary.className = "approval-summary";
+      summary.textContent = `主对话还有 ${queuedCalls} 个工具调用等待恢复；练习窗口不会替它继续。打开主对话后按原顺序恢复。`;
+      body.appendChild(summary);
+      const actions = document.createElement("div"); actions.className = "approval-actions";
+      const open = document.createElement("button"); open.type = "button"; open.className = "action-button resolve"; open.textContent = "打开主对话处理";
+      open.addEventListener("click", () => { closeWorkflowChatDialog(); openWorkflowChatDialog({ scrollApproval: true }); });
+      actions.appendChild(open); body.appendChild(actions); notice.appendChild(body); region.appendChild(notice); hydrateIcons(notice);
+      return;
+    }
+    if (!pending && !liveWorker && !isUnknown && Number.isFinite(queuedCalls) && queuedCalls > 0) {
+      const card = document.createElement("article");
+      card.className = "approval-card queue-recovery-card";
+      card.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">工具队列待恢复</div><h3>上一轮工具调用尚未完成</h3></div></div>`;
+      const body = document.createElement("div");
+      body.className = "approval-body";
+      const summary = document.createElement("p");
+      summary.className = "approval-summary";
+      summary.textContent = `还有 ${queuedCalls} 个工具调用等待按原顺序处理。继续会恢复这一轮对话，不会新增用户消息。`;
+      body.appendChild(summary);
+      const actions = document.createElement("div");
+      actions.className = "approval-actions";
+      const resume = document.createElement("button");
+      resume.type = "button";
+      resume.className = "action-button resolve";
+      resume.dataset.action = "continue";
+      resume.appendChild(icon("arrow-right"));
+      resume.appendChild(document.createTextNode("继续执行工具队列"));
+      // A live job may still be draining the queue. The button becomes
+      // enabled after the next snapshot reports the persisted queue as idle.
+      const liveJob = Boolean(session.busy || state.jobs.has(String(session.id)));
+      resume.disabled = liveJob;
+      actions.appendChild(resume);
+      body.appendChild(actions);
+      const foot = document.createElement("p");
+      foot.className = "approval-footnote";
+      foot.textContent = "恢复前不会重放已获批的副作用操作；需要人工确认的操作仍会单独显示。";
+      body.appendChild(foot);
+      card.appendChild(body);
+      region.appendChild(card);
+      hydrateIcons(card);
+      return;
+    }
     if (isUnknown) {
       const card = document.createElement("article");
       card.className = "approval-card unknown-card";
@@ -936,18 +1782,45 @@
   function renderBusy() {
     const busy = sessionBusy(state.currentSession);
     const pending = Boolean(state.currentSession && state.currentSession.pending);
-    const blocked = busy || pending;
+    const queued = sessionHasQueue(state.currentSession);
+    const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const practicePending = practiceScope && pending && practiceApprovalMatches(state.currentSession);
+    const practiceQueue = practiceScope && practiceQueueMatches(state.currentSession);
+    const stalePractice = practiceScope && state.practiceWindow.standalone && state.practiceWindow.stale;
+    const blocked = busy || pending || queued || stalePractice;
     $("busyBar").classList.toggle("hidden", !busy);
     $("sendButton").disabled = blocked;
     $("composerInput").disabled = blocked;
     $("sendButton").setAttribute("aria-busy", busy ? "true" : "false");
-    $("composerInput").placeholder = pending ? "请先处理上方审批，再发送新的消息…" : busy ? "求职教练正在处理当前会话…" : "粘贴 JD、说明已有技能，或上传相关材料…";
+    $("composerInput").placeholder = practiceScope
+      ? (stalePractice
+        ? "主窗口已切换练习项目，请从当前项目重新打开实操…"
+        : pending
+        ? (practicePending ? "请先处理练习操作的审批，再发送新的消息…" : "主对话有待确认操作，请先打开主对话处理…")
+        : queued
+         ? (practiceScope && practiceQueue ? "当前项目工具队列待继续，请在练习窗口恢复…" : "主对话工具队列待继续，请先打开主对话恢复…")
+          : busy
+            ? "练习教练正在处理当前项目…"
+            : "描述当前项目进展、遇到的错误或下一步问题…")
+      : pending
+      ? "请先处理上方审批，再发送新的消息…"
+      : queued
+        ? "上一轮工具队列待继续，请先点击下方“继续执行工具队列”…"
+        : busy
+          ? "求职教练正在处理当前会话…"
+          : "粘贴 JD、说明已有技能，或上传相关材料…";
     const job = currentJob();
-    setText($("busyText"), job ? "求职教练正在运行，状态每秒更新…" : "会话正在恢复，状态会自动更新…");
+    setText(
+      $("busyText"),
+      job
+          ? "求职教练正在运行，状态每秒更新…"
+          : "会话正在恢复，状态会自动更新…",
+    );
   }
 
   function renderAll({ scroll = false } = {}) {
     state.renderSerial += 1;
+    if (state.jobEditor.open && state.jobEditor.sessionId !== String(state.currentSessionId || "")) closeJobEditor();
     renderHeader();
     renderMessages(scroll);
     renderActivity();
@@ -955,6 +1828,8 @@
     renderBusy();
     renderInspector();
     renderWorkflowPage();
+    if (state.clarification.open && state.clarification.sessionId !== String(state.currentSessionId || "")) closeClarificationModal({ restore: false });
+    else syncClarificationModal();
     const attachment = $("attachmentStrip");
     const attachments = Array.isArray(state.uploadedAttachments)
       ? state.uploadedAttachments
@@ -969,6 +1844,7 @@
       remove.addEventListener("click", () => {
         state.uploadedAttachments = attachments.filter((_item, itemIndex) => itemIndex !== index);
         state.uploadedAttachment = state.uploadedAttachments[0] || null;
+        captureComposerDraft();
         renderAll();
       });
       chip.appendChild(remove);
@@ -1012,6 +1888,7 @@
 
   function selectWorkflowStep(id) {
     if (!WORKFLOW_STEPS.some((step) => step.id === id)) return;
+    if (state.voice.active || state.voice.stopping) stopVoiceInput({ cancel: true });
     if (state.jdImport.open) saveJdDraft();
     state.selectedStep = id;
     state.pageView = true;
@@ -1020,38 +1897,546 @@
     renderWorkflowPage();
   }
 
+  function mountSharedChat(host) {
+    const chat = qs(".chat-column");
+    if (!chat || !host) return null;
+    if (chat.parentNode !== host) host.appendChild(chat);
+    return chat;
+  }
+
+  function composerDraftKey(scope = state.workflowChat.scope, sessionId = state.currentSessionId, projectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey) {
+    const normalizedScope = scope === "practice" ? "practice" : "main";
+    const normalizedSession = String(sessionId || "new");
+    const normalizedProject = normalizedScope === "practice" ? String(projectKey || "") : "";
+    return JSON.stringify([normalizedSession, normalizedScope, normalizedProject]);
+  }
+
+  function captureComposerDraft(scope = state.workflowChat.scope, sessionId = state.currentSessionId, projectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey) {
+    const key = composerDraftKey(scope, sessionId, projectKey);
+    const input = $("composerInput");
+    state.workflowChat.drafts.set(key, String(input?.value || ""));
+    const attachments = Array.isArray(state.uploadedAttachments)
+      ? state.uploadedAttachments
+      : (state.uploadedAttachment ? [state.uploadedAttachment] : []);
+    state.workflowChat.draftAttachments.set(key, attachments.map((item) => ({ ...item })));
+  }
+
+  function storeComposerDraft(scope, sessionId, projectKey, text, attachments = []) {
+    const key = composerDraftKey(scope, sessionId, projectKey);
+    state.workflowChat.drafts.set(key, String(text || ""));
+    state.workflowChat.draftAttachments.set(key, (Array.isArray(attachments) ? attachments : []).map((item) => ({ ...item })));
+  }
+
+  function clearComposerDraft(scope = state.workflowChat.scope, sessionId = state.currentSessionId, projectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey) {
+    const key = composerDraftKey(scope, sessionId, projectKey);
+    state.workflowChat.drafts.delete(key);
+    state.workflowChat.draftAttachments.delete(key);
+  }
+
+  function restoreComposerDraft(scope = state.workflowChat.scope, sessionId = state.currentSessionId, projectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey) {
+    const key = composerDraftKey(scope, sessionId, projectKey);
+    const input = $("composerInput");
+    if (input) input.value = state.workflowChat.drafts.get(key) || "";
+    const attachments = (state.workflowChat.draftAttachments.get(key) || []).map((item) => ({ ...item }));
+    state.uploadedAttachments = attachments;
+    state.uploadedAttachment = attachments[0] || null;
+    resizeComposer();
+  }
+
+  function openWorkflowChatDialog({ focus = true, scrollApproval = false } = {}) {
+    if (!state.pageView) return false;
+    if (state.jdImport.open) {
+      saveJdDraft();
+      $("jdImportBackdrop")?.classList.add("hidden");
+      state.jdImport.open = false;
+    }
+    if ((state.voice.active || state.voice.stopping) && state.workflowChat.scope !== "main") stopVoiceInput({ cancel: true });
+    const wasPractice = state.workflowChat.scope === "practice";
+    captureComposerDraft(state.workflowChat.scope);
+    if (wasPractice) state.practice.viewSerial += 1;
+    const host = $("practiceChatHost");
+    const backdrop = $("workflowChatBackdrop");
+    const chat = mountSharedChat(host);
+    if (!host || !backdrop || !chat) return false;
+    if (!state.workflowChat.open) {
+      state.workflowChat.open = true;
+      const active = document.activeElement;
+      const activeInAnotherModal = qsa(".modal-backdrop").some((item) => item !== backdrop && item.contains(active));
+      state.workflowChat.previousFocus = activeInAnotherModal ? $("backToChat") : active;
+    }
+    state.workflowChat.scope = "main";
+    state.workflowChat.practiceProjectKey = "";
+    restoreComposerDraft("main");
+    const step = WORKFLOW_STEPS.find((item) => item.id === state.selectedStep);
+    setText($("workflowChatTitle"), step ? `${step.title} · 当前会话` : "求职辅导对话");
+    backdrop.classList.remove("hidden");
+    backdrop.setAttribute("aria-hidden", "false");
+    document.body.classList.add("modal-open");
+    if (focus) window.requestAnimationFrame(() => {
+      if (!state.workflowChat.open) return;
+      if (scrollApproval) {
+        const region = $("approvalRegion");
+        if (region && typeof region.scrollIntoView === "function") region.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+      const input = $("composerInput");
+      if (input && !input.disabled) input.focus();
+      else $("workflowChatClose")?.focus();
+    });
+    renderAll();
+    return true;
+  }
+
+  function showStandalonePracticeStale(sessionId, projectKey, message = "") {
+    const host = $("practiceChatHost");
+    const backdrop = $("workflowChatBackdrop");
+    if (!host || !backdrop || !mountSharedChat(host)) return false;
+    state.practiceWindow.stale = true;
+    state.practiceWindow.error = String(message || "").trim();
+    state.workflowChat.open = true;
+    state.workflowChat.scope = "practice";
+    state.workflowChat.practiceProjectKey = String(projectKey || state.practiceWindow.projectKey || "").trim();
+    state.practice.sessionId = String(sessionId || state.currentSessionId || "");
+    state.practice.projectKey = state.workflowChat.practiceProjectKey;
+    state.practice.projectTitle = "当前项目";
+    state.practice.threadId = "";
+    state.practice.loaded = true;
+    state.practice.loading = false;
+    state.practice.error = "";
+    restoreComposerDraft("practice");
+    backdrop.classList.remove("hidden");
+    backdrop.setAttribute("aria-hidden", "false");
+    document.body.classList.add("modal-open");
+    renderAll();
+    startPracticeWindowRefresh();
+    return true;
+  }
+
+  async function openPracticeChatDialog({ focus = true, start = false } = {}) {
+    if (!state.pageView || !state.currentSessionId) return false;
+    if (state.practiceWindow.standalone && start) {
+      start = !state.practiceWindow.startConsumed;
+      state.practiceWindow.startConsumed = true;
+    }
+    const data = workflowData();
+    const selected = data && data.selected_project;
+    const projectKey = selectedProjectKey(data);
+    const sessionId = String(state.currentSessionId || "");
+    if (!selected || !projectKey) {
+      if (state.practiceWindow.standalone) {
+        showStandalonePracticeStale(sessionId, state.practiceWindow.projectKey, "当前练习项目已不可用。为避免把消息写入错误项目，请关闭此窗口并从当前项目重新打开实操。");
+        return false;
+      }
+      toast("请先在“计划 & 项目”中选定练习项目。", "");
+      return false;
+    }
+    if (state.practiceWindow.standalone && state.practiceWindow.projectKey && state.practiceWindow.projectKey !== projectKey) {
+      showStandalonePracticeStale(sessionId, state.practiceWindow.projectKey, "主窗口已切换到另一个练习项目。为避免把消息写入错误项目，请关闭此窗口并从当前项目重新打开实操。");
+      return false;
+    }
+    state.practiceWindow.stale = false;
+    state.practiceWindow.error = "";
+    if (!state.practiceWindow.standalone && openPracticeWindow(sessionId, projectKey, start)) {
+      // The native/browser child owns its own chat DOM and transcript view.
+      // Keep the parent page on the workflow page so its drafts, inspector,
+      // and main conversation remain usable while practice runs.
+      return true;
+    }
+    if (start
+      && state.practice.startPending
+      && state.practice.sessionId === String(state.currentSessionId)
+      && state.practice.projectKey === projectKey) return true;
+    if (start) state.practice.startPending = true;
+    if (state.jdImport.open) {
+      saveJdDraft();
+      $("jdImportBackdrop")?.classList.add("hidden");
+      state.jdImport.open = false;
+    }
+    if (state.voice.active || state.voice.stopping) stopVoiceInput({ cancel: true });
+    captureComposerDraft(state.workflowChat.scope);
+    const host = $("practiceChatHost");
+    const backdrop = $("workflowChatBackdrop");
+    const chat = mountSharedChat(host);
+    if (!host || !backdrop || !chat) {
+      state.practice.startPending = false;
+      return false;
+    }
+    const active = document.activeElement;
+    if (!state.workflowChat.open) {
+      state.workflowChat.open = true;
+      const activeInAnotherModal = qsa(".modal-backdrop").some((item) => item !== backdrop && item.contains(active));
+      state.workflowChat.previousFocus = activeInAnotherModal ? $("backToChat") : active;
+    }
+    state.workflowChat.scope = "practice";
+    state.workflowChat.practiceProjectKey = projectKey;
+    const viewSerial = ++state.practice.viewSerial;
+    const sameThread = state.practice.sessionId === sessionId && state.practice.projectKey === projectKey && Boolean(state.practice.threadId);
+    state.practice.sessionId = sessionId;
+    state.practice.projectKey = projectKey;
+    state.practice.projectTitle = projectDisplayTitle(selected);
+    if (!sameThread) {
+      state.practice.threadId = "";
+      state.practice.messages = [];
+      state.practice.events = [];
+      state.practice.loaded = false;
+      if (!start) state.practice.startPending = false;
+    }
+    state.practice.loading = true;
+    state.practice.error = "";
+    restoreComposerDraft("practice");
+    const kicker = qs(".workflow-chat-header .inspect-kicker");
+    if (kicker) kicker.textContent = "当前练习项目 · 独立记录";
+    backdrop.classList.remove("hidden");
+    backdrop.setAttribute("aria-hidden", "false");
+    document.body.classList.add("modal-open");
+    renderAll();
+    try {
+      await ensurePracticeThread(sessionId, projectKey, viewSerial);
+      if (!practiceContextMatches(sessionId, projectKey, "", viewSerial)) return false;
+      const threadId = state.practice.threadId;
+      await refreshPracticeThread(sessionId, threadId, viewSerial);
+      if (!practiceContextMatches(sessionId, projectKey, threadId, viewSerial)) return false;
+      // Reopening an existing thread only reads its durable transcript. The
+      // first explicit click may seed a new thread once, after the server has
+      // confirmed that no practice turn exists; busy/pending main turns never
+      // start a second run here.
+      const canStart = start
+        && state.workflowChat.open
+        && state.workflowChat.scope === "practice"
+        && state.currentSessionId === sessionId
+        && state.practice.viewSerial === viewSerial
+        && !practiceHasMessages(state.currentSession, projectKey, threadId)
+        && !state.currentSession?.pending && !sessionTurnBlocked(state.currentSession);
+      if (canStart) {
+        state.practice.startPending = false;
+        void sendPracticeMessage(
+          "请围绕当前练习项目给出首个可执行步骤，等待我完成后记录真实结果与证据。",
+          { summary: "开始今天的实操", projectKey, viewSerial }
+        );
+      } else state.practice.startPending = false;
+    } catch (error) {
+      if (error && error.practiceScopeChanged) return false;
+      state.practice.startPending = false;
+      if (practiceContextMatches(sessionId, projectKey, "", viewSerial)) {
+        state.practice.loading = false;
+        state.practice.error = error.message || "无法打开实操记录";
+        renderAll();
+        toast(state.practice.error, "error");
+      }
+    }
+    if (state.practiceWindow.standalone) startPracticeWindowRefresh();
+    if (focus) window.requestAnimationFrame(() => {
+      if (!state.workflowChat.open || state.workflowChat.scope !== "practice") return;
+      const input = $("composerInput");
+      if (input && !input.disabled) input.focus();
+      else $("workflowChatClose")?.focus();
+    });
+    return true;
+  }
+
+  function closeWorkflowChatDialog({ restore = true } = {}) {
+    if (!state.workflowChat.open) return;
+    if ((state.voice.active || state.voice.stopping) && state.voice.target && $("workflowChatBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    const wasPractice = state.workflowChat.scope === "practice";
+    captureComposerDraft(state.workflowChat.scope);
+    if (wasPractice && state.practiceWindow.standalone) {
+      // Closing a child window only detaches this view. The backend job is
+      // deliberately left running so another window can continue observing it.
+      state.practice.viewSerial += 1;
+      clearPracticeWindowRefresh();
+      state.workflowChat.open = false;
+      state.workflowChat.scope = "main";
+      state.workflowChat.practiceProjectKey = "";
+      state.practice.optimisticMessage = null;
+      state.practice.startPending = false;
+      $("workflowChatBackdrop").classList.add("hidden");
+      $("workflowChatBackdrop").setAttribute("aria-hidden", "true");
+      document.body.classList.remove("modal-open");
+      requestPracticeWindowClose();
+      return;
+    }
+    if (wasPractice) state.practice.viewSerial += 1;
+    if (state.workflowChat.scope === "practice") restoreComposerDraft("main");
+    const chat = qs(".chat-column");
+    if (chat && chat.parentNode !== $("chatHome")) $("chatHome").prepend(chat);
+    state.workflowChat.open = false;
+    state.workflowChat.scope = "main";
+    state.workflowChat.practiceProjectKey = "";
+    state.practice.optimisticMessage = null;
+    state.practice.startPending = false;
+    $("workflowChatBackdrop").classList.add("hidden");
+    $("workflowChatBackdrop").setAttribute("aria-hidden", "true");
+    if (restore && state.pageView && state.selectedStep === "jd" && !state.jdImport.busy) {
+      $("jdImportBackdrop")?.classList.remove("hidden");
+      state.jdImport.open = true;
+    }
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.jdImport.open) document.body.classList.remove("modal-open");
+    const previous = state.workflowChat.previousFocus;
+    state.workflowChat.previousFocus = null;
+    if (restore) restoreSidebarAwareFocus(previous);
+    renderAll();
+  }
+
   function showSharedChat() {
+    if (state.voice.active || state.voice.stopping) stopVoiceInput({ cancel: true });
+    if (state.workflowChat.open) closeWorkflowChatDialog({ restore: false });
     if (state.jdImport.open) saveJdDraft();
+    restoreInspectorPaneHost();
     state.pageView = false;
     const chat = qs(".chat-column");
-    $("chatHome").prepend(chat);
+    if (chat && chat.parentNode !== $("chatHome")) $("chatHome").prepend(chat);
     $("workflowPage").classList.add("hidden");
     $("chatHome").classList.remove("hidden");
     $("composerInput").focus();
   }
 
+  function restoreInspectorPaneHost() {
+    const pane = $("inspectPane");
+    const home = $("chatHome");
+    if (!pane || !home || pane.parentNode === home) return;
+    pane.classList.remove("workflow-inspector-overlay");
+    home.appendChild(pane);
+  }
+
+  const WORKFLOW_ACTION_SUMMARIES = {
+    jd: "处理目标岗位 JD，保留不确定字段并等待核对",
+    profile: "整理技能档案，保留事实证据与待澄清问题",
+    plan: "基于已确认 JD 与技能档案生成差距、计划和候选项目",
+    practice: "围绕当前练习项目开始实操并记录真实证据"
+  };
+
+  function workflowActionSummary(stepId) {
+    return WORKFLOW_ACTION_SUMMARIES[String(stepId || "")] || "继续当前求职步骤";
+  }
+
+  function setPendingWorkflowAction(stepId) {
+    const summary = workflowActionSummary(stepId);
+    state.pendingWorkflowAction = {
+      sessionId: String(state.currentSessionId || ""),
+      stepId: String(stepId || state.selectedStep || ""),
+      summary
+    };
+    openWorkflowChatDialog();
+    toast(`已记录动作：${summary}。请在对话窗口补充材料后发送。`, "success", 4200);
+    $("composerInput").focus();
+  }
+
+  function sendTrustedWorkflowAction(text, stepId = state.selectedStep, summary = "", actionContext = {}, { openChat = true } = {}) {
+    const actionText = String(text || "").trim();
+    // A workflow button may be used while the user has an unrelated draft in
+    // the composer.  Keep that draft intact and let the normal session guards
+    // (approval/queue/running) decide whether the trusted action can run.
+    if (!actionText || !canPrepareJobAction()) return false;
+    const id = String(state.currentSessionId || "");
+    if (!id) {
+      toast("请先创建岗位会话，再执行此操作。", "");
+      return false;
+    }
+    const actionSummary = String(summary || actionText).trim();
+    const context = actionContext && typeof actionContext === "object" && !Array.isArray(actionContext) ? actionContext : {};
+    const body = {
+      text: actionText,
+      workflow_action: { step: String(stepId || ""), summary: actionSummary, ...context }
+    };
+    state.pendingWorkflowAction = null;
+    const accepted = enqueueAction("message", body, id, { optimisticText: actionSummary });
+    if (openChat) openWorkflowChatDialog();
+    return accepted;
+  }
+
+  function practiceRequestBody(text) {
+    return { text: String(text || "").trim() };
+  }
+
+  async function sendPracticeMessage(text, { summary = "", projectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey || selectedProjectKey(), attachments = [], viewSerial = state.practice.viewSerial } = {}) {
+    const id = String(state.currentSessionId || "");
+    const key = String(projectKey || "").trim();
+    const message = String(text || "").trim();
+    if (!id || !key || !message) return false;
+    if (state.practiceWindow.standalone) {
+      // Refresh immediately before a child send. This closes the small race
+      // where the parent has just submitted a project switch but the child's
+      // one-second observer has not received that session snapshot yet.
+      const latest = await refreshCurrentSession(id, { scroll: false, clearOptimistic: false });
+      if (!latest) return false;
+      markPracticeWindowStale();
+    }
+    if (state.practiceWindow.standalone && (state.practiceWindow.stale || state.practiceWindow.projectKey !== key || !practiceWindowSelectionMatches())) {
+      state.practiceWindow.stale = true;
+      renderAll();
+      toast("主窗口已切换练习项目；请关闭此窗口后从当前项目重新打开实操。", "error", 5200);
+      return false;
+    }
+    if (!canPrepareJobAction()) return false;
+    if (!practiceContextMatches(id, key, "", viewSerial)) return false;
+    if (!state.practice.threadId || state.practice.projectKey !== key) {
+      try {
+        await ensurePracticeThread(id, key, viewSerial);
+        if (!practiceContextMatches(id, key, "", viewSerial)) return false;
+        await refreshPracticeThread(id, state.practice.threadId, viewSerial);
+      } catch (error) {
+        if (!error || !error.practiceScopeChanged) toast(error.message || "无法打开实操窗口", "error");
+        return false;
+      }
+    }
+    if (!practiceContextMatches(id, key, state.practice.threadId, viewSerial)) return false;
+    const previousScope = state.workflowChat.scope;
+    const previousKey = state.workflowChat.practiceProjectKey;
+    state.workflowChat.scope = "practice";
+    state.workflowChat.practiceProjectKey = key;
+    const body = practiceRequestBody(message);
+    const imagePaths = attachments.filter(isSupportedImageAttachment).map((attachment) => attachment.path || attachment.name).filter(Boolean);
+    const textPaths = attachments.filter((attachment) => !isSupportedImageAttachment(attachment)).map((attachment) => attachment.path || attachment.name).filter(Boolean);
+    if (textPaths.length) body.text = `${body.text}\n\n已上传工作区附件，请使用相对路径读取：${textPaths.join("、")}`;
+    if (imagePaths.length) body.attachments = imagePaths;
+    const thread = String(state.practice.threadId || "").trim();
+    const accepted = await enqueueAction(`practice/${encodeURIComponent(thread)}/message`, body, id, {
+      optimisticText: message,
+      scope: "practice",
+      projectKey: key
+    });
+    // Keep the practice view selected while its job is running.  If a caller
+    // was only preparing a turn, restoring these fields avoids leaking scope
+    // into the home chat's next render.
+    if (!state.workflowChat.open) {
+      state.workflowChat.scope = previousScope;
+      state.workflowChat.practiceProjectKey = previousKey;
+    }
+    return accepted;
+  }
+
   const pageDrafts = new Map();
+  const projectFilterDrafts = new Map();
+  const projectFilterServerSnapshots = new Map();
   let pageSession = null;
   let profileTab = "text";
   let profileFiles = [];
+  let planProjectFiles = [];
   let pageSubmitting = false;
-  const PAGE_FIELDS = ["profileSource", "profileText", "profilePath", "profileAnswer", "planInclude", "planExclude", "planMinStars", "planRerank"];
+
+  function projectFilterSource(data = workflowData()) {
+    const raw = data && data.project_filter;
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  }
+
+  function dataProjectFilterForSession(sessionId = state.currentSessionId) {
+    const id = String(sessionId || "new");
+    const source = projectFilterSource(id === String(state.currentSessionId || "") ? workflowData() : {});
+    const draft = projectFilterDrafts.get(id) || {};
+    const value = (key, fallback = "") => draft[key] !== undefined ? draft[key] : source[key] !== undefined ? source[key] : fallback;
+    const minValue = value("min_stars", undefined);
+    const minStars = minValue === undefined || minValue === null || String(minValue).trim() === ""
+      ? "50"
+      : String(minValue).trim();
+    const includeValue = value("include", []);
+    const excludeValue = value("exclude", []);
+    const asText = (raw) => Array.isArray(raw) ? raw.join("、") : String(raw || "");
+    const asBool = (raw, fallback) => {
+      if (raw === undefined || raw === null || raw === "") return fallback;
+      if (typeof raw === "string") return !["false", "0", "no", "off"].includes(raw.trim().toLowerCase());
+      return Boolean(raw);
+    };
+    return {
+      minStars,
+      include: asText(includeValue),
+      exclude: asText(excludeValue),
+      other: String(value("other", "") || ""),
+      paperProjects: asBool(value("paper_projects", undefined), true),
+      rerank: asBool(value("rerank", undefined), true)
+    };
+  }
+
+  function rememberProjectFilter(sessionId, values = {}) {
+    const id = String(sessionId || state.currentSessionId || "new");
+    const current = dataProjectFilterForSession(id);
+    projectFilterDrafts.set(id, {
+      min_stars: String(values.minStars ?? current.minStars ?? "50"),
+      include: String(values.include ?? current.include ?? ""),
+      exclude: String(values.exclude ?? current.exclude ?? ""),
+      other: String(values.other ?? current.other ?? ""),
+      paper_projects: values.paperProjects == null ? current.paperProjects : Boolean(values.paperProjects),
+      rerank: values.rerank == null ? current.rerank : Boolean(values.rerank)
+    });
+  }
+
+  function projectFilterActionContext(values = dataProjectFilterForSession()) {
+    const rawMinStars = String(values.minStars ?? "").trim();
+    const minStars = rawMinStars === "" ? 50 : Number(rawMinStars);
+    return {
+      min_stars: Number.isFinite(minStars) && minStars >= 0 ? Math.trunc(minStars) : 50,
+      include: commaList(values.include),
+      exclude: commaList(values.exclude),
+      other: String(values.other || "").trim(),
+      paper_projects: Boolean(values.paperProjects),
+      rerank: Boolean(values.rerank)
+    };
+  }
+  const PAGE_FIELDS = ["profileSource", "profileText", "profilePath", "profileAnswer", "planInclude", "planExclude", "planMinStars", "planOther", "planRerank", "planPaperProjects", "planProjectUrl"];
   function syncPageDrafts() {
     const id = String(state.currentSessionId || "new");
     if (pageSession === id) return;
     if (pageSession !== null) {
       const values = {};
       PAGE_FIELDS.forEach((name) => { values[name] = $(name).type === "checkbox" ? $(name).checked : $(name).value; });
-      pageDrafts.set(pageSession, { values, tab: profileTab, files: profileFiles });
+      pageDrafts.set(pageSession, { values, tab: profileTab, files: profileFiles, projectFiles: planProjectFiles.map((item) => ({ ...item })) });
     }
     pageSession = id;
     const draft = pageDrafts.get(id);
-    PAGE_FIELDS.forEach((name) => { const el = $(name); const value = draft?.values[name] ?? (name === "planMinStars" ? "50" : name === "profileSource" ? "self_report" : name === "planRerank" ? true : ""); if (el.type === "checkbox") el.checked = value; else el.value = value; });
+    const savedFilter = dataProjectFilterForSession(id);
+    PAGE_FIELDS.forEach((name) => {
+      const el = $(name);
+      const filterValue = {
+        planInclude: savedFilter.include,
+        planExclude: savedFilter.exclude,
+        planMinStars: savedFilter.minStars,
+        planOther: savedFilter.other,
+        planRerank: savedFilter.rerank,
+        planPaperProjects: savedFilter.paperProjects
+      }[name];
+      const value = draft?.values[name] ?? (filterValue !== undefined ? filterValue : name === "planMinStars" ? "50" : name === "profileSource" ? "self_report" : ["planRerank", "planPaperProjects"].includes(name) ? true : "");
+      if (el.type === "checkbox") el.checked = value;
+      else el.value = value;
+    });
     profileFiles = draft?.files || [];
+    planProjectFiles = (draft?.projectFiles || []).map((item) => ({ ...item }));
     $("profileDocuments").value = "";
     setProfileTab(draft?.tab || "text");
     renderProfileFiles();
+    renderPlanProjectResources();
     setText($("profileImportStatus"), ""); setText($("planPageStatus"), "");
+  }
+
+  function syncPlanFilterControlsFromSession() {
+    const id = String(state.currentSessionId || "");
+    if (!id || projectFilterDrafts.has(id)) return;
+    const saved = dataProjectFilterForSession(id);
+    const controls = {
+      planInclude: saved.include,
+      planExclude: saved.exclude,
+      planMinStars: saved.minStars,
+      planOther: saved.other,
+      planRerank: saved.rerank,
+      planPaperProjects: saved.paperProjects
+    };
+    Object.entries(controls).forEach(([name, value]) => {
+      const el = $(name);
+      if (!el) return;
+      if (el.type === "checkbox") el.checked = Boolean(value);
+      else el.value = String(value ?? "");
+    });
+  }
+
+  function syncProjectFilterServerSnapshot() {
+    const id = String(state.currentSessionId || "");
+    if (!id || state.loadingSession || !state.currentSession || String(state.currentSession.id || "") !== id) return;
+    const signature = JSON.stringify(projectFilterSource(workflowData()));
+    const previous = projectFilterServerSnapshots.get(id);
+    if (previous !== undefined && previous !== signature && projectFilterDrafts.has(id)) {
+      // A main coach discussion or a completed filter action has produced a
+      // newer persisted value. Keep that confirmed session value ahead of an
+      // old local textarea draft.
+      projectFilterDrafts.delete(id);
+    }
+    projectFilterServerSnapshots.set(id, signature);
   }
   function setProfileTab(tab) {
     profileTab = tab;
@@ -1059,18 +2444,87 @@
     qsa("[data-profile-panel]").forEach((el) => el.classList.toggle("hidden", el.dataset.profilePanel !== tab));
   }
   function renderProfileFiles() { $("profileDocumentList").textContent = profileFiles.map((file) => file.name).join("、"); }
+  function projectResourcePath(resource) {
+    return String(resource && (resource.path || resource.name || resource.workspace_path || resource.workspacePath) || "").trim();
+  }
+  function projectResourceSourcePath(resource) {
+    return String(resource && (resource.source_path || resource.sourcePath || resource.original_path || resource.originalPath) || "").trim();
+  }
+  function projectResourceLabel(resource) {
+    const path = projectResourcePath(resource);
+    const sourcePath = projectResourceSourcePath(resource);
+    if (!path) return "未命名材料";
+    return sourcePath && sourcePath !== path ? `${path}（来源：${sourcePath}）` : path;
+  }
+  function validateProjectUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    let parsed;
+    try { parsed = new URL(raw); } catch (_) { throw new Error("项目 URL 必须是有效的 HTTPS 项目链接。"); }
+    if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.hash || (parsed.port && parsed.port !== "443")) throw new Error("项目 URL 必须是无凭据的 HTTPS 项目链接。");
+    if (parsed.hostname.includes(":")) throw new Error("项目 URL 暂不支持 IPv6 字面量。");
+    const credentialKeys = new Set(["token", "access_token", "api_key", "apikey", "key", "auth", "authorization"]);
+    for (const key of parsed.searchParams.keys()) {
+      if (credentialKeys.has(String(key).trim().toLowerCase().replace(/-/g, "_"))) throw new Error("项目 URL 查询参数不能携带凭据。");
+    }
+    return parsed.href;
+  }
+  function renderPlanProjectResources() {
+    const list = $("planProjectResourceList");
+    if (!list) return;
+    list.replaceChildren();
+    planProjectFiles.forEach((resource, index) => {
+      const row = document.createElement("div");
+      row.className = "plan-project-resource";
+      const label = document.createElement("span");
+      label.textContent = projectResourceLabel(resource);
+      row.appendChild(label);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "plan-project-resource-remove";
+      remove.textContent = "移除";
+      remove.setAttribute("aria-label", `移除复现项目材料 ${projectResourcePath(resource) || index + 1}`);
+      remove.addEventListener("click", () => {
+        planProjectFiles = planProjectFiles.filter((_item, itemIndex) => itemIndex !== index);
+        renderPlanProjectResources();
+      });
+      row.appendChild(remove);
+      list.appendChild(row);
+    });
+    const url = String($("planProjectUrl")?.value || "").trim();
+    if (!planProjectFiles.length && !url) {
+      const empty = document.createElement("span");
+      empty.className = "plan-project-resource-empty";
+      empty.textContent = "尚未添加项目链接或本地材料。";
+      list.appendChild(empty);
+    }
+  }
   function renderWorkflowPage() {
+    syncProjectFilterServerSnapshot();
     syncPageDrafts();
     if (!state.pageView) return;
+    syncPlanFilterControlsFromSession();
     const step = WORKFLOW_STEPS.find((item) => item.id === state.selectedStep);
     $("workflowPage").classList.remove("hidden"); $("chatHome").classList.add("hidden");
     $("workflowPageTitle").textContent = step.title;
     $("workflowPageHint").textContent = step.hint;
     qsa(".step-page").forEach((page) => page.classList.toggle("hidden", page.id !== `${step.id}Page`));
-    const busy = sessionBusy(state.currentSession) || state.jobs.has(String(state.currentSessionId));
-    $("workflowPageStatus").textContent = state.currentSession?.pending ? "当前操作等待确认。返回对话查看详情并批准或拒绝。" : busy ? "正在处理；可返回对话查看回复与运行记录。" : "";
-    $("workflowPageStatus").classList.toggle("hidden", !state.currentSession?.pending && !busy);
-    ["profileImportSubmit", "planGenerate", "practiceStarter"].forEach((id) => { $(id).disabled = Boolean(pageSubmitting || busy || state.currentSession?.pending || state.loadingSession); });
+    const busy = sessionBusy(state.currentSession);
+    const queued = sessionHasQueue(state.currentSession);
+    $("workflowPageStatus").textContent = state.currentSession?.pending
+      ? "当前操作等待确认；请在已打开的对话窗口中核对并批准或拒绝。"
+      : queued
+        ? `上一轮还有 ${Number(state.currentSession?.queued_calls || 0)} 个工具调用等待恢复；请在对话窗口点击“继续执行工具队列”。`
+        : busy
+          ? "正在处理；回复、运行记录和待确认操作会显示在对话窗口。"
+          : "";
+    $("workflowPageStatus").classList.toggle("hidden", !state.currentSession?.pending && !busy && !queued);
+    ["profileImportSubmit", "planGenerate", "planProjectRegister", "planProjectUpload", "planProjectLocalImport", "planProjectUrl", "planOther", "planOtherDiscuss", "planPaperProjects", "planRerank"].forEach((id) => { const control = $(id); if (control) control.disabled = Boolean(pageSubmitting || busy || queued || state.currentSession?.pending || state.loadingSession); });
+    const practiceOpen = $("practiceStarter");
+    // Opening practice is always a read/view action.  A pending main turn or
+    // a running queue blocks starting another turn, but must not hide durable
+    // practice history or its scoped status window.
+    if (practiceOpen) practiceOpen.disabled = Boolean(pageSubmitting || state.loadingSession);
     const results = $(`${step.id}PageResults`);
     results.replaceChildren(); renderJobPane(results);
     qs(".workflow-intro", results)?.remove();
@@ -1085,15 +2539,15 @@
     $("planGenerate").disabled ||= missingPlan;
     $("practiceStarter").disabled ||= missingPractice;
     $("profileCopy").disabled = !data.profile || state.loadingSession || state.newSession.busy;
-    $("profileManual").disabled = Boolean(state.loadingSession || state.newSession.busy || state.currentSession?.pending || busy);
+    $("profileManual").disabled = Boolean(state.loadingSession || state.newSession.busy || state.currentSession?.pending || busy || queued);
     if (step.id === "plan") qsa(".job-card", results).forEach((card) => { if (qs("h3", card)?.textContent === "下一步与差距") card.remove(); });
     if (step.id === "profile") qsa(".job-card", results).forEach((card) => { if (qs("h3", card)?.textContent === "已有技能") card.remove(); });
     if (step.id === "profile" && data.profile?.skills?.length) {
       if (data.profile.summary) { const summary = document.createElement("p"); summary.className = "profile-summary"; summary.textContent = data.profile.summary; results.prepend(summary); }
-      results.prepend(pageTable("当前档案", ["技能", "熟练程度", "事实证据"], data.profile.skills.map((skill) => [typeof skill === "string" ? skill : skill.name || skill.skill, jobEnumLabel(skill.proficiency || skill.level || skill.status), skill.evidence || skill.proof])));
+      results.prepend(pageTable("当前档案", ["技能", "熟练程度", "事实证据"], data.profile.skills.map((skill) => [typeof skill === "string" ? skill : skill.name || skill.skill, jobEnumLabel(skill.proficiency || skill.level || skill.status), skill.evidence || skill.proof]), { className: "profile-table", headerLines: { "熟练程度": ["熟练", "程度"] } }));
     }
     if (step.id === "plan" && data.plan) {
-      results.prepend(pageTable("差距分析", ["岗位要求", "已有技能", "状态", "说明"], (data.plan.gaps || []).map((gap) => [typeof gap === "string" ? gap : gap.requirement || gap.name || gap.skill, gap.matched_skill, jobEnumLabel(gap.status || gap.priority), gap.note])));
+      results.prepend(pageTable("差距分析", ["岗位要求", "已有技能", "状态", "说明"], (data.plan.gaps || []).map((gap) => [typeof gap === "string" ? gap : gap.requirement || gap.name || gap.skill, typeof gap === "object" ? gap.matched_skill || gap.matchedSkill || gap.existing_skill || gap.existingSkill || gap.skill_match : "", jobEnumLabel(typeof gap === "object" ? gap.status || gap.priority : ""), typeof gap === "object" ? gap.note || gap.description || gap.reason : ""]), { className: "gap-analysis-table" }));
       const phases = document.createElement("section"); phases.className = "job-card";
       const title = document.createElement("h3"); title.textContent = "分阶段学习计划"; phases.appendChild(title);
       (data.plan.phases || []).forEach((phase) => { const item = document.createElement("div"); item.className = "plan-phase"; const h = document.createElement("h4"); h.textContent = typeof phase === "string" ? phase : `${phase.phase || phase.title || phase.name || "学习阶段"}${phase.duration_weeks ? ` · ${phase.duration_weeks} 周` : ""}`; item.appendChild(h); for (const key of ["goal", "topics", "suggested_practice", "tasks", "checkpoints"]) { if (phase[key]) { const p = document.createElement("p"); p.textContent = `${({goal:"目标",topics:"学习内容",suggested_practice:"建议练习",tasks:"任务",checkpoints:"检查点"})[key]}：${Array.isArray(phase[key]) ? phase[key].map((value) => typeof value === "string" ? value : jobItemText(value, ["title", "name", "description", "text"]) || safeString(value)).join("、") : typeof phase[key] === "string" ? phase[key] : safeString(phase[key])}`; item.appendChild(p); } } phases.appendChild(item); });
@@ -1101,27 +2555,43 @@
     }
     if (step.id === "jd") {
       if ($("jdImportBackdrop").parentNode !== $("jdPageImport")) $("jdPageImport").appendChild($("jdImportBackdrop"));
-      $("jdImportBackdrop").classList.remove("hidden");
+      if (!state.workflowChat.open) $("jdImportBackdrop").classList.remove("hidden");
       if (state.jdImport.sessionId !== String(state.currentSessionId || "")) {
         if (state.jdImport.open) saveJdDraft();
         state.jdImport.sessionId = String(state.currentSessionId || "");
         JD_FIELDS.forEach((id) => { $(id).value = jdDraft().fields[id] || (id === "jdPlatform" ? "boss" : ""); });
         setJdMode(jdDraft().mode); renderJdFiles();
       }
-      state.jdImport.open = true;
+      if (!state.workflowChat.open) state.jdImport.open = true;
     }
-    if (step.id === "practice" && qs(".chat-column").parentNode !== $("practiceChatHost")) $("practiceChatHost").appendChild(qs(".chat-column"));
+    const practiceChatOpen = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const chatTitle = practiceChatOpen
+      ? `Agent 实操 · ${state.practice.projectTitle || projectDisplayTitle(data.selected_project) || "当前项目"}`
+      : (step ? `${step.title} · 当前会话` : "求职辅导对话");
+    setText($("workflowChatTitle"), chatTitle);
+    const chatKicker = qs(".workflow-chat-header .inspect-kicker");
+    if (chatKicker) chatKicker.textContent = practiceChatOpen ? "当前练习项目 · 独立记录" : "当前会话";
+    $("workflowChatBackdrop")?.setAttribute("aria-hidden", state.workflowChat.open ? "false" : "true");
     enhanceVoiceInputs($("workflowPage"));
   }
-  function pageTable(title, headers, rows) {
-    const card = document.createElement("section"); card.className = "job-card page-table-card";
+  function pageTable(title, headers, rows, options = {}) {
+    const card = document.createElement("section"); card.className = `job-card page-table-card${options.className ? ` ${options.className}` : ""}`;
     const heading = document.createElement("h3"); heading.textContent = title; card.appendChild(heading);
     const table = document.createElement("table"); const head = document.createElement("thead"); const row = document.createElement("tr");
-    headers.forEach((value) => { const cell = document.createElement("th"); cell.textContent = value; row.appendChild(cell); }); head.appendChild(row); table.appendChild(head);
+    headers.forEach((value) => {
+      const cell = document.createElement("th");
+      const lines = options.headerLines && options.headerLines[value];
+      if (Array.isArray(lines) && lines.length) {
+        cell.className = "table-header-lines";
+        cell.setAttribute("aria-label", value);
+        lines.forEach((line) => { const lineNode = document.createElement("span"); lineNode.textContent = line; cell.appendChild(lineNode); });
+      } else cell.textContent = value;
+      row.appendChild(cell);
+    }); head.appendChild(row); table.appendChild(head);
     const body = document.createElement("tbody"); rows.forEach((values) => { const row = document.createElement("tr"); values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = value == null ? "—" : typeof value === "object" ? safeString(value) : String(value); row.appendChild(cell); }); body.appendChild(row); }); table.appendChild(body); card.appendChild(table); return card;
   }
-  async function sendPageAction(text, status, attachments = [], sessionId = state.currentSessionId) {
-    if (state.loadingSession || state.currentSession?.pending || sessionBusy(state.currentSession) || state.jobs.has(String(state.currentSessionId))) throw new Error("请先完成当前操作或等待会话运行结束。");
+  async function sendPageAction(text, status, attachments = [], sessionId = state.currentSessionId, actionContext = null) {
+    if (state.loadingSession || state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) throw new Error("请先完成当前操作或点击“继续执行工具队列”。");
     if (sessionId && String(sessionId) !== String(state.currentSessionId)) throw new Error("会话已切换，输入已保留，请在原会话重试。");
     if (!state.currentSessionId) await createSession();
     const id = String(state.currentSessionId);
@@ -1129,9 +2599,12 @@
     const textPaths = attachments.filter((item) => !isSupportedImageAttachment(item)).map((item) => item.path || item.name).filter(Boolean);
     const composed = textPaths.length ? `${text}\n\n已上传工作区附件，请使用 read_document 或文件读取工具读取相对路径：${textPaths.join("、")}` : text;
     const body = { text: composed }; if (imagePaths.length) body.attachments = imagePaths;
+    if (actionContext && typeof actionContext === "object") body.workflow_action = actionContext;
     const accepted = await enqueueAction("message", body, id, { optimisticText: composed });
     if (!accepted) throw new Error("发送失败，输入已保留。");
-    status.textContent = "已提交。返回对话可查看回复与待确认操作，结果会同步到本页。";
+    if (String(state.currentSessionId) !== id) throw new Error("会话已切换，输入已保留，请在原会话重试。");
+    openWorkflowChatDialog();
+    status.textContent = "已提交；对话窗口已打开，回复和待确认操作会同步到本页。";
   }
   async function submitProfilePage(event) {
     event.preventDefault(); if (pageSubmitting) return;
@@ -1143,7 +2616,7 @@
     const status = $("profileImportStatus");
     pageSubmitting = true; $("profileImportSubmit").disabled = true;
     try {
-      if (state.loadingSession || sessionBusy(state.currentSession) || state.currentSession?.pending) throw new Error("请先完成当前操作。");
+      if (state.loadingSession || sessionTurnBlocked(state.currentSession) || state.currentSession?.pending) throw new Error("请先完成当前操作或点击“继续执行工具队列”。");
       if (tab === "text" && !materialText.trim()) throw new Error("请填写技能材料。");
       if (tab === "documents" && !files.length) throw new Error("请先选择文档。");
       if (tab === "obsidian" && !materialPath) throw new Error("请填写本地路径。");
@@ -1166,28 +2639,121 @@
     } catch (error) { status.textContent = error.message; }
     finally { pageSubmitting = false; renderWorkflowPage(); }
   }
+  function discussPlanOther() {
+    if (!canPrepareJobAction()) return;
+    const id = String(state.currentSessionId || "");
+    const values = {
+      minStars: String($("planMinStars")?.value || "").trim(),
+      include: String($("planInclude")?.value || "").trim(),
+      exclude: String($("planExclude")?.value || "").trim(),
+      other: String($("planOther")?.value || "").trim(),
+      paperProjects: Boolean($("planPaperProjects")?.checked),
+      rerank: Boolean($("planRerank")?.checked)
+    };
+    rememberProjectFilter(id, values);
+    const prompt = values.other
+      ? `我想和你讨论并细化项目筛选要求。当前“其他要求”是：${values.other}。请结合岗位差距和已有项目候选，指出需要澄清的取舍；确认后调用 set_project_filter，把最终筛选偏好保存到当前会话，后续搜索和计划都遵守。`
+      : "我想和你讨论项目筛选要求。请结合岗位差距和已有项目候选，询问我最需要补充的限制或偏好；确认后调用 set_project_filter，把最终筛选偏好保存到当前会话，后续搜索和计划都遵守。";
+    const summary = "讨论并确认项目筛选要求";
+    Promise.resolve(sendTrustedWorkflowAction(prompt, "plan", summary, { project_filter: projectFilterActionContext(values) })).then((accepted) => {
+      if (accepted && String(state.currentSessionId || "") === id) projectFilterDrafts.delete(id);
+    });
+  }
   async function submitPlanPage(event) {
     event.preventDefault(); if (pageSubmitting) return;
     const data = workflowData(); const status = $("planPageStatus");
     if (!data.jd || !data.profile) { status.textContent = "请先填写并确认岗位 JD 和技能档案。"; return; }
     const stars = Number($("planMinStars").value);
     if (!Number.isInteger(stars) || stars < 0) { status.textContent = "最低 star 数应为非负整数。"; return; }
+    const includeKeywords = String($("planInclude").value || "").trim();
+    const excludeKeywords = String($("planExclude").value || "").trim();
+    const otherRequirements = String($("planOther").value || "").trim();
+    const rerankProjects = Boolean($("planRerank").checked);
+    const paperProjects = Boolean($("planPaperProjects").checked);
+    let projectUrl = String($("planProjectUrl").value || "").trim();
+    if (projectUrl) {
+      try { projectUrl = validateProjectUrl(projectUrl); }
+      catch (error) { status.textContent = error.message; return; }
+    }
+    const projectFiles = planProjectFiles.map((resource) => ({ ...resource }));
+    const projectResources = projectFiles.map((resource) => projectResourcePath(resource)).filter(Boolean);
+    const projectResourceLabels = projectFiles.map((resource) => projectResourceLabel(resource)).filter(Boolean);
+    const projectSourceText = projectUrl || projectResources.length
+      ? `另外，请评估我提供的自有复现项目。项目 URL：${projectUrl || "未提供"}；项目材料工作区路径：${projectResources.length ? projectResources.join("、") : "未提供"}；材料来源标记：${projectResourceLabels.length ? projectResourceLabels.join("、") : "未提供"}。请先读取 URL 或这些材料，再用 register_project 把它登记为候选，保留 source.kind（user_url、upload 或 local_import）、source.evidence、source.url 和 source.paths 等真实来源字段；不要自动 select_project 或执行代码。只能把 URL 或材料中明确可核验的内容作为事实；不要把我的项目影响力、结果或完成状态写成未经证明的事实。`
+      : "没有自有复现项目材料；请只搜索并展示外部候选。";
+    const paperSearchText = paperProjects
+      ? "调用 search_projects 时启用 include_paper_implementations=true，优先寻找与当前岗位差距相关、同时有可核验论文和开源仓库证据的高影响力项目；先读取 README、引用文件和公开论文来源，再只使用真实论文/DOI、仓库链接以及可核验的公开引用或 star 等指标，并把论文依据保留为 paper_evidence。无法核验时明确标注未知，绝不编造影响力、引用数、star 数或项目结果。"
+      : "调用 search_projects 时使用 include_paper_implementations=false；不额外优先论文或高影响力开源项目，但所有候选仍必须保留真实仓库链接并明确可核验依据，不能编造影响力或项目结果。";
     pageSubmitting = true;
-    try { await sendPageAction(`请基于当前已确认 JD 与技能档案生成差距分析、分阶段学习计划（含任务、检查点），并搜索真实 GitHub 复现项目。包含关键词：${$("planInclude").value || "不限"}；排除关键词：${$("planExclude").value || "无"}；最低 star 数：${stars}。${$("planRerank").checked ? "由你比较候选项目与我的差距并说明排序理由。" : "按搜索匹配度展示候选项目。"}保存计划与候选项目，等待我选择项目，不要自动开始实操。`, status); }
+    try {
+      let id = String(state.currentSessionId || "");
+      if (!id) {
+        id = await createSession();
+        if (!id) throw new Error("无法创建岗位会话，请重试。");
+        if (String(state.currentSessionId) !== id) throw new Error("会话已切换，输入已保留，请在原会话重试。");
+        planProjectFiles = projectFiles;
+        $("planInclude").value = includeKeywords;
+        $("planExclude").value = excludeKeywords;
+        $("planMinStars").value = String(stars);
+        $("planOther").value = otherRequirements;
+        $("planRerank").checked = rerankProjects;
+        $("planPaperProjects").checked = paperProjects;
+        $("planProjectUrl").value = projectUrl;
+        renderPlanProjectResources();
+      }
+      rememberProjectFilter(id, { minStars: String(stars), include: includeKeywords, exclude: excludeKeywords, other: otherRequirements, paperProjects, rerank: rerankProjects });
+      await sendPageAction(`请基于当前已确认 JD 与技能档案生成差距分析、分阶段学习计划（含任务、检查点），并搜索真实 GitHub 复现项目。包含关键词：${includeKeywords || "不限"}；排除关键词：${excludeKeywords || "无"}；最低 star 数：${stars}；其他要求：${otherRequirements || "无"}。${rerankProjects ? "由你比较候选项目与我的差距并说明排序理由。" : "按搜索匹配度展示候选项目。"}${paperSearchText}\n${projectSourceText}\n保存本次项目筛选偏好（尤其是其他要求），后续重新搜索和计划调整继续遵守；等待我选择项目，不要自动开始实操。`, status, projectFiles, id, { step: "plan", summary: "生成差距分析、学习计划和项目候选", project_filter: projectFilterActionContext({ minStars: String(stars), include: includeKeywords, exclude: excludeKeywords, other: otherRequirements, paperProjects, rerank: rerankProjects }) });
+      projectFilterDrafts.delete(id);
+    }
     catch (error) { status.textContent = error.message; }
     finally { pageSubmitting = false; renderWorkflowPage(); }
   }
 
-  function draftWorkflowPrompt(text) {
-    const input = $("composerInput");
-    if (input.value.trim()) { toast("消息框已有草稿，请先发送或清空后再准备引导。", ""); return; }
-    input.value = `${text}\n只处理当前步骤；完成后展示结果，等待我选择下一步，不要自行推进其他阶段。`;
-    resizeComposer();
-    if (window.matchMedia("(max-width: 900px)").matches) {
-      $("inspectPane").classList.add("collapsed");
-      $("inspectorToggle").setAttribute("aria-expanded", "false");
+  async function submitOwnProjectPage() {
+    if (pageSubmitting) return;
+    const status = $("planPageStatus");
+    let projectUrl = String($("planProjectUrl").value || "").trim();
+    const projectFiles = planProjectFiles.map((resource) => ({ ...resource }));
+    const projectResources = projectFiles.map((resource) => projectResourcePath(resource)).filter(Boolean);
+    if (!projectUrl && !projectResources.length) {
+      status.textContent = "请先提供项目 URL、上传文件或导入本地材料。";
+      return;
     }
-    input.focus();
+    if (projectUrl) {
+      try { projectUrl = validateProjectUrl(projectUrl); }
+      catch (error) { status.textContent = error.message; return; }
+    }
+    const sourceKind = projectUrl ? "使用 user_url；若同时有文件，source.paths 也必须保留这些材料" : "按每条材料的真实来源使用 upload 或 local_import";
+    const sourcePaths = projectResources.length ? projectFiles.map((resource) => projectResourceLabel(resource)).filter(Boolean).join("、") : "未提供";
+    pageSubmitting = true;
+    try {
+      if (state.loadingSession || sessionTurnBlocked(state.currentSession) || state.currentSession?.pending) throw new Error("请先完成当前操作或点击“继续执行工具队列”。");
+      let id = String(state.currentSessionId || "");
+      if (!id) {
+        id = await createSession();
+        if (!id) throw new Error("无法创建岗位会话，请重试。");
+        if (String(state.currentSessionId) !== id) throw new Error("会话已切换，项目材料已保留，请在目标会话重试。");
+        // createSession renders a fresh draft. Restore the captured source so
+        // a successful registration never clears the user's project entry.
+        planProjectFiles = projectFiles;
+        $("planProjectUrl").value = projectUrl;
+        renderPlanProjectResources();
+      }
+      await sendPageAction(`请只评估我提供的自有复现项目并把它加入当前候选项目。项目 URL：${projectUrl || "未提供"}；项目材料工作区路径：${sourcePaths}。请先读取 URL 或这些材料，再调用 register_project 登记候选；source.kind 请按真实来源使用 ${sourceKind}，并保留 source.evidence、source.url、source.paths。若 URL 与材料同时存在，source.evidence 要分别说明，不能丢失任一来源。若岗位 JD、技能档案或学习计划尚未准备好，只说明暂缺比较依据，仍先读取并登记候选；已有计划和外部候选保持原样，不要触发外部项目检索或生成、重算学习计划。不要 select_project，不要执行代码。只能使用 URL 或材料中可核验的项目名称、代码、论文和结果；影响力、星标、论文关联或完成状态无法核验时标为待核实，不要补写。`, status, projectFiles, id);
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      pageSubmitting = false;
+      renderWorkflowPage();
+    }
+  }
+
+  function draftWorkflowPrompt(text) {
+    // This button is a material-entry affordance. Keep the user's composer
+    // untouched and carry only a short, structured action context into the
+    // next message they explicitly send.
+    if (!canPrepareJobAction()) return;
+    setPendingWorkflowAction(state.selectedStep);
   }
 
   function renderStepIntro(root, data) {
@@ -1220,7 +2786,7 @@
     }
     if (step.id === "jd") { const imports = document.createElement("button"); imports.type = "button"; imports.className = "action-button primary"; imports.textContent = "导入 / 搜索岗位 JD"; imports.addEventListener("click", openJdImport); actions.prepend(imports); }
     card.appendChild(actions);
-    const note = document.createElement("small"); note.textContent = "准备引导只填写消息草稿；由你点击发送后才会处理。"; card.appendChild(note);
+    const note = document.createElement("small"); note.textContent = "准备对话引导会记录动作上下文；请在消息框补充材料后发送。"; card.appendChild(note);
     root.appendChild(card);
   }
 
@@ -1266,7 +2832,93 @@
 
   function projectIdentity(project) {
     if (!project || typeof project !== "object") return "";
-    return String(project.full_name || project.fullName || project.repository || project.name || project.html_url || project.url || "").trim();
+    return String(project.project_key || project.projectKey || project.id || project.full_name || project.fullName || project.repository || project.name || project.html_url || project.url || "").trim();
+  }
+
+  function projectSourceMeta(project) {
+    if (!project || typeof project !== "object") return {};
+    const source = project.source || project.source_meta || project.sourceMeta;
+    return source && typeof source === "object" && !Array.isArray(source) ? source : {};
+  }
+
+  function projectSourceKind(project) {
+    const source = projectSourceMeta(project);
+    return String(project && (project.source_kind || project.sourceKind) || source.kind || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  }
+
+  function projectUrl(project) {
+    if (!project || typeof project !== "object") return "";
+    const source = projectSourceMeta(project);
+    const values = [project.html_url, project.repository_url, project.repo_url, project.url, source.url, project.source_url];
+    for (const raw of values) {
+      const value = String(raw || "").trim();
+      if (!value) continue;
+      try {
+        const parsed = new URL(value);
+        if (["https:", "http:"].includes(parsed.protocol) && parsed.hostname) return parsed.href;
+      } catch (_) { /* candidate URLs are untrusted display data */ }
+    }
+    return "";
+  }
+
+  function projectPathHints(project) {
+    const source = projectSourceMeta(project);
+    const values = [];
+    for (const raw of [project.source_paths, project.sourcePaths, project.paths, source.paths, project.workspace_paths, project.workspacePaths]) {
+      if (Array.isArray(raw)) values.push(...raw);
+      else if (raw) values.push(raw);
+    }
+    return values.map((value) => String(value || "").trim()).filter(Boolean);
+  }
+
+  function stableProjectLabel(value) {
+    const text = String(value || "").trim();
+    return text && !/^(?:user|local):[a-z0-9_-]{8,}$/i.test(text) ? text : "";
+  }
+
+  function projectDisplayTitle(project) {
+    if (!project || typeof project !== "object") return "未命名项目";
+    for (const raw of [project.display_name, project.displayName, project.title, project.full_name, project.fullName, project.name, project.repository]) {
+      const value = stableProjectLabel(raw);
+      if (value) return value;
+    }
+    const url = projectUrl(project);
+    if (url) {
+      try {
+        const parsed = new URL(url);
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        if (parts.length) return `自有复现项目 · ${parts[parts.length - 1]}`;
+      } catch (_) { /* fall through to source paths */ }
+    }
+    const paths = projectPathHints(project);
+    if (paths.length) {
+      const raw = paths[0].replace(/[\\/]+$/, "");
+      const parts = raw.split(/[\\/]/).filter(Boolean);
+      if (parts.length) return `自有复现项目 · ${parts[parts.length - 1]}`;
+    }
+    return projectSourceKind(project) ? "我的复现项目" : "未命名项目";
+  }
+
+  function projectIsLocalOnly(project) {
+    const kind = projectSourceKind(project);
+    if (["upload", "local_import", "local_path"].includes(kind)) return true;
+    return !projectUrl(project) && projectPathHints(project).length > 0;
+  }
+
+  function projectSourceLabel(project) {
+    const kind = projectSourceKind(project);
+    if (["local_import", "local_path", "local"].includes(kind)) return "本地导入";
+    if (["upload", "imported_material"].includes(kind)) return "上传材料";
+    if (["user_url", "url", "github", "paper_implementation"].includes(kind)) return "项目链接";
+    return "";
+  }
+
+  function projectStars(project) {
+    if (projectIsLocalOnly(project) || project && project.user_provided === true) return null;
+    const raw = project && (project.stargazers_count ?? project.stars ?? project.star_count);
+    if (raw === null || raw === undefined || String(raw).trim() === "") return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
   }
 
   function projectHistoryEntries(data) {
@@ -1341,14 +2993,11 @@
   function requestProjectSwitch(project) {
     const id = projectIdentity(project);
     if (!id || !state.currentSessionId) return;
-    if (!canPrepareJobAction()) return;
-    const name = String(project.full_name || project.name || id);
-    const text = `请切换到练习项目“${name}”。调用 select_project，使用 full_name=${name}，恢复该项目已有的练习进度；不要清空或覆盖其他项目的历史记录。切换完成后说明当前项目状态。`;
-    const input = $("composerInput");
-    input.value = text;
-    resizeComposer();
+    const name = projectDisplayTitle(project);
+    const summary = `切换练习项目：${name}`;
+    const text = `${summary}。候选 project_key=${id}。请调用 select_project，并使用这个 project_key 恢复已有进度，返回当前项目状态。`;
     selectWorkflowStep("practice");
-    void sendMessage();
+    sendTrustedWorkflowAction(text, "practice", summary, { project_key: id }, { openChat: false });
   }
 
   function renderProjectHistory(root, data) {
@@ -1375,11 +3024,11 @@
       body.className = "project-history-body";
       const name = document.createElement("strong");
       name.className = "project-history-name";
-      name.textContent = String(item.project.full_name || item.project.name || item.identity);
+      name.textContent = projectDisplayTitle(item.project);
       body.appendChild(name);
       const meta = document.createElement("span");
       meta.className = "project-history-meta";
-      const language = item.project.language ? String(item.project.language) : "";
+      const language = item.project.language ? String(item.project.language) : projectSourceLabel(item.project);
       meta.textContent = [language, projectHistoryStatus(item), projectProgressSummary(item)].filter(Boolean).join(" · ");
       body.appendChild(meta);
       row.appendChild(body);
@@ -1388,7 +3037,7 @@
       action.className = item.isCurrent ? "project-history-current" : "job-card-action";
       action.textContent = item.isCurrent ? "当前" : "切换并继续";
       action.disabled = item.isCurrent;
-      action.setAttribute("aria-label", item.isCurrent ? `当前项目 ${name.textContent}` : `切换到项目 ${name.textContent}`);
+       action.setAttribute("aria-label", item.isCurrent ? `当前项目 ${name.textContent}` : `切换到项目 ${name.textContent}`);
       if (!item.isCurrent) action.addEventListener("click", () => requestProjectSwitch(item.project));
       row.appendChild(action);
       list.appendChild(row);
@@ -1424,6 +3073,74 @@
       if (typeof item === "string") return item;
       return jobItemText(item, ["requirement", "name", "skill", "tag", "text", "title", "description"]);
     }).filter(Boolean).join("\n") : "";
+  }
+
+  function editableListEditor(label, field, value, { hint = "每行一项", placeholder = "请输入内容", multiline = false } = {}) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "job-edit-field job-edit-list-field";
+    wrapper.dataset.jobEditList = field;
+    wrapper.setAttribute("data-job-edit-list", field);
+    const labelNode = document.createElement("label");
+    labelNode.textContent = label;
+    wrapper.appendChild(labelNode);
+
+    const list = document.createElement("div");
+    list.className = "job-edit-list";
+    const values = Array.isArray(value) ? value.map((item) => {
+      if (typeof item === "string" || typeof item === "number") return String(item);
+      return jobItemText(item, ["requirement", "name", "skill", "tag", "text", "title", "description", "responsibility"]);
+    }).map((item) => String(item || "").trim()).filter(Boolean) : [];
+    const appendRow = (item = "", focus = false) => {
+      const row = document.createElement("div");
+      row.className = "job-edit-list-row";
+      row.dataset.jobEditListRow = field;
+      row.setAttribute("data-job-edit-list-row", field);
+      const input = document.createElement(multiline ? "textarea" : "input");
+      if (!multiline) input.type = "text";
+      input.className = "job-edit-list-input";
+      input.dataset.jobEditListInput = field;
+      input.setAttribute("data-job-edit-list-input", field);
+      input.value = item == null ? "" : String(item);
+      input.placeholder = placeholder;
+      if (multiline) input.rows = 2;
+      input.setAttribute("aria-label", `${label}条目`);
+      row.appendChild(input);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "job-edit-list-remove";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", `移除${label}这一行`);
+      remove.addEventListener("click", () => row.remove());
+      row.appendChild(remove);
+      list.appendChild(row);
+      if (focus && typeof input.focus === "function") input.focus();
+      return row;
+    };
+    values.forEach((item) => appendRow(item));
+    if (!values.length) appendRow();
+    wrapper.appendChild(list);
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "inspect-inline-action job-edit-list-add";
+    add.textContent = "添加一项";
+    add.addEventListener("click", () => appendRow("", true));
+    wrapper.appendChild(add);
+    if (hint) {
+      const hintNode = document.createElement("span");
+      hintNode.className = "job-edit-field-hint";
+      hintNode.textContent = hint;
+      wrapper.appendChild(hintNode);
+    }
+    return wrapper;
+  }
+
+  function readEditableList(field) {
+    const fields = $("jobEditFields");
+    return qsa(`[data-job-edit-list-row="${field}"]`, fields).map((row) => {
+      const input = qs(`[data-job-edit-list-input="${field}"]`, row);
+      return String(input && input.value || "").trim();
+    }).filter(Boolean);
   }
 
   const PROFILE_PROFICIENCIES = [
@@ -1533,9 +3250,15 @@
 
   function openJobEditor(kind, value) {
     if (!kind || !value || !state.currentSessionId) return;
+    // A pending save belongs to the editor instance that started it. Opening a
+    // fresh editor invalidates that instance so a late response cannot close or
+    // unlock the new editor.
+    state.jobEditor.serial += 1;
     state.jobEditor.open = true;
     state.jobEditor.kind = kind;
     state.jobEditor.value = JSON.parse(JSON.stringify(value));
+    state.jobEditor.sessionId = String(state.currentSessionId);
+    state.jobEditor.busy = false;
     state.jobEditor.previousFocus = document.activeElement;
     const fields = $("jobEditFields");
     fields.replaceChildren();
@@ -1549,11 +3272,11 @@
         jobEditField("地点", "location", draft.location),
         jobEditField("团队", "team", draft.team),
         jobEditField("概况", "raw_summary", draft.raw_summary, { multiline: true }),
-        jobEditField("硬性要求", "hard_requirements", editableList(draft.hard_requirements), { multiline: true, hint: "每行一项" }),
-        jobEditField("技能标签", "skill_tags", editableList(draft.skill_tags), { multiline: true, hint: "每行一项" }),
-        jobEditField("工作职责", "responsibilities", editableList(draft.responsibilities), { multiline: true, hint: "每行一项" }),
-        jobEditField("加分项", "nice_to_haves", editableList(draft.nice_to_haves), { multiline: true, hint: "每行一项" }),
-        jobEditField("不确定字段", "uncertain_fields", editableList(draft.uncertain_fields), { multiline: true, hint: "每行一个字段名，例如 salary、location" })
+        editableListEditor("硬性要求", "hard_requirements", draft.hard_requirements, { multiline: true, placeholder: "例如：熟悉 Python" }),
+        editableListEditor("技能标签", "skill_tags", draft.skill_tags, { placeholder: "例如：Python" }),
+        editableListEditor("工作职责", "responsibilities", draft.responsibilities, { multiline: true, placeholder: "例如：负责模型训练与部署" }),
+        editableListEditor("加分项", "nice_to_haves", draft.nice_to_haves, { multiline: true, placeholder: "例如：有竞赛或开源经验" }),
+        editableListEditor("不确定字段", "uncertain_fields", draft.uncertain_fields, { hint: "每行一个字段名，例如 salary、location", placeholder: "例如：salary" })
       );
     } else {
       const draft = state.jobEditor.value;
@@ -1574,11 +3297,14 @@
 
   function closeJobEditor() {
     if (!state.jobEditor.open) return;
-    if (state.voice.active && state.voice.target && $("jobEditBackdrop").contains(state.voice.target)) stopVoiceInput();
+    if ((state.voice.active || state.voice.stopping) && state.voice.target && $("jobEditBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    state.jobEditor.serial += 1;
     state.jobEditor.open = false;
     state.jobEditor.value = null;
+    state.jobEditor.sessionId = "";
+    state.jobEditor.busy = false;
     $("jobEditBackdrop").classList.add("hidden");
-    if (!state.modelSettings.open && !state.newSession.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.newSession.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
     const previous = state.jobEditor.previousFocus;
     state.jobEditor.previousFocus = null;
     if (previous && typeof previous.focus === "function" && document.contains(previous)) previous.focus();
@@ -1626,15 +3352,30 @@
 
   async function saveJobEditor(event) {
     event.preventDefault();
-    if (!state.jobEditor.open || !state.jobEditor.value) return;
+    if (!state.jobEditor.open || !state.jobEditor.value || state.jobEditor.busy) return;
+    const sessionId = String(state.jobEditor.sessionId || "");
+    if (!sessionId || String(state.currentSessionId || "") !== sessionId) return;
+    const saveToken = ++state.jobEditor.serial;
+    const saveIsCurrent = () => state.jobEditor.open
+      && state.jobEditor.busy
+      && state.jobEditor.serial === saveToken
+      && state.jobEditor.sessionId === sessionId
+      && String(state.currentSessionId || "") === sessionId;
     const draft = JSON.parse(JSON.stringify(state.jobEditor.value));
     let missingEvidence = [];
     qsa("[data-job-edit-field]", $("jobEditFields")).forEach((field) => {
       const key = field.dataset.jobEditField;
-      if (["hard_requirements", "skill_tags", "responsibilities", "nice_to_haves", "open_questions", "uncertain_fields"].includes(key)) draft[key] = linesFromField(field);
+      // JD collection fields use one control per item. Profile's existing
+      // open_questions textarea remains intentionally unchanged.
+      if (key === "open_questions") draft[key] = linesFromField(field);
       else draft[key] = String(field.value || "").trim();
     });
     const kind = state.jobEditor.kind;
+    if (kind === "jd") {
+      ["hard_requirements", "skill_tags", "responsibilities", "nice_to_haves", "uncertain_fields"].forEach((key) => {
+        draft[key] = readEditableList(key);
+      });
+    }
     if (kind === "profile") {
       const profileSkills = readProfileSkillsEditor(draft.skills, draft.open_questions);
       draft.skills = profileSkills.skills;
@@ -1643,78 +3384,357 @@
     }
     const kindLabel = kind === "jd" ? "岗位 JD" : "技能档案";
     const button = $("jobEditSave");
+    state.jobEditor.busy = true;
     button.disabled = true;
+    qsa("input, textarea, select, button", $("jobEditFields")).forEach((control) => { control.disabled = true; });
     setText($("jobEditStatus"), `正在保存${kindLabel}…`);
     try {
-      const payload = await request(`/sessions/${encodeURIComponent(state.currentSessionId)}/${kind}`, { method: "POST", body: { [kind]: draft, confirmed: true } });
+      const payload = await request(`/sessions/${encodeURIComponent(sessionId)}/${kind}`, { method: "POST", body: { [kind]: draft, confirmed: true } });
+      if (!saveIsCurrent()) return;
       const session = unwrapSession(payload);
       if (session && session.id) state.currentSession = session;
-      else await refreshCurrentSession(state.currentSessionId, { scroll: false });
+      else await refreshCurrentSession(sessionId, { scroll: false });
+      if (!saveIsCurrent()) return;
       // JD edits also change the sidebar title. Refresh the summaries before
       // rendering so both the row and the top title use the new JD immediately.
       await refreshSessions();
-      const summary = state.sessions.find((row) => String(row.id) === String(state.currentSessionId));
+      if (!saveIsCurrent()) return;
+      const summary = state.sessions.find((row) => String(row.id) === sessionId);
       if (summary && state.currentSession) state.currentSession = { ...state.currentSession, title: summary.title, job_title: summary.job_title, company: summary.company };
+      if (!saveIsCurrent()) return;
+      state.jobEditor.busy = false;
       closeJobEditor();
       renderAll();
       toast(missingEvidence.length ? `${kindLabel}已确认并保存；${missingEvidence.length} 项缺少事实证据，已转入待澄清问题。` : `${kindLabel}已确认并保存。`, "success");
     } catch (error) {
-      setText($("jobEditStatus"), `保存失败：${error.message || "无法保存资料"}`);
+      if (saveIsCurrent()) setText($("jobEditStatus"), `保存失败：${error.message || "无法保存资料"}`);
     } finally {
-      button.disabled = false;
+      if (saveIsCurrent()) {
+        state.jobEditor.busy = false;
+        button.disabled = false;
+        qsa("input, textarea, select, button", $("jobEditFields")).forEach((control) => { control.disabled = false; });
+      }
     }
   }
 
   function commaList(value) {
-    return String(value || "").split(/[，,]/).map((item) => item.trim()).filter(Boolean);
+    return String(value || "").split(/[，,、]/).map((item) => item.trim()).filter(Boolean);
   }
 
   function canPrepareJobAction() {
     if (state.currentSession?.pending) { toast("请先批准或拒绝当前操作。", ""); return false; }
-    if (sessionBusy(state.currentSession)) { toast("当前会话仍在运行，请等待完成。", ""); return false; }
-    if ($("composerInput").value.trim()) { toast("消息框已有草稿，请先发送或清空后继续。", ""); return false; }
+    if (sessionTurnBlocked(state.currentSession)) {
+      toast(sessionHasQueue(state.currentSession) ? "上一轮工具队列待恢复，请先点击“继续执行工具队列”。" : "当前会话仍在运行，请等待完成。", "");
+      return false;
+    }
     return true;
   }
 
-  function submitProjectFilter() {
+  function currentProjectFilterCard() {
+    return qs(".project-filter-card", $("inspectContent"))
+      || qs(".project-filter-card", $("planPageResults"));
+  }
+
+  function projectFilterControl(card, key) {
+    return card && card._projectFilterControls && card._projectFilterControls[key]
+      ? card._projectFilterControls[key]
+      : qs(`[data-job-filter="${key}"]`, card);
+  }
+
+  function submitProjectFilter(sourceCard = null) {
     if (!canPrepareJobAction()) return;
-    const card = qs(".project-filter-card", $("inspectContent"));
+    const card = sourceCard || currentProjectFilterCard();
     if (!card) return;
-    const minStars = String((qs('[data-job-filter="minStars"]', card) || {}).value || "").trim();
-    const include = commaList((qs('[data-job-filter="include"]', card) || {}).value);
-    const exclude = commaList((qs('[data-job-filter="exclude"]', card) || {}).value);
-    if (!minStars && !include.length && !exclude.length) { toast("请先填写至少一项筛选偏好。", ""); return; }
-    const lines = ["请按下面的明确偏好重新搜索并整理候选练习项目，仍在当前求职工作流中处理："];
-    if (minStars) lines.push(`最低星标数：${minStars}`);
-    if (include.length) lines.push(`包含关键词：${include.join("、")}`);
-    if (exclude.length) lines.push(`排除关键词：${exclude.join("、")}`);
-    lines.push("搜索完成后展示候选项目，并说明每个项目与当前岗位差距的对应关系。");
-    const input = $("composerInput"); input.value = lines.join("\n"); resizeComposer();
-    void sendMessage();
+    const minStars = String((projectFilterControl(card, "minStars") || {}).value || "").trim();
+    const include = commaList((projectFilterControl(card, "include") || {}).value);
+    const exclude = commaList((projectFilterControl(card, "exclude") || {}).value);
+    const other = String((projectFilterControl(card, "other") || {}).value || "").trim();
+    const paperProjects = Boolean((projectFilterControl(card, "paperProjects") || {}).checked);
+    const rerank = Boolean((projectFilterControl(card, "rerank") || {}).checked);
+    if (!minStars && !include.length && !exclude.length && !other && !paperProjects && !rerank) { toast("请先填写至少一项筛选偏好。", ""); return; }
+    const filterValues = { minStars: minStars, include: include.join("、"), exclude: exclude.join("、"), other, paperProjects, rerank };
+    rememberProjectFilter(state.currentSessionId, filterValues);
+    const summaryParts = ["重新筛选练习项目"];
+    if (minStars) summaryParts.push(`最低 star ${minStars}`);
+    if (include.length) summaryParts.push(`包含 ${include.join("、")}`);
+    if (exclude.length) summaryParts.push(`排除 ${exclude.join("、")}`);
+    if (other) summaryParts.push(`其他要求：${other}`);
+    if (paperProjects) summaryParts.push("查找相关高影响力论文的开源实现（只接受可核验依据）");
+    const summary = `${summaryParts.join("；")}。`;
+    const text = `${summary}请搜索真实候选项目，并说明它们与当前岗位差距的对应关系。${other ? `请把这些额外要求作为筛选条件并记录到当前会话：${other}。` : ""}${paperProjects ? "查找相关高影响力论文的开源实现；核对论文来源、代码关联及影响力依据，不足时标为待核实，绝不编造。" : "仍请保留真实来源链接和可核验依据，不要编造项目影响力或结果。"}`;
+    const id = String(state.currentSessionId || "");
+    Promise.resolve(sendTrustedWorkflowAction(text, "plan", summary, { project_filter: projectFilterActionContext(filterValues) })).then((accepted) => {
+      // Keep the per-session draft while the request is in flight (and after a
+      // failure). Once the server has accepted the workflow action, its
+      // persisted project_filter is authoritative and a later render can
+      // absorb model-confirmed refinements without an old textarea winning.
+      if (accepted && String(state.currentSessionId || "") === id) projectFilterDrafts.delete(id);
+    });
+  }
+
+  function discussProjectFilter(sourceCard = null) {
+    if (!canPrepareJobAction()) return;
+    const card = sourceCard || currentProjectFilterCard();
+    if (!card) return;
+    const values = {
+      minStars: String((projectFilterControl(card, "minStars") || {}).value || "").trim(),
+      include: String((projectFilterControl(card, "include") || {}).value || "").trim(),
+      exclude: String((projectFilterControl(card, "exclude") || {}).value || "").trim(),
+      other: String((projectFilterControl(card, "other") || {}).value || "").trim(),
+      paperProjects: Boolean((projectFilterControl(card, "paperProjects") || {}).checked),
+      rerank: Boolean((projectFilterControl(card, "rerank") || {}).checked)
+    };
+    rememberProjectFilter(state.currentSessionId, values);
+    const prompt = values.other
+      ? `我想和你讨论并细化项目筛选要求。当前其他要求是：${values.other}。请结合岗位差距和已有项目候选，指出需要澄清的取舍；确认后把最终筛选偏好保存到当前会话，后续搜索和计划都遵守。`
+      : "我想和你讨论项目筛选要求。请结合岗位差距和已有项目候选，询问我最需要补充的限制或偏好；确认后把最终筛选偏好保存到当前会话，后续搜索和计划都遵守。";
+    const summary = "讨论并确认项目筛选要求";
+    const id = String(state.currentSessionId || "");
+    Promise.resolve(sendTrustedWorkflowAction(prompt, "plan", summary, { project_filter: projectFilterActionContext(values) })).then((accepted) => {
+      if (accepted && String(state.currentSessionId || "") === id) projectFilterDrafts.delete(id);
+    });
   }
 
   function startSelectedProject(repo) {
-    if (!canPrepareJobAction()) return;
-    const name = String(repo && (repo.full_name || repo.name) || "").trim();
+    const projectKey = projectIdentity(repo);
+    if (!projectKey) return;
+    const name = projectDisplayTitle(repo);
     if (!name) return;
-    const input = $("composerInput");
-    input.value = `我选用练习项目 ${name}。请调用当前求职工作流记录这个项目，并先给出今天的上手步骤，再开始实践。`;
-    resizeComposer();
+    const summary = `选用练习项目：${name}`;
+    const text = `${summary}。候选 project_key=${projectKey}。请调用 select_project 使用这个 project_key 记录当前项目，先给出今天的上手步骤，等待我按步骤实践。`;
     selectWorkflowStep("practice");
-    void sendMessage();
+    sendTrustedWorkflowAction(text, "practice", summary, { project_key: projectKey }, { openChat: false });
   }
 
-  function answerClarification(question) {
-    if (!canPrepareJobAction()) return;
+  function clarificationQuestionKey(question) {
+    return String(question || "").trim();
+  }
+
+  function clarificationDraftKey(sessionId, question) {
+    return `${String(sessionId || "")}:${clarificationQuestionKey(question)}`;
+  }
+
+  function clarificationJobFor(sessionId, questionKey = "") {
+    const entry = state.clarification.jobs.get(String(sessionId || ""));
+    return entry && (!questionKey || entry.questionKey === questionKey) ? entry : null;
+  }
+
+  function clarificationStatus(message, kind = "") {
+    state.clarification.status = String(message || "");
+    state.clarification.statusKind = String(kind || "");
+    const node = $("clarificationStatus");
+    if (!node) return;
+    node.className = `clarification-status-message${kind ? ` ${kind}` : ""}`;
+    node.textContent = state.clarification.status;
+    node.setAttribute("aria-busy", kind === "loading" ? "true" : "false");
+  }
+
+  function clarificationFeedbackText(terminalPayload, confirmed = false) {
+    // This must be the result of this clarification job.  Never search the
+    // session transcript: a late result from another action could otherwise
+    // make this modal display an unrelated old assistant message.
+    const result = terminalPayload && terminalPayload.result;
+    const resultMessage = result && typeof result === "object"
+      ? String(result.message || result.assistant_text || "").trim()
+      : "";
+    if (resultMessage) return resultMessage.slice(0, 4000);
+    return confirmed ? "档案已更新，待澄清问题列表已刷新。" : "模型已完成处理，但待澄清问题仍保留。";
+  }
+
+  function clarificationEntryBlocked(entry) {
+    return Boolean(entry && entry.blocked);
+  }
+
+  function clarificationEntryActive(entry) {
+    return Boolean(entry && !entry.blocked && entry.active !== false);
+  }
+
+  function clarificationSessionBlocked(session, result = null) {
+    const resultStatus = String(result && result.status || "").trim().toLowerCase();
+    const executionStatus = String(session && session.execution && session.execution.status || "").trim().toLowerCase();
+    const blockedStatuses = new Set([
+      "pending", "paused", "uncertain", "waiting_approval", "waiting-approval",
+      "needs_approval", "needs-approval", "queued", "running"
+    ]);
+    return blockedStatuses.has(resultStatus)
+      || Boolean(result && result.pending)
+      || Boolean(session && session.pending)
+      || sessionHasQueue(session)
+      || blockedStatuses.has(executionStatus);
+  }
+
+  function clarificationSnapshotFor(session, sessionId) {
+    const id = String(sessionId || "");
+    if (!session || !id || String(session.id || "") !== id) return null;
+    const root = session.skill_state;
+    const data = root && typeof root === "object" ? root["job-radar"] : null;
+    if (!data || typeof data !== "object") return null;
+    const profile = data.profile;
+    // A session shell can arrive before the job-radar profile is loaded.  A
+    // missing open_questions array is therefore not evidence that a question
+    // was answered.
+    if (!profile || typeof profile !== "object" || !Array.isArray(profile.open_questions)) return null;
+    const clarification = data.clarification && typeof data.clarification === "object" ? data.clarification : {};
+    const questions = [...new Set([
+      ...profile.open_questions,
+      ...(Array.isArray(clarification.open_questions) ? clarification.open_questions : [])
+    ].map((item) => String(item || "").trim()).filter(Boolean))];
+    return { data, profile, clarification, questions };
+  }
+
+  function syncClarificationModal({ preserveAnswer = true } = {}) {
+    const modal = $("clarificationBackdrop");
+    if (!modal) return;
+    modal.classList.toggle("hidden", !state.clarification.open);
+    if (!state.clarification.open) return;
+    setText($("clarificationQuestion"), state.clarification.question);
+    const answer = $("clarificationAnswer");
+    if (answer && (!preserveAnswer || document.activeElement !== answer)) answer.value = state.clarification.answer;
+    if (answer) answer.disabled = Boolean(state.clarification.busy);
+    const send = $("clarificationSend");
+    if (send) {
+      send.disabled = Boolean(state.clarification.busy || (!state.clarification.completed && !String(state.clarification.answer || "").trim()));
+      send.textContent = state.clarification.completed ? "已完成" : state.clarification.busy ? "发送中…" : "发送回答";
+    }
+    const close = $("clarificationClose");
+    if (close) close.disabled = false;
+    const recovery = $("clarificationRecovery");
+    const entry = clarificationJobFor(state.clarification.sessionId, state.clarification.questionKey);
+    const blocked = Boolean(
+      clarificationEntryBlocked(entry)
+      || state.currentSession?.pending
+      || sessionHasQueue(state.currentSession)
+      || ["paused", "uncertain", "waiting_approval", "waiting-approval"].includes(String(state.currentSession?.execution?.status || "").toLowerCase())
+    );
+    if (recovery) {
+      recovery.classList.toggle("hidden", !blocked);
+      recovery.disabled = false;
+    }
+    const feedback = $("clarificationFeedback");
+    if (feedback) {
+      feedback.classList.toggle("hidden", !state.clarification.feedback);
+      feedback.textContent = state.clarification.feedback;
+    }
+    clarificationStatus(state.clarification.status, state.clarification.statusKind);
+  }
+
+  function openClarificationModal(question) {
     const text = String(question || "").trim();
-    if (!text) return;
-    const input = $("composerInput");
-    input.value = `我来回答待澄清问题：“${text}”\n请先听取我的事实回答，并更新当前会话中的技能档案；回答清楚后从待澄清列表移除这个问题。`;
-    resizeComposer();
-    showSharedChat();
-    input.focus();
-    input.setSelectionRange(input.value.length, input.value.length);
-    toast("问题已带入消息框，请补充事实后发送。", "success", 3600);
+    const sessionId = String(state.currentSessionId || "");
+    if (!text || !sessionId || state.loadingSession) return;
+    const key = clarificationQuestionKey(text);
+    const draftKey = clarificationDraftKey(sessionId, text);
+    const running = clarificationJobFor(sessionId, key);
+    state.clarification.open = true;
+    state.clarification.sessionId = sessionId;
+    state.clarification.question = text;
+    state.clarification.questionKey = key;
+    state.clarification.answer = running?.answer || state.clarification.drafts.get(draftKey) || "";
+    // An awaitingConfirmation entry means the backend result was ambiguous;
+    // it must remain retryable and must not be presented as a saved answer
+    // when the modal is opened again.
+    state.clarification.completed = false;
+    state.clarification.busy = clarificationEntryActive(running);
+    state.clarification.feedback = "";
+    state.clarification.previousFocus = document.activeElement;
+    state.clarification.serial += 1;
+    if (clarificationEntryActive(running)) clarificationStatus("正在处理你的回答，关闭窗口不会取消后台任务。", "loading");
+    else if (clarificationEntryBlocked(running)) clarificationStatus("请先打开对话处理当前操作；答案会保留，处理完成后继续更新。", "error");
+    else if (running?.awaitingSnapshot || running?.awaitingConfirmation) clarificationStatus("暂时无法确认档案保存状态；答案已保留，可以稍后重试。", "error");
+    else if (state.currentSession?.pending) clarificationStatus("当前会话等待审批，请先处理对话中的审批操作。", "error");
+    else if (sessionHasQueue(state.currentSession)) clarificationStatus("当前会话有待恢复工具队列，请打开对话继续执行。", "error");
+    else clarificationStatus("只填写与问题相关的事实、项目、日志或材料路径。回答与结果会保存到当前会话。", "");
+    $("clarificationBackdrop").classList.remove("hidden");
+    document.body.classList.add("modal-open");
+    syncClarificationModal({ preserveAnswer: false });
+    $("clarificationAnswer").focus();
+  }
+
+  function closeClarificationModal({ restore = true } = {}) {
+    if (!state.clarification.open) return;
+    if ((state.voice.active || state.voice.stopping) && state.voice.target && $("clarificationBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    state.clarification.open = false;
+    $("clarificationBackdrop").classList.add("hidden");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
+    const previous = state.clarification.previousFocus;
+    state.clarification.previousFocus = null;
+    if (restore) restoreSidebarAwareFocus(previous);
+  }
+
+  async function submitClarification(event) {
+    event.preventDefault();
+    if (!state.clarification.open) return;
+    if (state.clarification.completed) {
+      closeClarificationModal();
+      return;
+    }
+    if (state.clarification.busy) return;
+    const sessionId = String(state.clarification.sessionId || "");
+    const question = String(state.clarification.question || "").trim();
+    const answer = String($("clarificationAnswer")?.value || "").trim();
+    if (!sessionId || sessionId !== String(state.currentSessionId || "")) {
+      clarificationStatus("会话已切换，请关闭窗口后在当前会话重新打开问题。", "error");
+      return;
+    }
+    if (!answer) {
+      clarificationStatus("请填写事实回答后再发送。", "error");
+      $("clarificationAnswer")?.focus();
+      return;
+    }
+    if (state.currentSession?.pending) {
+      clarificationStatus("当前会话等待审批，请打开对话处理审批。", "error");
+      syncClarificationModal();
+      return;
+    }
+    if (sessionTurnBlocked(state.currentSession)) {
+      clarificationStatus(sessionHasQueue(state.currentSession) ? "当前会话有待恢复工具队列，请打开对话继续执行。" : "当前会话正在处理，请稍候。", "error");
+      syncClarificationModal();
+      return;
+    }
+    const key = clarificationQuestionKey(question);
+    const token = ++state.clarification.serial;
+    const entry = {
+      token,
+      sessionId,
+      question,
+      questionKey: key,
+      answer,
+      baseMessageCount: visibleMessages(state.currentSession).length,
+      jobId: ""
+    };
+    state.clarification.answer = answer;
+    state.clarification.drafts.set(clarificationDraftKey(sessionId, question), answer);
+    state.clarification.jobs.set(sessionId, entry);
+    state.clarification.busy = true;
+    state.clarification.feedback = "";
+    clarificationStatus("正在处理你的回答，回答与结果会保存到当前会话…", "loading");
+    syncClarificationModal();
+    const summary = `回答待澄清问题：${question}`;
+    // The server builds the fixed clarification action and validates the
+    // question under the session lock. Do not send a client-authored prompt
+    // through the ordinary message route or start a second model/session.
+    const body = { question, answer };
+    const accepted = await enqueueAction("clarification", body, sessionId, {
+      optimisticText: `${summary}\n事实回答：${answer}`,
+      clarificationContext: entry
+    });
+    if (!accepted) {
+      const current = state.clarification.jobs.get(sessionId);
+      if (current && current.token === token) {
+        state.clarification.jobs.delete(sessionId);
+        state.clarification.busy = false;
+        clarificationStatus("发送失败，答案已保留；请修正后重试。", "error");
+        syncClarificationModal();
+      }
+      return;
+    }
+    // Older services can complete a short message synchronously and omit a
+    // job id. Treat that response as complete after enqueueAction refreshes the
+    // authoritative session snapshot.
+    const current = state.clarification.jobs.get(sessionId);
+    if (current && current.token === token && !current.jobId && !state.jobs.has(sessionId)) {
+      finishClarificationJob(sessionId, { status: "completed", result: {} }, state.currentSession);
+    }
   }
 
   const JD_FIELDS = ["jdSourceUrl", "jdSourceText", "jdPlatform", "jdQuery", "jdImageNote"];
@@ -1786,7 +3806,7 @@
     }
     const id = state.jdImport.sessionId;
     if (state.loadingSession || String(state.currentSessionId) !== id) { setText($("jdImportStatus"), "会话已切换，请关闭后在目标会话重新打开。"); return; }
-    if (state.currentSession?.pending || sessionBusy(state.currentSession) || state.jobs.has(id)) { setText($("jdImportStatus"), "请先处理当前待确认操作或等待会话运行完成。"); return; }
+    if (state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) { setText($("jdImportStatus"), "请先处理当前待确认操作、等待运行完成或点击“继续执行工具队列”。"); return; }
     saveJdDraft(); const draft = jdDraft(); const fields = draft.fields; let text = "";
     if (kind === "search") {
       if (!fields.jdQuery.trim()) { setText($("jdImportStatus"), "请填写岗位名称或方向。"); return; }
@@ -1808,14 +3828,14 @@
     try {
       const attachments = [];
       if (kind === "image") for (const file of draft.files) attachments.push(await uploadOne(file));
-      if (String(state.currentSessionId) !== id || state.loadingSession || state.currentSession?.pending || sessionBusy(state.currentSession) || state.jobs.has(id)) throw new Error("会话状态已变化，输入已保留，请稍后重试。");
+      if (String(state.currentSessionId) !== id || state.loadingSession || state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) throw new Error("会话状态已变化，输入已保留，请稍后重试。");
       const body = { text }; if (attachments.length) body.attachments = attachments.map((item) => item.path);
       const accepted = await enqueueAction("message", body, id, { optimisticText: text });
       if (!accepted) throw new Error("发送失败，输入已保留，请重试。");
       if (kind === "search") $("jdQuery").value = "";
       else if (kind === "source") { $("jdSourceUrl").value = ""; $("jdSourceText").value = ""; }
       else { draft.files = []; $("jdImageNote").value = ""; }
-      saveJdDraft(); state.jdImport.busy = false; setText($("jdImportStatus"), "已提交，结果会同步到本页。返回对话可查看回复与待确认操作。");
+       saveJdDraft(); state.jdImport.busy = false; openWorkflowChatDialog(); setText($("jdImportStatus"), "已提交；对话窗口已打开，结果会同步到本页。");
     } catch (error) { setText($("jdImportStatus"), error.message || "导入失败，输入已保留。"); }
     finally { state.jdImport.busy = false; qsa("button, input, textarea, select", $("jdImportBackdrop")).forEach((el) => { el.disabled = false; }); $("jdImportSubmit").textContent = "交给 AI 整理 JD"; renderJdFiles(); }
   }
@@ -1829,11 +3849,13 @@
     if (!stateData) { const empty = document.createElement("div"); empty.className = "inspect-empty"; empty.textContent = "在对话中提供 JD、已有技能或简历材料后，相关资料会显示在这里。"; root.appendChild(empty); return; }
     if (["plan", "practice"].includes(step)) renderProjectHistory(root, stateData);
     if (step === "jd" && stateData.jd) {
-      const jdCard = jobObjectCard("目标 JD", stateData.jd, ["job_title", "company", "salary", "location", "team", "raw_summary", "uncertain_fields"], "jd");
-      appendJobList(jdCard, "硬性要求", stateData.jd.hard_requirements, (item) => jobItemText(item, ["requirement", "name", "text", "title"]));
-      appendJobList(jdCard, "技能标签", stateData.jd.skill_tags, (item) => jobItemText(item, ["name", "skill", "tag", "text"]));
-      appendJobList(jdCard, "岗位职责", stateData.jd.responsibilities, (item) => jobItemText(item, ["responsibility", "name", "text", "title"]));
-      appendJobList(jdCard, "加分项", stateData.jd.nice_to_haves, (item) => jobItemText(item, ["requirement", "name", "text", "title"]));
+      const jdCard = jdObjectCard(stateData.jd);
+      appendJobList(jdCard, "硬性要求", stateData.jd.hard_requirements, (item) => jobItemText(item, ["requirement", "name", "text", "title"]), { listTag: "ul", listClass: "jd-requirement-list", limit: null });
+      appendJobList(jdCard, "技能标签", stateData.jd.skill_tags, (item) => jobItemText(item, ["name", "skill", "tag", "text"]), { listClass: "job-chip-list", itemClass: "job-chip", limit: null });
+      appendJobList(jdCard, "工作职责", stateData.jd.responsibilities, (item) => jobItemText(item, ["responsibility", "name", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list", limit: null });
+      appendJobList(jdCard, "加分项", stateData.jd.nice_to_haves, (item) => jobItemText(item, ["requirement", "name", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list", limit: null });
+      appendJobList(jdCard, "待确认字段", stateData.jd.uncertain_fields, (item) => jobItemText(item, ["field", "name", "key", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list jd-uncertain-list", limit: null });
+      appendJdSummary(jdCard, stateData.jd);
       root.appendChild(jdCard);
     }
     if (step === "profile" && stateData.profile) {
@@ -1850,7 +3872,15 @@
     const clarification = stateData.clarification && typeof stateData.clarification === "object" ? stateData.clarification : {};
     const profileQuestions = stateData.profile && Array.isArray(stateData.profile.open_questions) ? stateData.profile.open_questions : [];
     const clarificationQuestions = Array.isArray(clarification.open_questions) ? clarification.open_questions : [];
-    const questions = [...new Set([...clarificationQuestions, ...profileQuestions].map((item) => String(item || "").trim()).filter(Boolean))];
+    const pendingClarification = state.clarification.jobs.get(String(state.currentSessionId || ""));
+    const questions = [...new Set([
+      ...clarificationQuestions,
+      ...profileQuestions,
+      // Keep a question visible until this session's clarification job has
+      // supplied confirmed=true.  A transient or unconfirmed snapshot must
+      // never make a still-unverified question disappear from the UI.
+      ...(pendingClarification?.question ? [pendingClarification.question] : [])
+    ].map((item) => String(item || "").trim()).filter(Boolean))];
     if (step === "profile" && (questions.length || (stateData.profile && clarification.status))) {
       const card = document.createElement("section"); card.className = "job-card clarification-card";
       const head = document.createElement("div"); head.className = "job-card-head";
@@ -1867,7 +3897,7 @@
         questions.slice(0, 12).forEach((question) => {
           const row = document.createElement("div"); row.className = "clarification-row";
           const text = document.createElement("span"); text.className = "clarification-question"; text.textContent = question; row.appendChild(text);
-          const answer = document.createElement("button"); answer.type = "button"; answer.className = "job-card-action"; answer.textContent = "现在回答"; answer.addEventListener("click", () => answerClarification(question)); row.appendChild(answer);
+          const answer = document.createElement("button"); answer.type = "button"; answer.className = "job-card-action"; answer.textContent = "现在回答"; answer.setAttribute("aria-label", `回答待澄清问题：${question}`); answer.addEventListener("click", () => openClarificationModal(question)); row.appendChild(answer);
           list.appendChild(row);
         });
         card.appendChild(list);
@@ -1891,17 +3921,38 @@
       const filterTitle = document.createElement("h3"); filterTitle.textContent = "调整项目筛选"; filterHead.appendChild(filterTitle); filterCard.appendChild(filterHead);
       const filterHint = document.createElement("p"); filterHint.className = "job-edit-field-hint"; filterHint.textContent = "按明确偏好重新搜索。"; filterCard.appendChild(filterHint);
       const filterFields = document.createElement("div"); filterFields.className = "project-filter-fields";
-      const minStars = document.createElement("input"); minStars.type = "number"; minStars.min = "0"; minStars.step = "1"; minStars.placeholder = "最低星标数"; minStars.dataset.jobFilter = "minStars"; minStars.setAttribute("aria-label", "最低星标数");
-      const include = document.createElement("input"); include.type = "text"; include.placeholder = "包含关键词（逗号分隔）"; include.dataset.jobFilter = "include"; include.setAttribute("aria-label", "包含关键词");
-      const exclude = document.createElement("input"); exclude.type = "text"; exclude.placeholder = "排除关键词（逗号分隔）"; exclude.dataset.jobFilter = "exclude"; exclude.setAttribute("aria-label", "排除关键词");
-      filterFields.append(minStars, include, exclude); filterCard.appendChild(filterFields);
-      const filterButton = document.createElement("button"); filterButton.type = "button"; filterButton.className = "action-button secondary project-filter-submit"; filterButton.textContent = "重新搜索"; filterButton.addEventListener("click", submitProjectFilter); filterCard.appendChild(filterButton);
+      const filterValues = dataProjectFilterForSession(state.currentSessionId);
+      const rememberField = (key, control) => control.addEventListener("input", () => rememberProjectFilter(state.currentSessionId, { [key]: control.value }));
+      const minStars = document.createElement("input"); minStars.type = "number"; minStars.min = "0"; minStars.step = "1"; minStars.placeholder = "最低星标数"; minStars.value = filterValues.minStars; minStars.dataset.jobFilter = "minStars"; minStars.setAttribute("aria-label", "最低星标数"); rememberField("minStars", minStars);
+      const include = document.createElement("input"); include.type = "text"; include.placeholder = "包含关键词（逗号分隔）"; include.value = filterValues.include; include.dataset.jobFilter = "include"; include.setAttribute("aria-label", "包含关键词"); rememberField("include", include);
+      const exclude = document.createElement("input"); exclude.type = "text"; exclude.placeholder = "排除关键词（逗号分隔）"; exclude.value = filterValues.exclude; exclude.dataset.jobFilter = "exclude"; exclude.setAttribute("aria-label", "排除关键词"); rememberField("exclude", exclude);
+      const other = document.createElement("textarea"); other.rows = 3; other.placeholder = "其他要求（例如：优先轻量、文档完整、能在 Windows 本地复现）"; other.value = filterValues.other; other.dataset.jobFilter = "other"; other.setAttribute("aria-label", "其他项目筛选要求"); rememberField("other", other);
+      const paperLabel = document.createElement("label"); paperLabel.className = "project-filter-checkbox";
+      const paper = document.createElement("input"); paper.type = "checkbox"; paper.checked = filterValues.paperProjects; paper.dataset.jobFilter = "paperProjects"; paper.setAttribute("aria-label", "查找相关高影响力论文的开源实现"); paper.addEventListener("change", () => rememberProjectFilter(state.currentSessionId, { paperProjects: paper.checked }));
+      paperLabel.append(paper, document.createTextNode("查找相关高影响力论文的开源实现"));
+      const rerankLabel = document.createElement("label"); rerankLabel.className = "project-filter-checkbox";
+      const rerank = document.createElement("input"); rerank.type = "checkbox"; rerank.checked = filterValues.rerank; rerank.dataset.jobFilter = "rerank"; rerank.setAttribute("aria-label", "使用 AI 教练比较候选项目"); rerank.addEventListener("change", () => rememberProjectFilter(state.currentSessionId, { rerank: rerank.checked }));
+      rerankLabel.append(rerank, document.createTextNode("使用 AI 教练比较候选项目"));
+      filterCard._projectFilterControls = { minStars, include, exclude, other, paperProjects: paper, rerank };
+      filterFields.append(minStars, include, exclude, other); filterCard.append(filterFields, paperLabel, rerankLabel);
+      const discussButton = document.createElement("button"); discussButton.type = "button"; discussButton.className = "action-button secondary project-filter-discuss"; discussButton.textContent = "和教练讨论筛选要求"; discussButton.addEventListener("click", () => discussProjectFilter(filterCard)); filterCard.appendChild(discussButton);
+      const filterButton = document.createElement("button"); filterButton.type = "button"; filterButton.className = "action-button secondary project-filter-submit"; filterButton.textContent = "重新搜索"; filterButton.addEventListener("click", () => submitProjectFilter(filterCard)); filterCard.appendChild(filterButton);
       root.appendChild(filterCard);
     }
-    if (["plan", "practice"].includes(step) && stateData.selected_project) root.appendChild(jobObjectCard("已选练习项目", stateData.selected_project, ["full_name", "language", "stargazers_count", "html_url"]));
+    if (["plan", "practice"].includes(step) && stateData.selected_project) {
+      const selectedProject = { ...stateData.selected_project, full_name: projectDisplayTitle(stateData.selected_project) };
+      if (!selectedProject.language) selectedProject.language = projectSourceLabel(stateData.selected_project);
+      const selectedUrl = projectUrl(stateData.selected_project);
+      if (selectedUrl) selectedProject.html_url = selectedUrl;
+      else delete selectedProject.html_url;
+      const selectedStars = projectStars(stateData.selected_project);
+      if (selectedStars == null) delete selectedProject.stargazers_count;
+      else selectedProject.stargazers_count = selectedStars;
+      root.appendChild(jobObjectCard("已选练习项目", selectedProject, ["full_name", "language", "stargazers_count", "html_url"]));
+    }
     if (step === "plan" && Array.isArray(stateData.repos) && stateData.repos.length) {
       const card = document.createElement("section"); card.className = "job-card"; const h = document.createElement("h3"); h.textContent = `候选练习项目 · ${stateData.repos.length}`; card.appendChild(h);
-      stateData.repos.slice(0, 8).forEach((repo) => { const row = document.createElement("div"); row.className = "job-repo"; const info = document.createElement("div"); const strong = document.createElement("strong"); strong.textContent = String(repo.full_name || repo.name || "未命名项目"); info.appendChild(strong); if (repo.html_url) { try { const url = new URL(repo.html_url); if (["https:", "http:"].includes(url.protocol)) { const link = document.createElement("a"); link.href = url.href; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = "查看 GitHub 仓库 ↗"; info.appendChild(link); } } catch (_) {} } const span = document.createElement("span"); span.textContent = `${repo.language || "未知语言"}${repo.stargazers_count != null ? ` · ${repo.stargazers_count} 星标` : ""}`; info.appendChild(span); for (const key of ["description", "reason", "match_score"]) { if (repo[key] != null) { const detail = document.createElement("p"); detail.className = "repo-detail"; detail.textContent = `${key === "match_score" ? "匹配分：" : key === "reason" ? "推荐理由：" : ""}${key === "match_score" && Number.isFinite(Number(repo[key])) ? `${Math.round(Number(repo[key]) <= 1 ? Number(repo[key]) * 100 : Number(repo[key]))}%` : repo[key]}`; info.appendChild(detail); } } row.appendChild(info); const use = document.createElement("button"); use.type = "button"; use.className = "job-card-action"; use.textContent = "选用并开始实践"; use.addEventListener("click", () => startSelectedProject(repo)); row.appendChild(use); card.appendChild(row); }); root.appendChild(card);
+      stateData.repos.slice(0, 8).forEach((repo) => { const row = document.createElement("div"); row.className = "job-repo"; const info = document.createElement("div"); const strong = document.createElement("strong"); strong.textContent = projectDisplayTitle(repo); info.appendChild(strong); const repoUrl = projectUrl(repo); if (repoUrl) { const link = document.createElement("a"); link.href = repoUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; let repoHost = ""; try { repoHost = new URL(repoUrl).hostname.toLowerCase(); } catch (_) {} link.textContent = repoHost === "github.com" || repoHost.endsWith(".github.com") ? "查看 GitHub 仓库 ↗" : "查看公开项目链接 ↗"; info.appendChild(link); } const paperUrl = String(repo.paper_url || "").trim(); if (paperUrl) { try { const parsedPaper = new URL(paperUrl); if (["https:", "http:"].includes(parsedPaper.protocol) && parsedPaper.hostname) { const paperLink = document.createElement("a"); paperLink.href = parsedPaper.href; paperLink.target = "_blank"; paperLink.rel = "noopener noreferrer"; paperLink.textContent = "查看论文来源 ↗"; info.appendChild(paperLink); } } catch (_) {} } const stars = projectStars(repo); const span = document.createElement("span"); span.textContent = [repo.language || projectSourceLabel(repo), stars == null ? "" : `${stars} 星标`].filter(Boolean).join(" · "); if (span.textContent) info.appendChild(span); if (repo.paper_candidate) { const paper = document.createElement("p"); paper.className = "repo-detail"; paper.textContent = `论文线索：${repo.paper_verified ? "已提供可核验证据" : "待核验，影响力未知"}${repo.paper_title ? ` · ${repo.paper_title}` : ""}`; info.appendChild(paper); } for (const key of ["description", "reason", "match_score"]) { if (key === "match_score" && (projectIsLocalOnly(repo) || repo.user_provided === true)) continue; if (repo[key] != null && String(repo[key]).trim() !== "") { const detail = document.createElement("p"); detail.className = "repo-detail"; detail.textContent = `${key === "match_score" ? "匹配分：" : key === "reason" ? "推荐理由：" : ""}${key === "match_score" && Number.isFinite(Number(repo[key])) ? `${Math.round(Number(repo[key]) <= 1 ? Number(repo[key]) * 100 : Number(repo[key]))}%` : repo[key]}`; info.appendChild(detail); } } row.appendChild(info); const use = document.createElement("button"); use.type = "button"; use.className = "job-card-action"; use.textContent = "选用并开始实践"; use.addEventListener("click", () => startSelectedProject(repo)); row.appendChild(use); card.appendChild(row); }); root.appendChild(card);
     }
     if (step === "practice" && Array.isArray(stateData.progress) && stateData.progress.length) {
       const card = document.createElement("section"); card.className = "job-card"; const h = document.createElement("h3"); h.textContent = "练习进度"; card.appendChild(h);
@@ -1924,7 +3975,7 @@
     beginner: "入门", familiar: "了解", intermediate: "基础使用", advanced: "熟练", proficient: "熟练", expert: "精通",
     planned: "待开始", todo: "待开始", pending: "待确认", in_progress: "进行中", active: "进行中",
     completed: "已完成", complete: "已完成", done: "已完成", blocked: "受阻", failed: "失败",
-    high: "高优先", medium: "中优先", low: "低优先", unknown: "待确认"
+    high: "高优先", medium: "中优先", low: "低优先", evidence_insufficient: "证据不足", insufficient_evidence: "证据不足", unknown: "待确认"
   };
 
   function jobEnumLabel(value) {
@@ -1940,7 +3991,7 @@
     if (typeof item !== "object") return String(item);
     for (const field of fields) {
       const value = item[field];
-      if (value != null && String(value).trim()) return String(value);
+      if (value != null && String(value).trim()) return String(value).trim();
     }
     return "";
   }
@@ -1962,12 +4013,82 @@
     const dl = document.createElement("dl"); fields.forEach((field) => { if (value[field] == null || value[field] === "") return; const dt = document.createElement("dt"); dt.textContent = labels[field] || field; const dd = document.createElement("dd"); dd.textContent = Array.isArray(value[field]) ? value[field].slice(0, 4).join("、") : String(value[field]); dl.append(dt, dd); }); if (!dl.childElementCount) { const dd = document.createElement("dd"); dd.textContent = "已保存结构化资料"; dl.appendChild(dd); } card.appendChild(dl); return card;
   }
 
-  function appendJobList(card, label, items, formatter) {
+  function jdObjectCard(value) {
+    const card = document.createElement("section");
+    card.className = "job-card jd-card";
+    const head = document.createElement("div");
+    head.className = "job-card-head";
+    const h = document.createElement("h3");
+    h.textContent = "岗位卡片（可编辑）";
+    head.appendChild(h);
+    const actions = document.createElement("div");
+    actions.className = "job-card-actions";
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "job-card-action";
+    edit.textContent = "编辑";
+    edit.addEventListener("click", () => openJobEditor("jd", value));
+    actions.appendChild(edit);
+    head.appendChild(actions);
+    card.appendChild(head);
+
+    const title = String(value && value.job_title || "").trim();
+    const company = String(value && value.company || "").trim();
+    const identity = document.createElement("div");
+    identity.className = "jd-card-identity";
+    if (title) {
+      const jobTitle = document.createElement("strong");
+      jobTitle.className = "jd-job-title";
+      jobTitle.textContent = title;
+      identity.appendChild(jobTitle);
+    }
+    if (company) {
+      const companyNode = document.createElement("span");
+      companyNode.className = "jd-card-company";
+      companyNode.textContent = company;
+      identity.appendChild(companyNode);
+    }
+    if (identity.children.length) card.appendChild(identity);
+    const meta = [value && value.salary, value && value.location]
+      .map((item) => String(item == null ? "" : item).trim()).filter(Boolean);
+    if (meta.length) {
+      const metaNode = document.createElement("div");
+      metaNode.className = "jd-card-meta";
+      metaNode.textContent = meta.join(" · ");
+      card.appendChild(metaNode);
+    }
+    const team = String(value && value.team || "").trim();
+    if (team) {
+      const teamNode = document.createElement("div");
+      teamNode.className = "jd-card-team";
+      teamNode.textContent = team;
+      card.appendChild(teamNode);
+    }
+    return card;
+  }
+
+  function appendJdSummary(card, value) {
+    const summary = String(value && (value.raw_summary || value.summary) || "").trim();
+    if (summary) {
+      const summaryTitle = document.createElement("div");
+      summaryTitle.className = "job-subtitle";
+      summaryTitle.textContent = "概况";
+      card.appendChild(summaryTitle);
+      const summaryNode = document.createElement("p");
+      summaryNode.className = "jd-summary";
+      summaryNode.textContent = summary;
+      card.appendChild(summaryNode);
+    }
+  }
+
+  function appendJobList(card, label, items, formatter, { listTag = "div", listClass = "", itemClass = "job-list-item", limit = 12 } = {}) {
     if (!Array.isArray(items) || !items.length) return;
     const heading = document.createElement("div"); heading.className = "job-subtitle"; heading.textContent = label; card.appendChild(heading);
-    const list = document.createElement("div"); list.className = "job-list";
-    items.slice(0, 12).forEach((item) => { const value = formatter(item); if (!value) return; const row = document.createElement("div"); row.className = "job-list-item"; row.textContent = String(value); list.appendChild(row); });
-    if (list.childElementCount) card.appendChild(list);
+    const list = document.createElement(listTag); list.className = `job-list${listClass ? ` ${listClass}` : ""}`;
+    const visibleItems = limit == null ? items : items.slice(0, limit);
+    visibleItems.forEach((item) => { const value = String(formatter(item) || "").trim(); if (!value) return; const row = document.createElement(listTag === "ul" ? "li" : "div"); row.className = itemClass; row.textContent = value; list.appendChild(row); });
+    if (list.children.length) card.appendChild(list);
+    else heading.remove();
   }
 
   function parentPath(path) {
@@ -1982,8 +4103,14 @@
     return left ? `${left}/${name}` : String(name || ".");
   }
 
-  function openLocalImport() {
+  function openLocalImport(target = "composer") {
     if (state.newSession.open || state.modelSettings.open) return;
+    state.localImportTarget = target === "planProject" ? "planProject" : "composer";
+    state.localImportSessionId = String(state.currentSessionId || "new");
+    const hint = $("localImportHint");
+    if (hint) hint.textContent = target === "planProject"
+      ? "输入本机代码、说明材料或项目目录的完整路径。支持 PDF、Office、图片和文本等可读取资料；敏感路径、超限文件和不支持的二进制会跳过。上限：最多 1000 个文件、单文件 2 MiB、总计 20 MiB。导入后会添加到复现项目材料，点击评估后读取。"
+      : "输入本机简历、笔记或资料目录的完整路径。支持 PDF、Office、图片和文本等可读取资料；敏感路径、超限文件和不支持的二进制会跳过。上限：最多 1000 个文件、单文件 2 MiB、总计 20 MiB。导入后会放入当前消息，发送后读取。";
     $("localImportPath").value = "";
     setText($("localImportStatus"), "");
     $("localImportBackdrop").classList.remove("hidden");
@@ -1993,7 +4120,9 @@
 
   function closeLocalImport() {
     $("localImportBackdrop").classList.add("hidden");
-    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open) document.body.classList.remove("modal-open");
+    state.localImportTarget = "composer";
+    state.localImportSessionId = "new";
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
   }
 
   const LOCAL_IMPORT_REASON_LABELS = {
@@ -2038,23 +4167,36 @@
     setText($("localImportStatus"), "正在导入路径…");
     try {
       const payload = await request("/imports/local", { method: "POST", body: { path } });
+      if (String(state.currentSessionId || "new") !== String(state.localImportSessionId || "new")) throw new Error("会话已切换，本次导入结果未加入新会话。请在目标会话重新导入。");
       // Only paths in the explicit imported list become message attachments.
       // The response envelope may contain the original source path and must
       // never be treated as an attachment when zero files were imported.
       const imported = Array.isArray(payload && payload.imported) ? payload.imported : [];
       const skipped = Array.isArray(payload && payload.skipped) ? payload.skipped : [];
       const attachments = imported.map((item) => ({
-        name: String(typeof item === "string" ? item : item && item.path || ""),
-        path: String(typeof item === "string" ? item : item && item.path || ""),
+        name: String(typeof item === "string" ? item : item && (item.name || item.path) || ""),
+        path: String(typeof item === "string" ? item : item && (item.path || item.workspace_path) || ""),
+        sourcePath: String(item && (item.source_path || item.sourcePath || item.original_path || item.originalPath) || ""),
         mediaType: String(item && (item.media_type || item.mediaType) || "")
       })).filter((item) => item.path);
       const summary = localImportSummary(payload, attachments.length, skipped);
       if (attachments.length) {
-        state.uploadedAttachments = [...(state.uploadedAttachments || []), ...attachments];
-        state.uploadedAttachment = state.uploadedAttachments[0] || null;
+        const target = state.localImportTarget;
+        if (target === "planProject") {
+          planProjectFiles = [...planProjectFiles, ...attachments];
+          renderPlanProjectResources();
+        } else {
+          state.uploadedAttachments = [...(state.uploadedAttachments || []), ...attachments];
+          state.uploadedAttachment = state.uploadedAttachments[0] || null;
+        }
         closeLocalImport();
-        renderAll();
-        toast(summary, "success", 7200);
+        if (target === "planProject") {
+          renderWorkflowPage();
+          toast(`${summary}；已加入自有复现项目材料。`, "success", 7200);
+        } else {
+          renderAll();
+          toast(summary, "success", 7200);
+        }
       } else {
         setText($("localImportStatus"), `${summary}。没有可附加文件。`);
         $("localImportStatus").className = "model-settings-status error";
@@ -2096,8 +4238,11 @@
   function closeFileModal() { $("fileModalBackdrop").classList.add("hidden"); }
 
   function toast(message, kind = "", duration = 4200) {
+    const text = String(message || "").trim();
+    if (!text) return;
+    const compact = text.length > 640 ? `${text.slice(0, 640)}…` : text;
     const item = document.createElement("div"); item.className = `toast ${kind}`;
-    item.appendChild(icon(kind === "error" ? "warning" : kind === "success" ? "check" : "spark", "toast-icon")); item.appendChild(document.createTextNode(String(message || "")));
+    item.appendChild(icon(kind === "error" ? "warning" : kind === "success" ? "check" : "spark", "toast-icon")); item.appendChild(document.createTextNode(compact));
     $("toastRegion").appendChild(item); hydrateIcons(item);
     window.setTimeout(() => item.remove(), duration);
   }
@@ -2640,7 +4785,7 @@
     if ($("modelApiKey")) $("modelApiKey").value = "";
     if ($("modelClearKey")) $("modelClearKey").checked = false;
     $("modelSettingsBackdrop").classList.add("hidden");
-    document.body.classList.remove("modal-open");
+    if (!state.workflowChat.open && !state.newSession.open && !state.jobEditor.open && !state.clarification.open) document.body.classList.remove("modal-open");
     const previousFocus = state.modelSettings.previousFocus;
     state.modelSettings.previousFocus = null;
     restoreSidebarAwareFocus(previousFocus);
@@ -2648,7 +4793,7 @@
 
   function trapModelSettingsFocus(event) {
     if (event.key !== "Tab") return;
-    const backdrop = state.newSession.open ? $("newSessionBackdrop") : state.modelSettings.open ? $("modelSettingsBackdrop") : null;
+    const backdrop = state.clarification.open ? $("clarificationBackdrop") : state.newSession.open ? $("newSessionBackdrop") : state.modelSettings.open ? $("modelSettingsBackdrop") : state.workflowChat.open ? $("workflowChatBackdrop") : null;
     if (!backdrop) return;
     const dialog = backdrop.querySelector('[role="dialog"]');
     const focusable = qsa("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])", dialog).filter((node) => node.offsetParent !== null);
@@ -2826,7 +4971,7 @@
     if (!state.newSession.open || state.newSession.busy) return;
     state.newSession.open = false;
     $("newSessionBackdrop").classList.add("hidden");
-    if (!state.modelSettings.open && !state.jobEditor.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
     const previous = state.newSession.previousFocus;
     state.newSession.previousFocus = null;
     restoreSidebarAwareFocus(previous);
@@ -2844,12 +4989,16 @@
       const payload = await request("/sessions", { method: "POST", body });
       const session = unwrapSession(payload);
       if (!session || !session.id) throw new ApiError("服务没有返回新会话");
-      clearPolling(); stopVoiceInput();
-      state.optimisticMessage = null; state.uploadedAttachment = null; state.uploadedAttachments = [];
+      captureComposerDraft(state.workflowChat.scope);
+      clearPolling(); stopVoiceInput({ cancel: true }); closeWorkflowChatDialog({ restore: false });
+      clearCommandRuntime();
+      state.optimisticMessage = null; state.practice.optimisticMessage = null; state.practice.sessionId = String(session.id); state.practice.projectKey = ""; state.practice.projectTitle = ""; state.practice.threadId = ""; state.practice.messages = []; state.practice.events = []; state.practice.loaded = false; state.practice.error = ""; state.practice.startPending = false; state.uploadedAttachment = null; state.uploadedAttachments = [];
+      restoreComposerDraft("main", session.id, "");
       state.currentSessionId = String(session.id); state.currentSession = session; persistCurrentSession();
       state.sessions = [{ ...session, has_profile: Boolean(session.skill_state?.["job-radar"]?.profile), message_count: visibleMessages(session).length }, ...state.sessions.filter((row) => String(row.id) !== String(session.id))];
       if (state.newSession.open) { state.newSession.busy = false; closeNewSession(); }
       renderAll({ scroll: true });
+      startCommandRuntimeRefresh();
       await loadFiles(".");
       return String(session.id);
 
@@ -2871,9 +5020,14 @@
 
   async function selectSession(id, { restore = false } = {}) {
     const target = String(id || ""); if (!target) return;
+    if (state.jobEditor.open && state.jobEditor.sessionId !== target) closeJobEditor();
+    captureComposerDraft(state.workflowChat.scope);
+    closeClarificationModal({ restore: false });
+    closeWorkflowChatDialog({ restore: false });
     clearPolling();
-    stopVoiceInput();
-    state.currentSessionId = target; state.currentSession = null; state.loadingSession = true; state.optimisticMessage = null; state.uploadedAttachment = null; state.uploadedAttachments = []; persistCurrentSession();
+    clearCommandRuntime();
+    stopVoiceInput({ cancel: true });
+    state.currentSessionId = target; state.currentSession = null; state.loadingSession = true; state.optimisticMessage = null; state.practice.optimisticMessage = null; state.practice.sessionId = target; state.practice.projectKey = ""; state.practice.projectTitle = ""; state.practice.threadId = ""; state.practice.messages = []; state.practice.events = []; state.practice.loaded = false; state.practice.loading = false; state.practice.error = ""; state.practice.startPending = false; state.workflowChat.scope = "main"; state.workflowChat.practiceProjectKey = ""; state.uploadedAttachment = null; state.uploadedAttachments = []; persistCurrentSession();
     renderAll();
     const serial = ++state.sessionRequestSerial;
     try {
@@ -2881,14 +5035,27 @@
       if (serial !== state.sessionRequestSerial || String(state.currentSessionId) !== target) return;
       state.currentSession = session || { id: target, messages: [] };
       state.loadingSession = false;
+      restoreComposerDraft("main", target, "");
       renderAll({ scroll: true });
-      if (restore && (state.currentSession.pending || sessionBusy(state.currentSession))) toast(state.currentSession.pending ? "已恢复待审批会话，请核对完整预览。" : "已恢复正在运行的会话，状态会自动更新。", "success");
+      startCommandRuntimeRefresh();
+      const live = sessionBusy(state.currentSession);
+      const queued = sessionHasQueue(state.currentSession);
+      if (restore && (state.currentSession.pending || live || queued)) {
+        toast(
+          state.currentSession.pending
+            ? "已恢复待审批会话，请核对完整预览。"
+            : queued && !live
+              ? "已恢复待执行工具队列，请打开对话点击“继续执行工具队列”。"
+              : "已恢复正在运行的会话，状态会自动更新。",
+          "success",
+        );
+      }
       if (sessionBusy(state.currentSession)) startPolling(target);
       else maybeShowLastResult(target, state.currentSession);
       await loadFiles(".");
     } catch (error) {
       if (serial !== state.sessionRequestSerial || String(state.currentSessionId) !== target) return;
-      state.loadingSession = false; state.currentSession = { id: target, messages: [], events: [] }; renderAll(); toast(error.message || "读取会话失败", "error");
+      state.loadingSession = false; state.currentSession = { id: target, messages: [], events: [] }; restoreComposerDraft("main", target, ""); renderAll(); toast(error.message || "读取会话失败", "error");
     }
   }
 
@@ -2901,6 +5068,7 @@
       await request(`/sessions/${encodeURIComponent(target)}`, { method: "DELETE" });
       state.sessions = state.sessions.filter((row) => String(row.id) !== target);
       state.jobs.delete(target);
+      state.clarification.jobs.delete(target);
       if (String(state.currentSessionId || "") === target) {
         state.currentSessionId = null;
         state.currentSession = null;
@@ -2916,19 +5084,27 @@
     }
   }
 
+  function sessionSignature(session) {
+    if (!session) return "";
+    try { return JSON.stringify(session); } catch (_error) { return safeString(session); }
+  }
+
   async function refreshCurrentSession(target = state.currentSessionId, { scroll = false, clearOptimistic = false } = {}) {
     const id = String(target || ""); if (!id) return null;
     try {
       const session = unwrapSession(await request(`/sessions/${encodeURIComponent(id)}`));
       if (String(state.currentSessionId) !== id) return null;
       if (session) {
+        const previousSignature = sessionSignature(state.currentSession);
         const job = state.jobs.get(id);
         session.busy = Boolean(session.busy || (job && job.id));
-        if (clearOptimistic && !session.busy && state.optimisticMessage && state.optimisticMessage.sessionId === id) state.optimisticMessage = null;
+        const shouldClearOptimistic = clearOptimistic && !session.busy && state.optimisticMessage && state.optimisticMessage.sessionId === id;
+        if (shouldClearOptimistic) state.optimisticMessage = null;
         state.currentSession = session;
         const index = state.sessions.findIndex((row) => String(row.id) === id);
         if (index >= 0) state.sessions[index] = { ...state.sessions[index], ...session, message_count: visibleMessages(session).length };
-        renderAll({ scroll });
+        const changed = previousSignature !== sessionSignature(session);
+        if (changed || scroll || shouldClearOptimistic) renderAll({ scroll });
         if (!session.busy) maybeShowLastResult(id, session);
       }
       return session;
@@ -2954,10 +5130,213 @@
     state.pollTimer = window.setInterval(() => pollOnce(id), 1000);
   }
 
+  function clearPracticeWindowRefresh() {
+    if (state.practiceWindow.refreshTimer) {
+      window.clearInterval(state.practiceWindow.refreshTimer);
+      state.practiceWindow.refreshTimer = null;
+    }
+  }
+
+  function startPracticeWindowRefresh() {
+    if (!state.practiceWindow.standalone || !state.currentSessionId || document.visibilityState === "hidden") return;
+    clearPracticeWindowRefresh();
+    const refresh = async () => {
+      const id = String(state.currentSessionId || "");
+      if (!id || state.practiceWindow.refreshInFlight) return;
+      state.practiceWindow.refreshInFlight = true;
+      try {
+        await refreshCurrentSession(id, { scroll: false, clearOptimistic: false });
+        markPracticeWindowStale();
+        if (state.workflowChat.open && state.workflowChat.scope === "practice" && state.practice.threadId && !state.practiceWindow.stale) {
+          try { await refreshPracticeThread(id, state.practice.threadId); } catch (_error) { /* scoped panel reports its own read error */ }
+        }
+      } finally {
+        state.practiceWindow.refreshInFlight = false;
+      }
+    };
+    void refresh();
+    // Keep a child window current even when another window initiated the job.
+    // The service is local and the scoped endpoint is cheap; a one-second
+    // cadence also makes completion visible without relying on opener events.
+    state.practiceWindow.refreshTimer = window.setInterval(() => { void refresh(); }, 1000);
+  }
+
+  async function refreshMainWindowOnReturn() {
+    // A practice child owns its own one-second refresh loop.  The main window
+    // needs one immediate read when it becomes active again so a child that
+    // completed a turn can update the main status and inspector before the
+    // next user action.  refreshCurrentSession only replaces the durable
+    // session object; the composer draft remains in its keyed local store and
+    // is never restored or cleared by this read.
+    if (state.practiceWindow.standalone || document.visibilityState === "hidden") return;
+    const id = String(state.currentSessionId || "");
+    if (!id || state.loadingSession || state.mainReturnRefreshInFlight) return;
+    state.mainReturnRefreshInFlight = true;
+    try {
+      await refreshCurrentSession(id, { scroll: false, clearOptimistic: false });
+    } finally {
+      state.mainReturnRefreshInFlight = false;
+    }
+  }
+
+  function finishClarificationJob(sessionId, terminalPayload = null, session = null) {
+    const id = String(sessionId || "");
+    const entry = state.clarification.jobs.get(id);
+    if (!entry) return { kind: "none" };
+    const result = terminalPayload && terminalPayload.result && typeof terminalPayload.result === "object"
+      ? terminalPayload.result
+      : {};
+    const outerStatus = String(terminalPayload && terminalPayload.status || "").trim().toLowerCase();
+    const resultStatus = String(result.status || outerStatus || "").trim().toLowerCase();
+    const metadata = result.metadata && typeof result.metadata === "object"
+      ? result.metadata
+      : result.action && result.action.metadata && typeof result.action.metadata === "object"
+        ? result.action.metadata
+        : null;
+    const failed = outerStatus === "failed" || ["failed", "error"].includes(resultStatus);
+    const current = String(state.currentSessionId || "") === id;
+    const modalMatches = current
+      && state.clarification.open
+      && state.clarification.sessionId === id
+      && state.clarification.questionKey === entry.questionKey;
+    const snapshot = clarificationSnapshotFor(session, id);
+    const blocked = !failed && clarificationSessionBlocked(session, result);
+
+    const preserveAnswer = () => {
+      state.clarification.drafts.set(clarificationDraftKey(id, entry.question), entry.answer);
+      if (modalMatches) state.clarification.answer = entry.answer;
+    };
+    const updateModal = (message, kind, feedback = "") => {
+      if (!modalMatches) return;
+      state.clarification.busy = false;
+      state.clarification.completed = false;
+      preserveAnswer();
+      state.clarification.feedback = feedback;
+      clarificationStatus(message, kind);
+      syncClarificationModal();
+    };
+
+    if (failed) {
+      state.clarification.jobs.delete(id);
+      preserveAnswer();
+      updateModal("处理失败，答案已保留；请检查后重试。", "error");
+      return { kind: "failed", current, modalMatches };
+    }
+
+    // Approval, uncertain execution, and queued tool work are not a model
+    // confirmation. Keep the question/job association so a later approve,
+    // resolve, or continue job can finish this same modal operation.
+    if (blocked) {
+      preserveAnswer();
+      state.clarification.jobs.set(id, {
+        ...entry,
+        active: false,
+        blocked: true,
+        needsRecovery: true,
+        jobId: "",
+        lastStatus: resultStatus
+      });
+      updateModal("请先打开对话处理当前操作；答案会保留，处理完成后继续更新。", "error");
+      if (current && !modalMatches) toast("当前操作需要先在对话中处理，答案已保留。", "error", 5200);
+      return { kind: "blocked", current, modalMatches };
+    }
+
+    // A result from a different session, or a shell without a loaded
+    // job-radar profile, cannot prove that this question was saved.
+    if (!snapshot) {
+      preserveAnswer();
+      state.clarification.jobs.set(id, {
+        ...entry,
+        active: false,
+        blocked: false,
+        needsRecovery: false,
+        awaitingSnapshot: true,
+        jobId: "",
+        lastStatus: resultStatus
+      });
+      updateModal("暂时无法确认档案是否更新；答案已保留，请刷新后重试。", "error");
+      if (current && !modalMatches) toast("暂时无法确认技能档案状态，答案已保留。", "error", 5200);
+      return { kind: "uncertain", current, modalMatches };
+    }
+
+    const stillOpen = snapshot.questions.some((question) => clarificationQuestionKey(question) === entry.questionKey);
+
+    // Generic approval/recovery endpoints may finish a worker without the
+    // clarification metadata.  A changed snapshot alone is not enough to
+    // prove that this particular answer was confirmed, so keep the local
+    // association and allow a retry until the backend supplies the flag.
+    if (!metadata || typeof metadata.confirmed !== "boolean") {
+      preserveAnswer();
+      state.clarification.jobs.set(id, {
+        ...entry,
+        active: false,
+        blocked: false,
+        needsRecovery: false,
+        awaitingConfirmation: true,
+        questionRemoved: !stillOpen,
+        jobId: "",
+        lastStatus: resultStatus
+      });
+      updateModal("已完成当前操作，但还无法确认档案保存状态；答案已保留，请稍后重试。", "error");
+      if (current && !modalMatches) toast("还无法确认档案保存状态，答案已保留。", "error", 5200);
+      return { kind: "uncertain", current, modalMatches };
+    }
+
+    const confirmed = metadata && metadata.confirmed === true;
+    const answered = confirmed && !stillOpen && metadata.question_remaining !== true;
+    if (!answered) {
+      preserveAnswer();
+      if (!stillOpen && metadata.confirmed !== true) {
+        state.clarification.jobs.set(id, {
+          ...entry,
+          active: false,
+          blocked: false,
+          needsRecovery: false,
+          awaitingConfirmation: true,
+          questionRemoved: true,
+          jobId: "",
+          lastStatus: resultStatus
+        });
+        updateModal("当前作业尚未确认档案保存；答案已保留，请稍后重试。", "error", clarificationFeedbackText(terminalPayload, false));
+        if (current && !modalMatches) toast("当前作业尚未确认档案保存，答案已保留。", "error", 5200);
+        return { kind: "uncertain", current, modalMatches };
+      }
+      state.clarification.jobs.delete(id);
+      updateModal("模型已完成处理，但待澄清问题仍保留；请核对回答后重试。", "error", clarificationFeedbackText(terminalPayload, false));
+      if (current && !modalMatches) toast("待澄清问题仍保留，答案已保留以便重试。", "error", 5200);
+      return { kind: "unconfirmed", current, modalMatches };
+    }
+
+    state.clarification.drafts.delete(clarificationDraftKey(id, entry.question));
+    // The pending question is merged into the rendered list while this job
+    // is awaiting confirmed metadata.  Remove that local association before
+    // refreshing the workflow panes so a confirmed row cannot linger after
+    // the modal completes.
+    state.clarification.jobs.delete(id);
+    if (modalMatches) {
+      state.clarification.busy = false;
+      state.clarification.completed = true;
+      state.clarification.answer = entry.answer;
+      state.clarification.feedback = clarificationFeedbackText(terminalPayload, true);
+      clarificationStatus("回答已核对并保存，待澄清问题列表已刷新。", "success");
+      renderInspector();
+      renderWorkflowPage();
+      syncClarificationModal();
+    } else if (current) {
+      renderInspector();
+      renderWorkflowPage();
+      toast("技能档案已更新，待澄清问题列表已刷新。", "success", 5200);
+    }
+    return { kind: "confirmed", current, modalMatches };
+  }
+
   async function pollOnce(target) {
     const id = String(target || "");
     if (String(state.currentSessionId || "") !== id || document.visibilityState === "hidden") return;
+    if (state.pollInFlight === id) return;
+    state.pollInFlight = id;
     const job = state.jobs.get(id);
+    const commandJobId = String(job && job.commandId || "").trim();
     try {
       let terminalPayload = null;
       if (job && job.id) {
@@ -2968,18 +5347,30 @@
       }
       if (terminalPayload) {
         state.jobs.delete(id);
+        if (commandJobId) {
+          state.commandRuntime.completionJobs.delete(commandJobId);
+          state.commandRuntime.settled.add(commandJobId);
+          if (terminalPayload.status === "failed") state.commandRuntime.error = String(terminalPayload.error || "命令结果同步失败");
+        }
         // The worker has reached a terminal state, so the server snapshot is
         // authoritative. Clear the optimistic bubble before the refresh
         // renders it, including failed jobs where the result is still shown.
-        if (String(state.currentSessionId) === id && state.optimisticMessage && state.optimisticMessage.sessionId === id) state.optimisticMessage = null;
+        if (String(state.currentSessionId) === id) {
+          if (state.optimisticMessage && state.optimisticMessage.sessionId === id) state.optimisticMessage = null;
+          if (state.practice.optimisticMessage && state.practice.optimisticMessage.sessionId === id) state.practice.optimisticMessage = null;
+        }
       }
       const session = await refreshCurrentSession(id, { scroll: Boolean(terminalPayload), clearOptimistic: !job });
+      await refreshCommandRuntime();
+      if (terminalPayload && state.practice.sessionId === id && state.practice.threadId && state.workflowChat.scope === "practice") {
+        try { await refreshPracticeThread(id, state.practice.threadId); } catch (_error) { /* the scoped panel reports its own read error */ }
+      }
       if (terminalPayload) {
+        const clarificationOutcome = finishClarificationJob(id, terminalPayload, session);
         state.optimisticMessage = null;
+        state.practice.optimisticMessage = null;
         const status = String(terminalPayload.status || "");
-        const result = terminalPayload.result;
         if (status === "failed") toast(String(terminalPayload.error || "AI 教练执行失败"), "error");
-        else if (result && result.message) toast(String(result.message), result.status === "completed" ? "success" : "");
         await refreshSessions();
         await loadFiles(state.filePath);
         if (state.pollTarget === id) clearPolling();
@@ -2996,12 +5387,25 @@
       }
     } catch (error) {
       if (String(state.currentSessionId) === id) toast(error.message || "读取执行状态失败", "error");
+    } finally {
+      if (state.pollInFlight === id) state.pollInFlight = null;
     }
   }
 
-  async function enqueueAction(path, body, targetId = state.currentSessionId, { optimisticText = "", restoreText = "", restoreAttachment = null, restoreAttachments = null } = {}) {
+  async function enqueueAction(path, body, targetId = state.currentSessionId, { optimisticText = "", restoreText = "", restoreAttachment = null, restoreAttachments = null, clarificationContext = null, scope = "main", projectKey = "" } = {}) {
     const id = String(targetId || ""); if (!id || String(state.currentSessionId) !== id) return false;
-    if (optimisticText) {
+    const recoveryPath = new Set(["approve", "reject", "continue", "resolve"]).has(String(path || ""));
+    const recoveryEntry = !clarificationContext && recoveryPath ? clarificationJobFor(id) : null;
+    const operationClarification = clarificationContext || recoveryEntry;
+    if (optimisticText && scope === "practice") {
+      const baseline = practiceMessages(state.currentSession, projectKey);
+      state.practice.optimisticMessage = {
+        sessionId: id,
+        projectKey: String(projectKey || "").trim(),
+        text: optimisticText,
+        baseMessageCount: baseline.length
+      };
+    } else if (optimisticText) {
       const baseline = visibleMessages(state.currentSession);
       state.optimisticMessage = {
         sessionId: id,
@@ -3015,10 +5419,24 @@
     try {
       const payload = await request(`/sessions/${encodeURIComponent(id)}/${path}`, { method: "POST", body });
       const jobId = payload && (payload.job_id || payload.jobId || (payload.job && payload.job.id));
+      const practiceThreadId = payload && payload.practice_thread_id;
+      if (scope === "practice" && practiceThreadId && String(state.currentSessionId) === id) state.practice.threadId = String(practiceThreadId);
       // The user can switch sessions while the POST is in flight. Preserve
       // the job association before checking the visible session so the
       // result can still be observed when they return.
-      if (jobId) state.jobs.set(id, { id: String(jobId) });
+      if (jobId) {
+        state.jobs.set(id, { id: String(jobId) });
+        if (operationClarification) {
+          const entry = state.clarification.jobs.get(id);
+          if (entry && (!operationClarification.token || entry.token === operationClarification.token)) {
+            entry.jobId = String(jobId);
+            entry.active = true;
+            entry.blocked = false;
+            entry.needsRecovery = false;
+            entry.awaitingConfirmation = false;
+          }
+        }
+      }
       if (String(state.currentSessionId) !== id) return true;
       const session = unwrapSession(payload);
       if (session && session.id) { state.currentSession = session; renderAll(); }
@@ -3026,17 +5444,40 @@
         if (state.currentSession) state.currentSession.busy = true;
         renderAll(); startPolling(id);
       } else {
-        state.optimisticMessage = null;
+        if (scope === "practice") state.practice.optimisticMessage = null;
+        else state.optimisticMessage = null;
         const latest = await refreshCurrentSession(id, { scroll: true });
+        if (scope === "practice" && state.practice.threadId) {
+          try { await refreshPracticeThread(id, state.practice.threadId); } catch (_error) { /* scoped panel keeps the error */ }
+        }
         if (latest && latest.busy) startPolling(id);
         await refreshSessions();
+        if (operationClarification && !jobId) finishClarificationJob(id, { status: "completed", result: {} }, latest);
       }
       return true;
     } catch (error) {
       state.jobs.delete(id);
       state.followUpJobs.delete(id);
+      if (operationClarification) {
+        const entry = state.clarification.jobs.get(id);
+        if (entry && (!operationClarification.token || entry.token === operationClarification.token)) {
+            const keepRecovery = Boolean(recoveryEntry || entry.blocked || entry.needsRecovery);
+          if (keepRecovery) {
+            state.clarification.jobs.set(id, { ...entry, active: false, blocked: true, needsRecovery: true, jobId: "" });
+          } else state.clarification.jobs.delete(id);
+          if (String(state.currentSessionId) === id && state.clarification.open && state.clarification.questionKey === entry.questionKey) {
+            state.clarification.busy = false;
+            state.clarification.answer = entry.answer;
+            state.clarification.drafts.set(clarificationDraftKey(id, entry.question), entry.answer);
+            state.clarification.feedback = "";
+            clarificationStatus(keepRecovery ? "当前操作未完成，请打开对话重试；答案已保留。" : "发送失败，答案已保留；请修正后重试。", "error");
+            syncClarificationModal();
+          }
+        }
+      }
       if (String(state.currentSessionId) === id) {
-        state.optimisticMessage = null;
+        if (scope === "practice") state.practice.optimisticMessage = null;
+        else state.optimisticMessage = null;
         if (state.currentSession) state.currentSession.busy = false;
         if (restoreText) { $("composerInput").value = restoreText; resizeComposer(); }
         if (restoreAttachments) {
@@ -3046,6 +5487,7 @@
           state.uploadedAttachments = [{ ...restoreAttachment }];
           state.uploadedAttachment = state.uploadedAttachments[0];
         }
+        if (restoreText || restoreAttachments || restoreAttachment) captureComposerDraft(scope, id, projectKey);
         renderAll();
         toast(error.message || "操作失败", "error");
       }
@@ -3055,15 +5497,81 @@
 
   async function sendMessage() {
     const input = $("composerInput");
-    if (!state.currentSessionId) { await createSession(); if (!state.currentSessionId) return; }
+    if ((state.voice.active || state.voice.stopping) && state.voice.target === input) stopVoiceInput({ cancel: true });
+    if (state.workflowChat.open && state.workflowChat.scope === "practice") {
+      if (!state.currentSessionId) return;
+      if (state.currentSession && state.currentSession.pending && !practiceApprovalMatches(state.currentSession)) {
+        toast("请先打开主对话处理待确认操作。", "");
+        return;
+      }
+      const attachments = Array.isArray(state.uploadedAttachments)
+        ? state.uploadedAttachments
+        : (state.uploadedAttachment ? [state.uploadedAttachment] : []);
+      const draftSessionId = String(state.currentSessionId || "");
+      const draftProjectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey;
+      const typedText = input.value.trim();
+      const text = typedText || (attachments.length ? EMPTY_ATTACHMENT_PROMPT : "");
+      if (!text) return;
+      const unsupported = attachments.find((attachment) => isUnsupportedImageAttachment(attachment));
+      if (unsupported) {
+        toast("暂不支持该图片格式，请先转换为 PNG、JPEG、GIF 或 WebP 后再上传。", "error");
+        return;
+      }
+      input.value = "";
+      resizeComposer();
+      state.uploadedAttachment = null;
+      state.uploadedAttachments = [];
+      clearComposerDraft("practice", state.currentSessionId, state.workflowChat.practiceProjectKey || state.practice.projectKey);
+      const accepted = await sendPracticeMessage(text, {
+        projectKey: draftProjectKey,
+        attachments
+      });
+      if (!accepted) {
+        if (String(state.currentSessionId || "") === draftSessionId && state.workflowChat.open && state.workflowChat.scope === "practice" && state.workflowChat.practiceProjectKey === draftProjectKey) {
+          input.value = text;
+          resizeComposer();
+          state.uploadedAttachments = attachments;
+          state.uploadedAttachment = attachments[0] || null;
+          captureComposerDraft("practice", draftSessionId, draftProjectKey);
+          renderAll();
+        } else storeComposerDraft("practice", draftSessionId, draftProjectKey, text, attachments);
+      }
+      return;
+    }
+    const newSessionDraft = !state.currentSessionId
+      ? {
+        text: String(input.value || ""),
+        attachments: (Array.isArray(state.uploadedAttachments) ? state.uploadedAttachments : (state.uploadedAttachment ? [state.uploadedAttachment] : [])).map((item) => ({ ...item }))
+      }
+      : null;
+    if (!state.currentSessionId) {
+      await createSession();
+      if (!state.currentSessionId) return;
+      // Creating the first session must not erase the turn the user had typed
+      // before the session id existed; move that draft to the new session key.
+      if (newSessionDraft && (newSessionDraft.text || newSessionDraft.attachments.length)) {
+        input.value = newSessionDraft.text;
+        state.uploadedAttachments = newSessionDraft.attachments.map((item) => ({ ...item }));
+        state.uploadedAttachment = state.uploadedAttachments[0] || null;
+        captureComposerDraft("main", state.currentSessionId, "");
+      }
+    }
     if (state.currentSession && state.currentSession.pending) { toast("请先批准或拒绝上方操作，再发送新的消息。", ""); return; }
-    if (sessionBusy(state.currentSession)) { toast("当前会话仍在运行，请等待完成。", ""); return; }
+    if (sessionTurnBlocked(state.currentSession)) {
+      toast(sessionHasQueue(state.currentSession) ? "上一轮工具队列待恢复，请先点击“继续执行工具队列”。" : "当前会话仍在运行，请等待完成。", "");
+      return;
+    }
     const attachments = Array.isArray(state.uploadedAttachments)
       ? state.uploadedAttachments
       : (state.uploadedAttachment ? [state.uploadedAttachment] : []);
+    const draftSessionId = String(state.currentSessionId || "");
     const typedText = input.value.trim();
     const text = typedText || (attachments.length ? EMPTY_ATTACHMENT_PROMPT : "");
     if (!text) return;
+    const pendingAction = state.pendingWorkflowAction
+      && (!state.pendingWorkflowAction.sessionId || state.pendingWorkflowAction.sessionId === String(state.currentSessionId))
+      ? state.pendingWorkflowAction
+      : null;
     const unsupported = attachments.find((attachment) => isUnsupportedImageAttachment(attachment));
     if (unsupported) {
       toast("暂不支持该图片格式，请先转换为 PNG、JPEG、GIF 或 WebP 后再上传。", "error");
@@ -3075,17 +5583,27 @@
     const attachmentNotes = [];
     if (textPaths.length) attachmentNotes.push(`已上传工作区附件，请使用相对路径读取：${textPaths.join("、")}`);
     if (imagePaths.length) attachmentNotes.push(`已上传图片：${imagePaths.join("、")}`);
-    const composed = attachmentNotes.length ? `${text}\n\n${attachmentNotes.join("\n")}` : text;
-    const body = { text: composed };
+    let composed = attachmentNotes.length ? `${text}\n\n${attachmentNotes.join("\n")}` : text;
+    if (pendingAction) composed = `${composed}\n\n动作：${pendingAction.summary}`;
+    const body = {
+      text: composed,
+      ...(pendingAction ? { workflow_action: { step: pendingAction.stepId, summary: pendingAction.summary } } : {})
+    };
     // Image paths are part of this same user turn. The backend validates the
     // workspace path and turns them into ImageBlock content for the model.
     if (imagePaths.length) body.attachments = imagePaths;
     input.value = ""; resizeComposer(); state.uploadedAttachment = null; state.uploadedAttachments = [];
-    await enqueueAction("message", body, state.currentSessionId, {
+    clearComposerDraft("main", state.currentSessionId, "");
+    const accepted = await enqueueAction("message", body, state.currentSessionId, {
       optimisticText: composed,
       restoreText: text,
       restoreAttachments: attachments.length ? attachments.map((attachment) => ({ ...attachment })) : null
     });
+    if (!accepted) {
+      if (String(state.currentSessionId || "") === draftSessionId && (!state.workflowChat.open || state.workflowChat.scope === "main")) captureComposerDraft("main", draftSessionId, "");
+      else storeComposerDraft("main", draftSessionId, "", text, attachments);
+    }
+    if (accepted && pendingAction === state.pendingWorkflowAction) state.pendingWorkflowAction = null;
   }
 
   async function approveOrReject(kind) {
@@ -3153,48 +5671,120 @@
     });
   }
 
-  function releaseVoice() {
+  const VOICE_STOP_TIMEOUT_MS = 1200;
+
+  function voiceSessionOwned(session) {
+    return Boolean(session && state.voice.session === session && state.voice.generation === session.ticket);
+  }
+
+  function voiceSessionCurrent(session, { allowStopping = true } = {}) {
+    if (!voiceSessionOwned(session)) return false;
+    if (state.voice.target !== session.input) return false;
+    if (typeof document.contains === "function" && !document.contains(session.input)) return false;
+    if (!allowStopping && !state.voice.active) return false;
+    if (!state.voice.active && !state.voice.stopping) return false;
+    return session.sessionId === String(state.currentSessionId || "");
+  }
+
+  function stopVoiceMeter(meter = state.voice.meter) {
+    if (!meter || meter.closed) return;
+    meter.closed = true;
+    if (state.voice.meter === meter) state.voice.meter = null;
+    if (meter.frame && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(meter.frame);
+    if (meter.stream && typeof meter.stream.getTracks === "function") {
+      meter.stream.getTracks().forEach((track) => {
+        try { track.stop(); } catch (_error) { /* already stopped */ }
+      });
+    }
+    if (meter.context && typeof meter.context.close === "function") {
+      try {
+        const closing = meter.context.close();
+        if (closing && typeof closing.catch === "function") void closing.catch(() => {});
+      } catch (_error) { /* already closed */ }
+    }
+  }
+
+  function releaseVoice({ ticket = null, abort = false } = {}) {
+    const session = state.voice.session;
+    if (ticket !== null && (!session || session.ticket !== ticket)) return false;
     state.voice.generation += 1;
     state.voice.active = false;
+    state.voice.stopping = false;
     state.voice.target = null;
-    const recognition = state.voice.recognition;
+    if (session && session.stopTimer) {
+      window.clearTimeout(session.stopTimer);
+      session.stopTimer = null;
+    }
+    const recognition = session?.recognition || state.voice.recognition;
+    if (session && session.inputListener && session.input && typeof session.input.removeEventListener === "function") {
+      session.input.removeEventListener("input", session.inputListener);
+    }
     state.voice.recognition = null;
+    state.voice.session = null;
     if (recognition) {
       recognition.onresult = null;
       recognition.onend = null;
       recognition.onerror = null;
-      try { recognition.abort ? recognition.abort() : recognition.stop(); } catch (_error) { /* already stopped */ }
+      if (abort) {
+        try {
+          if (typeof recognition.abort === "function") recognition.abort();
+          else if (typeof recognition.stop === "function") recognition.stop();
+        } catch (_error) { /* already stopped */ }
+      }
     }
-    const meter = state.voice.meter;
-    state.voice.meter = null;
-    if (meter) {
-      window.cancelAnimationFrame(meter.frame);
-      meter.stream.getTracks().forEach((track) => track.stop());
-      if (meter.context && typeof meter.context.close === "function") void meter.context.close().catch(() => {});
-    }
+    stopVoiceMeter();
+    state.voice.latestText = "";
     setVoiceVolume(0);
     updateVoiceUi();
+    return true;
   }
 
-  function stopVoiceInput() {
-    releaseVoice();
-    state.voice.latestText = "";
+  function stopVoiceInput({ cancel = false } = {}) {
+    const session = state.voice.session;
+    if (!session) {
+      releaseVoice();
+      return;
+    }
+    if (cancel) {
+      releaseVoice({ ticket: session.ticket, abort: true });
+      return;
+    }
+    if (state.voice.stopping) return;
+    state.voice.active = false;
+    state.voice.stopping = true;
+    stopVoiceMeter();
+    updateVoiceUi();
+    const finish = () => releaseVoice({ ticket: session.ticket, abort: true });
+    session.stopTimer = window.setTimeout(finish, VOICE_STOP_TIMEOUT_MS);
+    const recognition = session.recognition;
+    if (!recognition || typeof recognition.stop !== "function") {
+      finish();
+      return;
+    }
+    try {
+      recognition.stop();
+    } catch (_error) {
+      finish();
+    }
   }
 
   function startVoiceMeter(ticket) {
+    const session = state.voice.session;
+    if (!session || session.ticket !== ticket) return;
     if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
       toast("当前环境无法显示麦克风音量；语音识别仍可继续。", "", 3600);
       return;
     }
     void navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-      if (!state.voice.active || state.voice.generation !== ticket) {
-        stream.getTracks().forEach((track) => track.stop());
+      if (!voiceSessionCurrent(session, { allowStopping: false })) {
+        if (stream && typeof stream.getTracks === "function") stream.getTracks().forEach((track) => track.stop());
         return;
       }
       let context = null;
       try {
         const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
         if (!AudioContextCtor) throw new Error("audio_context_unavailable");
+        if (typeof window.requestAnimationFrame !== "function") throw new Error("animation_frame_unavailable");
         context = new AudioContextCtor();
         const source = context.createMediaStreamSource(stream);
         const analyser = context.createAnalyser();
@@ -3202,10 +5792,13 @@
         analyser.smoothingTimeConstant = 0.55;
         source.connect(analyser);
         const data = new Uint8Array(analyser.frequencyBinCount);
-        const meter = { stream, context, frame: 0 };
+        const meter = { stream, context, frame: 0, closed: false };
         state.voice.meter = meter;
         const tick = () => {
-          if (!state.voice.active || state.voice.generation !== ticket || state.voice.meter !== meter) return;
+          if (!voiceSessionCurrent(session, { allowStopping: false }) || state.voice.meter !== meter) {
+            stopVoiceMeter(meter);
+            return;
+          }
           analyser.getByteFrequencyData(data);
           const mean = data.reduce((sum, value) => sum + value, 0) / data.length;
           setVoiceVolume(Math.min(100, Math.max(0, (mean - 4) * 2.4)));
@@ -3213,22 +5806,24 @@
         };
         tick();
       } catch (_error) {
-        stream.getTracks().forEach((track) => track.stop());
-        if (context && typeof context.close === "function") void context.close().catch(() => {});
-        toast("麦克风音量检测初始化失败，语音识别仍可继续。", "", 3600);
+        stopVoiceMeter({ stream, context, frame: 0, closed: false });
+        if (voiceSessionCurrent(session, { allowStopping: false })) toast("麦克风音量检测初始化失败，语音识别仍可继续。", "", 3600);
       }
     }).catch(() => {
-      if (state.voice.active && state.voice.generation === ticket) toast("无法获取麦克风权限，已关闭音量显示。", "", 3600);
+      if (voiceSessionCurrent(session, { allowStopping: false })) toast("无法获取麦克风权限，已关闭音量显示。", "", 3600);
     });
   }
 
   function toggleVoiceInput(targetInput = $("composerInput")) {
     const input = targetInput && targetInput.nodeType === 1 ? targetInput : $("composerInput");
     if (!input) return;
-    if (state.voice.active) {
+    if (state.voice.active || state.voice.stopping) {
       const sameTarget = state.voice.target === input;
-      stopVoiceInput();
-      if (sameTarget) return;
+      if (sameTarget && state.voice.active) {
+        stopVoiceInput();
+        return;
+      }
+      releaseVoice({ ticket: state.voice.session?.ticket, abort: true });
     }
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) {
@@ -3236,36 +5831,99 @@
       return;
     }
     const ticket = ++state.voice.generation;
+    const session = {
+      ticket,
+      input,
+      sessionId: String(state.currentSessionId || ""),
+      baseText: String(input.value || ""),
+      finalResults: new Map(),
+      interimResults: new Map(),
+      stopTimer: null,
+      recognition: null,
+      renderedText: String(input.value || ""),
+      programmaticInput: false,
+      inputListener: null
+    };
+    state.voice.session = session;
     state.voice.active = true;
+    state.voice.stopping = false;
     state.voice.target = input;
-    state.voice.latestText = String(input.value || "");
+    state.voice.latestText = session.baseText;
+    session.inputListener = () => {
+      if (session.programmaticInput || !voiceSessionOwned(session)) return;
+      releaseVoice({ ticket, abort: true });
+    };
+    if (typeof input.addEventListener === "function") input.addEventListener("input", session.inputListener);
     updateVoiceUi();
     try {
       const recognition = new Recognition();
+      session.recognition = recognition;
       state.voice.recognition = recognition;
       recognition.lang = "zh-CN";
-      recognition.interimResults = false;
+      recognition.interimResults = true;
       recognition.continuous = true;
       recognition.onresult = (event) => {
-        if (!state.voice.active || state.voice.generation !== ticket || state.voice.target !== input) return;
-        let text = "";
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          if (event.results[index].isFinal !== false) text += event.results[index][0].transcript;
+        if (!voiceSessionCurrent(session)) return;
+        if (String(input.value || "") !== session.renderedText) {
+          releaseVoice({ ticket, abort: true });
+          return;
         }
-        if (text) {
-          state.voice.latestText += text;
-          input.value = state.voice.latestText;
-          input.dispatchEvent(new Event("input", { bubbles: true }));
+        const results = event && event.results;
+        if (!results || typeof results.length !== "number") return;
+        const firstChanged = Number.isInteger(event.resultIndex) ? Math.max(0, event.resultIndex) : 0;
+        for (const index of session.interimResults.keys()) {
+          if (index >= results.length) session.interimResults.delete(index);
+        }
+        for (let index = firstChanged; index < results.length; index += 1) {
+          const result = results[index];
+          const alternative = result && result[0];
+          const transcript = alternative && typeof alternative.transcript === "string" ? alternative.transcript : "";
+          if (result && result.isFinal === false) {
+            session.interimResults.set(index, transcript);
+          } else {
+            // SpeechRecognition re-emits the same result while later words are
+            // recognized. Replacing by result index prevents final text from
+            // being appended twice, while still preserving repeated phrases at
+            // distinct result indexes.
+            session.finalResults.set(index, transcript);
+            session.interimResults.delete(index);
+          }
+        }
+        const finalText = [...session.finalResults.entries()]
+          .sort(([left], [right]) => left - right)
+          .map(([, text]) => text)
+          .join("");
+        const interimText = [...session.interimResults.entries()]
+          .sort(([left], [right]) => left - right)
+          .map(([, text]) => text)
+          .join("");
+        const nextText = `${session.baseText}${finalText}${interimText}`;
+        state.voice.latestText = nextText;
+        session.renderedText = nextText;
+        if (input.value !== nextText) {
+          session.programmaticInput = true;
+          try {
+            input.value = nextText;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+          } finally {
+            session.programmaticInput = false;
+          }
           if (input.id === "composerInput") resizeComposer();
         }
       };
       recognition.onend = () => {
-        if (state.voice.generation === ticket) stopVoiceInput();
+        if (voiceSessionOwned(session)) releaseVoice({ ticket, abort: false });
       };
       recognition.onerror = (event) => {
-        if (state.voice.generation !== ticket) return;
-        stopVoiceInput();
-        if (event && event.error !== "aborted") {
+        if (!voiceSessionOwned(session)) return;
+        if (!voiceSessionCurrent(session)) {
+          releaseVoice({ ticket, abort: true });
+          return;
+        }
+        const errorCode = event && event.error;
+        const expectedStop = state.voice.stopping || errorCode === "aborted";
+        releaseVoice({ ticket, abort: true });
+        if (!expectedStop && errorCode !== "aborted") {
           const voiceErrors = {
             "not-allowed": "麦克风权限被拒绝",
             "service-not-allowed": "语音服务不可用",
@@ -3273,13 +5931,13 @@
             "no-speech": "没有检测到语音",
             network: "语音服务网络连接失败"
           };
-          toast(`语音识别失败：${voiceErrors[event.error] || "请检查麦克风权限或改用文字输入"}`, "error");
+          toast(`语音识别失败：${voiceErrors[errorCode] || "请检查麦克风权限或改用文字输入"}`, "error");
         }
       };
       recognition.start();
       startVoiceMeter(ticket);
     } catch (error) {
-      stopVoiceInput();
+      stopVoiceInput({ cancel: true });
       toast(`启动语音识别失败：${String(error && error.message || error)}`, "error");
     }
   }
@@ -3331,19 +5989,51 @@
   }
 
   function enhanceVoiceInputs(root = document) {
-    if (state.voice.active && state.voice.target && !document.contains(state.voice.target)) stopVoiceInput();
+    if ((state.voice.active || state.voice.stopping) && state.voice.target && !document.contains(state.voice.target)) stopVoiceInput({ cancel: true });
     qsa("textarea, input", root).forEach((input) => addVoiceInputControl(input));
     updateVoiceUi();
   }
-  function applyResponsiveInspectorDefault() {
+
+  function setInspectorCollapsed(collapsed) {
     const pane = $("inspectPane");
     const toggle = $("inspectorToggle");
-    if (!pane || !toggle || window.innerWidth >= 900) return;
+    if (!pane || !toggle) return;
+    state.inspectorCollapsed = Boolean(collapsed);
+    pane.classList.toggle("collapsed", state.inspectorCollapsed);
+    const expanded = !state.inspectorCollapsed;
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const label = expanded ? "收起求职资料面板" : "打开求职资料面板";
+    toggle.setAttribute("aria-label", label);
+    toggle.setAttribute("title", label);
+  }
+
+  function toggleInspectorPane() {
+    const pane = $("inspectPane");
+    if (!pane) return;
+    if (state.pageView) {
+      // The workflow page hides the chat grid, so keep the inspector on the
+      // current page as a fixed side panel instead of navigating back to chat.
+      if (pane.parentNode !== $("appShell")) {
+        $("appShell").appendChild(pane);
+        pane.classList.add("workflow-inspector-overlay");
+        setInspectorCollapsed(false);
+      } else {
+        setInspectorCollapsed(pane.classList.contains("collapsed") ? false : true);
+      }
+      renderInspector();
+      return;
+    }
+    if (pane.classList.contains("workflow-inspector-overlay")) restoreInspectorPaneHost();
+    setInspectorCollapsed(!pane.classList.contains("collapsed"));
+  }
+
+  function applyResponsiveInspectorDefault() {
+    if (!$("inspectPane") || !$("inspectorToggle")) return;
     // The inspector is useful on desktop, but it must not cover the only
     // readable surface in the narrow embedded browser. Keep it closed until
     // the user explicitly opens it with the toolbar button.
-    pane.classList.add("collapsed");
-    toggle.setAttribute("aria-expanded", "false");
+    if (window.innerWidth < 900) setInspectorCollapsed(true);
+    else setInspectorCollapsed(state.inspectorCollapsed);
   }
 
   async function uploadOne(file) {
@@ -3384,8 +6074,32 @@
     if (results.length) {
       state.uploadedAttachments = [...(state.uploadedAttachments || []), ...results];
       state.uploadedAttachment = state.uploadedAttachments[0] || null;
+      captureComposerDraft();
       renderAll();
       toast(`已上传 ${results.length} 份材料，发送后才会读取。`, "success");
+    }
+    if (errors.length) toast(errors.join("；"), "error", 5200);
+  }
+
+  async function handlePlanProjectUploads(files) {
+    const list = Array.from(files || []).filter(Boolean);
+    if (!list.length) return;
+    const sessionId = String(state.currentSessionId || "new");
+    const results = [];
+    const errors = [];
+    for (const file of list) {
+      try {
+        const uploaded = await uploadOne(file);
+        if (String(state.currentSessionId || "new") !== sessionId) throw new Error("会话已切换，项目材料未加入当前会话。请在目标会话重新上传。");
+        if (uploaded) results.push(uploaded);
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (results.length && String(state.currentSessionId || "new") === sessionId) {
+      planProjectFiles = [...planProjectFiles, ...results];
+      renderPlanProjectResources();
+      toast(`已加入 ${results.length} 份自有复现项目材料，发送计划时会传给同一会话。`, "success");
     }
     if (errors.length) toast(errors.join("；"), "error", 5200);
   }
@@ -3402,15 +6116,27 @@
   }
 
   function bindEvents() {
-    $("backToChat").addEventListener("click", showSharedChat);
+    $("backToChat").addEventListener("click", () => openWorkflowChatDialog());
     qsa("[data-profile-tab]").forEach((button) => button.addEventListener("click", () => setProfileTab(button.dataset.profileTab)));
     $("profileDocuments").addEventListener("change", (event) => { profileFiles = Array.from(event.target.files || []); renderProfileFiles(); });
     $("profileImportForm").addEventListener("submit", submitProfilePage);
     $("planPageForm").addEventListener("submit", submitPlanPage);
+    $("planOtherDiscuss").addEventListener("click", discussPlanOther);
+    ["planInclude", "planExclude", "planMinStars", "planOther", "planPaperProjects", "planRerank"].forEach((id) => {
+      const control = $(id);
+      if (!control) return;
+      const key = { planInclude: "include", planExclude: "exclude", planMinStars: "minStars", planOther: "other", planPaperProjects: "paperProjects", planRerank: "rerank" }[id];
+      control.addEventListener(control.type === "checkbox" ? "change" : "input", () => rememberProjectFilter(state.currentSessionId, { [key]: control.type === "checkbox" ? control.checked : control.value }));
+    });
+    $("planProjectUrl").addEventListener("input", renderPlanProjectResources);
+    $("planProjectUpload").addEventListener("click", () => $("planProjectFileInput").click());
+    $("planProjectFileInput").addEventListener("change", (event) => { void handlePlanProjectUploads(event.target.files); event.target.value = ""; });
+    $("planProjectLocalImport").addEventListener("click", () => openLocalImport("planProject"));
+    $("planProjectRegister").addEventListener("click", () => { void submitOwnProjectPage(); });
     $("profileManual").addEventListener("click", async () => { if (!state.currentSessionId) await createSession(); openJobEditor("profile", workflowData().profile || {}); });
     $("profileCopy").addEventListener("click", () => openNewSession(state.currentSessionId));
-    $("practiceStarter").addEventListener("click", () => { draftWorkflowPrompt(WORKFLOW_STEPS[3].prompt); });
-    $("practiceFiles").addEventListener("click", () => { showSharedChat(); state.selectedTab = "files"; $("inspectPane").classList.remove("collapsed"); renderInspector(); loadFiles(state.filePath); });
+    $("practiceStarter").addEventListener("click", () => { openPracticeChatDialog({ start: true }); });
+    $("practiceFiles").addEventListener("click", () => { openWorkflowChatDialog(); state.selectedTab = "files"; setInspectorCollapsed(false); renderInspector(); loadFiles(state.filePath); });
     hydrateIcons();
     applyTheme(readTheme(), { persist: false });
     sidebarLastMobile = sidebarIsMobile();
@@ -3425,11 +6151,11 @@
     $("sidebarToggle").addEventListener("click", toggleSidebar);
     $("sidebarClose").addEventListener("click", closeSidebarDrawer);
     $("sidebarScrim").addEventListener("click", closeSidebarDrawer);
-    $("inspectorToggle").addEventListener("click", () => { const pane = $("inspectPane"); const collapsed = pane.classList.toggle("collapsed"); $("inspectorToggle").setAttribute("aria-expanded", collapsed ? "false" : "true"); });
-    $("paneClose").addEventListener("click", () => { $("inspectPane").classList.add("collapsed"); $("inspectorToggle").setAttribute("aria-expanded", "false"); });
+    $("inspectorToggle").addEventListener("click", toggleInspectorPane);
+    $("paneClose").addEventListener("click", () => setInspectorCollapsed(true));
     $("dismissTokenNotice").addEventListener("click", () => { state.dismissTokenNotice = true; showTokenNotice(); });
     $("composerForm").addEventListener("submit", (event) => { event.preventDefault(); sendMessage(); });
-    $("composerInput").addEventListener("input", resizeComposer);
+    $("composerInput").addEventListener("input", () => { resizeComposer(); captureComposerDraft(); });
     $("composerInput").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); sendMessage(); } });
     $("uploadButton").addEventListener("click", () => $("fileUploadInput").click());
     $("localImportButton").addEventListener("click", openLocalImport);
@@ -3458,8 +6184,12 @@
       const button = event.target.closest("[data-session-id]");
       if (button) { closeSidebarDrawer(); void selectSession(button.dataset.sessionId); }
     });
+    $("commandRuntimeList").addEventListener("click", (event) => {
+      const stop = event.target.closest("[data-command-stop]");
+      if (stop) { stop.disabled = true; void stopCommandRuntime(stop.dataset.commandStop); }
+    });
     qsa(".inspect-tab").forEach((button) => button.addEventListener("click", () => { if (!button.classList.contains("hidden")) { state.selectedTab = button.dataset.tab; renderInspector(); if (state.selectedTab === "files" && !state.fileEntries.length) loadFiles(state.filePath); } }));
-    $("approvalRegion").addEventListener("click", (event) => { const action = event.target.closest("[data-action]"); if (!action) return; action.disabled = true; if (action.dataset.action === "approve") approveOrReject("approve"); else if (action.dataset.action === "reject") approveOrReject("reject"); else if (action.dataset.action === "resolve") resolveUncertain(); });
+    $("approvalRegion").addEventListener("click", (event) => { const action = event.target.closest("[data-action]"); if (!action) return; action.disabled = true; if (action.dataset.action === "approve") approveOrReject("approve"); else if (action.dataset.action === "reject") approveOrReject("reject"); else if (action.dataset.action === "resolve") resolveUncertain(); else if (action.dataset.action === "continue") continueSession(); });
     $("fileModalClose").addEventListener("click", closeFileModal);
     $("fileModalBackdrop").addEventListener("click", (event) => { if (event.target === $("fileModalBackdrop")) closeFileModal(); });
     $("modelSettingsClose").addEventListener("click", closeModelSettings);
@@ -3479,6 +6209,24 @@
     $("jobEditCancel").addEventListener("click", closeJobEditor);
     $("jobEditForm").addEventListener("submit", saveJobEditor);
     $("jobEditBackdrop").addEventListener("click", (event) => { if (event.target === $("jobEditBackdrop")) closeJobEditor(); });
+    $("clarificationClose").addEventListener("click", closeClarificationModal);
+    $("clarificationCancel").addEventListener("click", closeClarificationModal);
+    $("clarificationForm").addEventListener("submit", submitClarification);
+    $("clarificationAnswer").addEventListener("input", () => {
+      const answer = String($("clarificationAnswer").value || "");
+      state.clarification.answer = answer;
+      if (!state.clarification.busy && state.clarification.sessionId && state.clarification.question) {
+        state.clarification.drafts.set(clarificationDraftKey(state.clarification.sessionId, state.clarification.question), answer);
+      }
+      syncClarificationModal();
+    });
+    $("clarificationRecovery").addEventListener("click", () => {
+      closeClarificationModal();
+      openWorkflowChatDialog({ scrollApproval: true });
+    });
+    $("clarificationBackdrop").addEventListener("click", (event) => { if (event.target === $("clarificationBackdrop")) closeClarificationModal(); });
+    $("workflowChatClose").addEventListener("click", closeWorkflowChatDialog);
+    $("workflowChatBackdrop").addEventListener("click", (event) => { if (event.target === $("workflowChatBackdrop")) closeWorkflowChatDialog(); });
     $("jdImportButton").addEventListener("click", openJdImport);
     $("jdImportClose").addEventListener("click", closeJdImport);
     $("jdImportBackdrop").addEventListener("click", (event) => { if (event.target === $("jdImportBackdrop")) closeJdImport(); });
@@ -3502,22 +6250,75 @@
     $("localImportBackdrop").addEventListener("click", (event) => { if (event.target === $("localImportBackdrop")) closeLocalImport(); });
     document.addEventListener("keydown", (event) => {
       trapModelSettingsFocus(event);
-      if (event.key === "Escape") { closeSidebarDrawer(); closeJdImport(); closeFileModal(); closeModelSettings(); closeJobEditor(); closeNewSession(); closeLocalImport(); }
+      if (event.key === "Escape") { closeSidebarDrawer(); closeJdImport(); closeFileModal(); closeModelSettings(); closeJobEditor(); closeNewSession(); closeLocalImport(); closeClarificationModal(); closeWorkflowChatDialog(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); openNewSession(); }
     });
-    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") clearPolling(); else if (state.currentSessionId && sessionBusy(state.currentSession)) startPolling(state.currentSessionId); });
-    window.addEventListener("beforeunload", () => { clearPolling(); stopVoiceInput(); });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        clearPolling();
+        clearPracticeWindowRefresh();
+        clearCommandRuntimeRefresh();
+      } else {
+        void refreshMainWindowOnReturn();
+        if (state.currentSessionId && sessionBusy(state.currentSession)) startPolling(state.currentSessionId);
+        if (state.practiceWindow.standalone) startPracticeWindowRefresh();
+        startCommandRuntimeRefresh();
+      }
+    });
+    window.addEventListener("focus", () => { void refreshMainWindowOnReturn(); });
+    window.addEventListener("beforeunload", () => { clearPolling(); clearPracticeWindowRefresh(); clearCommandRuntimeRefresh(); stopVoiceInput({ cancel: true }); });
     window.addEventListener("hashchange", handleTokenHashChange);
     window.addEventListener("resize", handleSidebarResize);
   }
 
   async function bootstrap() {
+    const windowParams = readPracticeWindowParams();
+    state.practiceWindow.standalone = windowParams.standalone;
+    state.practiceWindow.sessionId = windowParams.sessionId;
+    state.practiceWindow.projectKey = windowParams.projectKey;
+    state.practiceWindow.startRequested = Boolean(windowParams.start);
+    state.practiceWindow.startConsumed = false;
     state.token = captureToken();
     bindEvents();
+    startCommandRuntimeRefresh();
+    applyPracticeWindowChrome();
     applyResponsiveInspectorDefault();
     showTokenNotice();
     renderAll();
     await Promise.allSettled([refreshInfo(), refreshSessions(), loadUiSettings()]);
+    if (state.practiceWindow.standalone) {
+      state.selectedStep = "practice";
+      state.pageView = true;
+      if (!state.practiceWindow.sessionId || !state.practiceWindow.projectKey) {
+        showStandalonePracticeStale(
+          state.practiceWindow.sessionId,
+          state.practiceWindow.projectKey,
+          "这个实操窗口缺少固定的会话或项目范围。请关闭此窗口，并从“计划 & 项目”重新打开实操。",
+        );
+        return;
+      }
+      const requestedPracticeSession = state.sessions.find((row) => String(row.id) === String(state.practiceWindow.sessionId));
+      if (!requestedPracticeSession || !requestedPracticeSession.id) {
+        showStandalonePracticeStale(
+          state.practiceWindow.sessionId,
+          state.practiceWindow.projectKey,
+          "固定会话已不存在或无法读取。为避免打开错误会话，请关闭此窗口，并从当前岗位会话重新打开实操。",
+        );
+        return;
+      }
+      await selectSession(requestedPracticeSession.id, { restore: true });
+      if (String(state.currentSessionId || "") !== String(state.practiceWindow.sessionId)) {
+        showStandalonePracticeStale(
+          state.practiceWindow.sessionId,
+          state.practiceWindow.projectKey,
+          "固定会话读取失败。请关闭此窗口，并从当前岗位会话重新打开实操。",
+        );
+        return;
+      }
+      renderAll();
+      await openPracticeChatDialog({ focus: true, start: state.practiceWindow.startRequested });
+      return;
+    }
     const persisted = readPersistedSession();
     if (persisted) {
       const found = state.sessions.some((row) => String(row.id) === String(persisted));

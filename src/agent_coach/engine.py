@@ -18,7 +18,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .contracts import AgentSession, PendingApproval, ToolContext, ToolDefinition, ToolOutcome, ToolRegistry
+from .contracts import (
+    AgentSession,
+    BackgroundAction,
+    PendingApproval,
+    ToolContext,
+    ToolDefinition,
+    ToolOutcome,
+    ToolRegistry,
+)
 from .legacy.core.schema import ImageBlock, LLMResponse, Message, TextBlock, ToolCall
 from .store import RevisionConflict, SessionBusy, SessionStore, StoreError, WorkspaceMismatch
 
@@ -102,8 +110,16 @@ class RunResult:
     session: AgentSession
     message: str = ""
     pending: PendingApproval | None = None
+    # Structured command-session data is returned for both the initial
+    # running handoff and the eventual poll/stop completion.  The browser can
+    # render bounded stdout/stderr without parsing the transcript text.
+    data: dict[str, Any] | None = None
     steps: int = 0
     exit_code: int = 0
+    # Background actions keep the concise transcript text and machine-readable
+    # result envelope separate from the internal control instruction.
+    display_text: str = ""
+    metadata: dict[str, Any] | None = None
 
     @property
     def session_id(self) -> str:
@@ -117,14 +133,20 @@ class RunResult:
         return ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": self.status,
             "session_id": self.session.id,
             "message": self.message,
+            "data": self.data,
             "pending": self.pending.model_dump(mode="json") if self.pending else None,
             "steps": self.steps,
             "exit_code": self.exit_code,
         }
+        if self.display_text:
+            payload["display_text"] = self.display_text
+        if self.metadata is not None:
+            payload["metadata"] = dict(self.metadata)
+        return payload
 
 
 EventCallback = Callable[[dict[str, Any]], None]
@@ -142,6 +164,47 @@ def _redact(text: str, *, limit: int = 240) -> str:
     value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._-]+", r"\1[已隐藏凭据]", value)
     value = value.replace("\r", " ").replace("\n", " ")
     return value[:limit]
+
+
+def _turn_metadata(value: Any, *, default_scope: str = "main") -> dict[str, Any]:
+    """Return the small, browser-safe provenance envelope for one turn.
+
+    Scope metadata is persistence/UI bookkeeping only.  It is never included
+    in provider messages (the adapters read only the ordinary Message fields),
+    so adding practice attribution cannot fork or filter the model context.
+    Unknown fields are deliberately dropped because request bodies are
+    untrusted input and the envelope is later copied to pending/execution
+    state.
+    """
+
+    raw = value if isinstance(value, dict) else {}
+    scope = str(raw.get("scope") or default_scope).strip().casefold()
+    if scope == "practice":
+        project_key = str(raw.get("project_key") or "").strip()
+        thread_id = str(raw.get("practice_thread_id") or "").strip()
+        # A project key is the minimum safe discriminator.  The HTTP service
+        # always supplies a stable thread id; direct engine embedders may use
+        # a project-scoped turn without opening a named browser thread.
+        result: dict[str, Any] = {"scope": "practice", "project_key": project_key}
+        if thread_id:
+            result["practice_thread_id"] = thread_id
+        return result
+    return {"scope": "main"}
+
+
+def _scope_fields(value: Any) -> dict[str, Any]:
+    """Expose the canonical scope fields on durable pending/execution records."""
+
+    metadata = _turn_metadata(value)
+    fields: dict[str, Any] = {
+        "scope": metadata["scope"],
+        "metadata": dict(metadata),
+    }
+    if metadata["scope"] == "practice":
+        fields["project_key"] = metadata.get("project_key", "")
+        if metadata.get("practice_thread_id"):
+            fields["practice_thread_id"] = metadata["practice_thread_id"]
+    return fields
 
 
 class AgentEngine:
@@ -574,6 +637,11 @@ class AgentEngine:
         *,
         attachments: Iterable[Any] | None = None,
         max_steps: int | None = None,
+        display_text: str | None = None,
+        action_instruction: str | None = None,
+        action_guard: Callable[[AgentSession], None] | None = None,
+        active_action: BackgroundAction | None = None,
+        message_metadata: dict[str, Any] | None = None,
     ) -> RunResult:
         """Append a user prompt and execute until completion or a safe pause.
 
@@ -586,13 +654,18 @@ class AgentEngine:
         text = str(prompt or "").strip()
         if not text:
             raise ValueError("prompt 不能为空")
+        persisted_text = text if display_text is None else str(display_text or "").strip()
+        if not persisted_text:
+            raise ValueError("display_text 不能为空")
+        turn_metadata = _turn_metadata(message_metadata)
         session = self.store.create() if session_id is None else self.store.get(session_id)
         with self.store.lock(session.id):
             session = self.store.get(session.id)
+            self._restore_turn_metadata(session)
             if self._ensure_workflow(session):
                 self._event(session, "workflow", "已恢复求职辅导工作流")
                 self._save(session)
-            recovered = self._recover_if_needed(session)
+            recovered = self._recover_if_needed(session, max_steps=max_steps)
             if recovered is not None:
                 return recovered
             if session.execution and session.execution.get("status") == "uncertain":
@@ -620,23 +693,112 @@ class AgentEngine:
                     "会话有待恢复的工具队列，请先 /continue；未追加新的用户消息",
                     exit_code=2,
                 )
+            # Run request guards only after recovery and all existing-turn
+            # blockers have been checked. Guards may persist a server-side
+            # workflow action; doing that here guarantees rejected, pending,
+            # queued, or uncertain requests do not mutate state before a new
+            # user turn is accepted.
+            if action_guard is not None:
+                action_guard(session)
+            # A newly accepted user request establishes the attribution for
+            # every assistant/tool boundary that follows it.  In particular,
+            # a main request explicitly resets an earlier practice scope; a
+            # later approval/continue can only retain the scope persisted on
+            # this active turn.
+            session.active_turn_metadata = dict(turn_metadata)
+            session.last_turn_metadata = dict(turn_metadata)
+            if active_action is not None:
+                # Persist only a small machine marker.  The actual question and
+                # answer stay in the ordinary user message and never enter the
+                # system prompt as dynamic data.  The marker and the user turn
+                # are saved together below; there is no recoverable tool
+                # boundary between these two in-memory mutations, so a second
+                # fsync here only adds latency to every background action.
+                session.background_action = {
+                    "kind": active_action.kind,
+                    "instruction": active_action.instruction,
+                    "display_text": active_action.display_text,
+                    "metadata": dict(active_action.metadata),
+                }
+            elif session.background_action is not None:
+                # A fresh ordinary user turn starts a new task.  A previous
+                # paused action is resumed only through continue/approve,
+                # which deliberately read the durable marker below.  Save the
+                # cleared marker with the new user turn below.
+                session.background_action = None
             self._clear_pause(session)
-            self._ensure_system(session)
-            content = self._user_content(session, text, attachments)
-            session.messages.append(Message(role="user", content=content))
+            self._ensure_system(
+                session,
+                runtime_instruction=(str(action_instruction) if action_instruction else None),
+            )
+            # The model receives the full control prompt through the temporary
+            # runtime instruction below, while the durable user turn remains a
+            # concise, user-facing display string.
+            content = self._user_content(session, persisted_text, attachments)
+            session.messages.append(
+                Message(role="user", content=content, metadata=dict(turn_metadata))
+            )
             self._event(session, "user", "已收到新的用户请求")
             self._save(session)
-            return self._loop_locked(session, max_steps=max_steps)
+            if action_instruction:
+                try:
+                    return self._loop_locked(
+                        session,
+                        max_steps=max_steps,
+                        runtime_instruction=str(action_instruction),
+                        system_ready=True,
+                    )
+                finally:
+                    # A paused action deliberately keeps its fixed template
+                    # in the durable marker so approve/continue can restore
+                    # it.  Refreshing it here is retained for compatibility;
+                    # the first model request above no longer rebuilds the
+                    # same prompt a second time.
+                    self._ensure_system(session)
+                    self._save(session)
+            return self._loop_locked(session, max_steps=max_steps, system_ready=True)
+
+    def run_action(
+        self,
+        action: BackgroundAction | dict[str, Any],
+        session_id: str,
+        *,
+        max_steps: int | None = None,
+        action_guard: Callable[[AgentSession], None] | None = None,
+    ) -> RunResult:
+        """Run a server-created action in the existing session.
+
+        The action's ``instruction`` is injected only into the temporary
+        runtime system prompt.  Its short ``display_text`` is what gets
+        persisted as the user turn, so control templates cannot masquerade as
+        user-authored transcript content.
+        """
+
+        envelope = action if isinstance(action, BackgroundAction) else BackgroundAction.model_validate(action)
+        result = self.run(
+            envelope.instruction,
+            session_id=session_id,
+            max_steps=max_steps,
+            display_text=envelope.display_text,
+            action_instruction=envelope.instruction,
+            action_guard=action_guard,
+            active_action=envelope,
+            message_metadata=envelope.metadata,
+        )
+        result.display_text = envelope.display_text
+        result.metadata = dict(envelope.metadata)
+        return result
 
     def continue_session(self, session_id: str, *, max_steps: int | None = None) -> RunResult:
         """Resume an existing queue without appending a new user message."""
 
         with self.store.lock(session_id):
             session = self.store.get(session_id)
+            self._restore_turn_metadata(session)
             if self._ensure_workflow(session):
                 self._event(session, "workflow", "已恢复求职辅导工作流")
                 self._save(session)
-            recovered = self._recover_if_needed(session)
+            recovered = self._recover_if_needed(session, max_steps=max_steps)
             if recovered is not None:
                 return recovered
             if session.execution and session.execution.get("status") == "uncertain":
@@ -660,6 +822,34 @@ class AgentEngine:
     def cancel(self, session_id: str) -> RunResult:
         """Stop current work while retaining messages, queue, and pending state."""
 
+        # A command session has a real child process behind the durable claim;
+        # merely changing the claim to ``cancelled`` would orphan that child.
+        # Stop it through the command lifecycle first, outside the session
+        # lock, and keep cancellation from resuming the model.
+        with self.store.lock(session_id):
+            current = self.store.get(session_id)
+            current_execution = dict(current.execution or {})
+            if current_execution.get("status") == "uncertain":
+                # Cancellation cannot turn an unknown side effect into a
+                # harmlessly cancelled one.  Keep the durable claim (and any
+                # tied pending approval) untouched so a stale approve request
+                # remains blocked until resolve_uncertain is used.
+                return self._result(
+                    current,
+                    "uncertain",
+                    "存在未确认的执行 claim，无法安全取消；请先人工确认结果",
+                    data=(
+                        current_execution.get("command_snapshot")
+                        if isinstance(current_execution.get("command_snapshot"), dict)
+                        else None
+                    ),
+                    exit_code=2,
+                )
+            command_id = str(current_execution.get("command_session_id") or "").strip()
+            command_running = current_execution.get("status") == "running" and bool(command_id)
+        if command_running:
+            return self.stop_command(session_id, command_id, _resume_model=False)
+
         with self.store.lock(session_id):
             session = self.store.get(session_id)
             if session.execution and session.execution.get("status") == "running":
@@ -669,10 +859,174 @@ class AgentEngine:
                     "cancelled_at": _now(),
                 }
             else:
-                session.execution = {"status": "cancelled", "cancelled_at": _now()}
+                session.execution = {
+                    "status": "cancelled",
+                    "cancelled_at": _now(),
+                    **_scope_fields(session.active_turn_metadata),
+                }
             self._event(session, "cancel", "已取消本次执行，可从当前会话恢复")
             self._save(session)
             return self._result(session, "cancelled", "执行已取消，当前状态已保留", exit_code=2)
+
+    def poll_command(
+        self,
+        session_id: str,
+        command_session_id: str | None = None,
+        *,
+        execution_id: str | None = None,
+        wait_seconds: float = 10.0,
+        max_steps: int | None = None,
+    ) -> RunResult:
+        """Poll an approved command and finish its saved model turn once.
+
+        The bounded wait happens outside the durable session lock so an HTTP
+        stop request can terminate the child while a poll is waiting.  The
+        claim is rechecked under the lock before any transcript mutation,
+        making concurrent polls idempotent.
+        """
+
+        requested_id = str(command_session_id or execution_id or "").strip() or None
+        with self.store.lock(session_id):
+            session = self.store.get(session_id)
+            execution = dict(session.execution or {})
+            current_id = str(execution.get("command_session_id") or "").strip()
+            if requested_id and current_id and requested_id != current_id:
+                raise ApprovalMismatch("command session ID 不匹配当前执行 claim")
+            if not current_id:
+                if requested_id:
+                    previous = self._last_command_result(session, requested_id)
+                    if previous is not None:
+                        return previous
+                if execution.get("status") == "uncertain":
+                    return self._result(session, "uncertain", "存在未确认的执行 claim，禁止再次执行", exit_code=2)
+                raise UncertainExecution("当前会话没有正在运行的 command session")
+            command_id = current_id
+            if execution.get("status") != "running":
+                previous = self._last_command_result(session, command_id)
+                if previous is not None:
+                    return previous
+                if execution.get("status") == "uncertain":
+                    return self._result(session, "uncertain", "存在未确认的执行 claim，禁止再次执行", exit_code=2)
+                raise UncertainExecution("当前 command session 不可轮询")
+            scope = self._command_scope(session, execution)
+
+        try:
+            from .tools import poll_command_session
+
+            snapshot = poll_command_session(command_id, wait_seconds=wait_seconds, scope=scope)
+        except Exception as exc:
+            if "previous process" not in str(exc):
+                raise
+            with self.store.lock(session_id):
+                session = self.store.get(session_id)
+                if str((session.execution or {}).get("command_session_id") or "") == command_id:
+                    self.store.recover_running(
+                        session,
+                        reason="command session is no longer present after a process boundary",
+                    )
+                    self._event(session, "uncertain", "长命令会话已脱离当前进程，结果不确定，已禁止重试")
+                    self._save(session)
+                return self._result(session, "uncertain", "检测到中断的长命令，需人工确认后处理", exit_code=2)
+
+        with self.store.lock(session_id):
+            session = self.store.get(session_id)
+            execution = dict(session.execution or {})
+            current_id = str(execution.get("command_session_id") or "").strip()
+            if current_id != command_id or execution.get("status") != "running":
+                previous = self._last_command_result(session, command_id)
+                if previous is not None:
+                    # A concurrent poll/stop already committed the terminal
+                    # snapshot. Return it without appending a second tool
+                    # message or resuming the model a second time.
+                    return previous
+                if execution.get("status") == "uncertain":
+                    return self._result(session, "uncertain", "存在未确认的执行 claim，禁止再次执行", exit_code=2)
+                raise UncertainExecution("command session claim 已被其他操作解决")
+            if self._is_running_command_snapshot(snapshot):
+                execution["command_snapshot"] = dict(snapshot)
+                execution["command_status"] = str(snapshot.get("status") or "running")
+                execution["updated_at"] = _now()
+                session.execution = execution
+                self._save(session)
+                return self._result(
+                    session,
+                    "running_command",
+                    "命令仍在运行，可轮询输出或显式停止",
+                    data=snapshot,
+                )
+            return self._finish_command_locked(session, snapshot, max_steps=max_steps)
+
+    def stop_command(
+        self,
+        session_id: str,
+        command_session_id: str | None = None,
+        *,
+        execution_id: str | None = None,
+        max_steps: int | None = None,
+        _resume_model: bool = True,
+    ) -> RunResult:
+        """Stop an approved command tree and resume its saved model turn."""
+
+        requested_id = str(command_session_id or execution_id or "").strip() or None
+        with self.store.lock(session_id):
+            session = self.store.get(session_id)
+            execution = dict(session.execution or {})
+            current_id = str(execution.get("command_session_id") or "").strip()
+            if requested_id and current_id and requested_id != current_id:
+                raise ApprovalMismatch("command session ID 不匹配当前执行 claim")
+            if not current_id:
+                if requested_id:
+                    previous = self._last_command_result(session, requested_id)
+                    if previous is not None:
+                        return previous
+                if execution.get("status") == "uncertain":
+                    return self._result(session, "uncertain", "存在未确认的执行 claim，禁止再次执行", exit_code=2)
+                raise UncertainExecution("当前会话没有正在运行的 command session")
+            command_id = current_id
+            if execution.get("status") != "running":
+                previous = self._last_command_result(session, command_id)
+                if previous is not None:
+                    return previous
+                if execution.get("status") == "uncertain":
+                    return self._result(session, "uncertain", "存在未确认的执行 claim，禁止再次执行", exit_code=2)
+                raise UncertainExecution("当前 command session 不可停止")
+            scope = self._command_scope(session, execution)
+
+        try:
+            from .tools import stop_command_session
+
+            snapshot = stop_command_session(command_id, scope=scope)
+        except Exception as exc:
+            if "previous process" not in str(exc):
+                raise
+            with self.store.lock(session_id):
+                session = self.store.get(session_id)
+                if str((session.execution or {}).get("command_session_id") or "") == command_id:
+                    self.store.recover_running(
+                        session,
+                        reason="command session is no longer present after a process boundary",
+                    )
+                    self._event(session, "uncertain", "长命令会话已脱离当前进程，无法安全停止，结果不确定")
+                    self._save(session)
+                return self._result(session, "uncertain", "命令会话已脱离当前进程，需人工确认后处理", exit_code=2)
+
+        with self.store.lock(session_id):
+            session = self.store.get(session_id)
+            execution = dict(session.execution or {})
+            current_id = str(execution.get("command_session_id") or "").strip()
+            if current_id != command_id or execution.get("status") != "running":
+                previous = self._last_command_result(session, command_id)
+                if previous is not None:
+                    return previous
+                if execution.get("status") == "uncertain":
+                    return self._result(session, "uncertain", "存在未确认的执行 claim，禁止再次执行", exit_code=2)
+                raise UncertainExecution("command session claim 已被其他操作解决")
+            return self._finish_command_locked(
+                session,
+                snapshot,
+                max_steps=max_steps,
+                resume_model=_resume_model,
+            )
 
     def resolve_uncertain(self, session_id: str, execution_id: str, note: str = "") -> RunResult:
         """Acknowledge an uncertain claim without replaying its tool.
@@ -685,6 +1039,7 @@ class AgentEngine:
 
         with self.store.lock(session_id):
             session = self.store.get(session_id)
+            self._restore_turn_metadata(session)
             execution = dict(session.execution or {})
             status = execution.get("status")
             if status not in {"running", "uncertain"}:
@@ -740,11 +1095,19 @@ class AgentEngine:
                 else None
             ),
             "execution": dict(session.execution or {}),
+            "last_command": dict(session.last_command or {}),
         }
 
     # ----- model/tool loop ------------------------------------------------
 
-    def _loop_locked(self, session: AgentSession, *, max_steps: int | None = None) -> RunResult:
+    def _loop_locked(
+        self,
+        session: AgentSession,
+        *,
+        max_steps: int | None = None,
+        runtime_instruction: str | None = None,
+        system_ready: bool = False,
+    ) -> RunResult:
         if self.router is None:
             self._event(session, "error", "未配置模型；可以使用 slash commands 或 --demo")
             self._save(session)
@@ -760,10 +1123,13 @@ class AgentEngine:
                     queued_result.steps = steps
                     return queued_result
                 # Queue is drained; ask the model to incorporate tool results.
+                system_ready = False
                 continue
 
             steps += 1
-            self._ensure_system(session)
+            if not system_ready:
+                self._ensure_system(session, runtime_instruction=runtime_instruction)
+            system_ready = False
             try:
                 response = self._complete(session)
             except Exception as exc:  # model failures pause the thread safely
@@ -773,6 +1139,7 @@ class AgentEngine:
                     "reason": "model_error",
                     "error_type": type(exc).__name__,
                     "at": _now(),
+                    **_scope_fields(session.active_turn_metadata),
                 }
                 self._save(session)
                 return self._result(session, "error", f"模型调用失败：{_redact(str(exc))}", steps=steps, exit_code=2)
@@ -786,6 +1153,7 @@ class AgentEngine:
                     reasoning_content=response.reasoning_content,
                     reasoning_provider=response.reasoning_provider,
                     tool_calls=calls or None,
+                    metadata=self._active_metadata(session),
                 )
             )
             # The assistant turn and its complete call queue are one recovery
@@ -800,13 +1168,21 @@ class AgentEngine:
                 if calls
                 else "模型已返回文本",
             )
-            self._save(session)
-
             if not calls:
                 session.execution = None
+                # A normal assistant text boundary completes a background
+                # action.  Paused/approval/error boundaries retain this marker
+                # so continue/approve can restore the fixed action template.
+                session.background_action = None
                 self._event(session, "complete", "模型已完成本轮回答")
+                session.last_turn_metadata = self._active_metadata(session)
+                session.active_turn_metadata = None
                 self._save(session)
                 return self._result(session, "completed", response.text or "", steps=steps)
+
+            # The assistant turn and its complete call queue are one recovery
+            # boundary.  Persist it before any handler can perform work.
+            self._save(session)
 
             call_result = self._execute_calls_locked(session, calls)
             if call_result is not None:
@@ -818,6 +1194,7 @@ class AgentEngine:
             "reason": "max_steps",
             "steps": steps,
             "at": _now(),
+            **_scope_fields(session.active_turn_metadata),
         }
         self._event(session, "pause", f"已达到步数上限（{steps}），等待继续，不宣称任务完成")
         self._save(session)
@@ -835,8 +1212,10 @@ class AgentEngine:
             # Keep the current call in the durable queue until its result (or
             # pending approval) is saved.  A crash in a prepare/handler call
             # therefore leaves a recoverable queue item instead of dropping it.
+            # The assistant boundary (or the previous call's result save) has
+            # already persisted this exact queue, so re-saving it immediately
+            # before lookup only adds an fsync without strengthening recovery.
             session.queued_calls = [call, *remaining]
-            self._save(session)
             try:
                 definition = self.registry.get(call.name, list(session.active_skills))
             except KeyError:
@@ -872,6 +1251,7 @@ class AgentEngine:
                 pending.tool_call_id = call.id
                 pending.tool_name = call.name
                 pending.arguments = dict(call.arguments or pending.arguments or {})
+                pending.metadata = self._active_metadata(session)
                 session.pending = pending
                 session.queued_calls = list(remaining)
                 self._event(session, "approval", f"工具 {call.name} 等待审批，编号 {pending.id}")
@@ -889,8 +1269,9 @@ class AgentEngine:
             session.queued_calls = list(remaining)
             self._event(session, "tool", f"工具 {call.name} 已完成")
             self._save(session)
+        # The final handler/unknown-tool/error branch has already saved the
+        # empty queue.  Avoid a second identical durable write after the loop.
         session.queued_calls = []
-        self._save(session)
         return None
 
     def _decide(
@@ -903,10 +1284,11 @@ class AgentEngine:
     ) -> RunResult:
         with self.store.lock(session_id):
             session = self.store.get(session_id)
+            self._restore_turn_metadata(session)
             if self._ensure_workflow(session):
                 self._event(session, "workflow", "已恢复求职辅导工作流")
                 self._save(session)
-            recovered = self._recover_if_needed(session)
+            recovered = self._recover_if_needed(session, max_steps=max_steps)
             if recovered is not None:
                 return recovered
             if session.execution and session.execution.get("status") in {"running", "uncertain"}:
@@ -941,7 +1323,13 @@ class AgentEngine:
                 "call_id": pending.tool_call_id,
                 "approval_id": pending.id,
                 "tool_name": pending.tool_name,
+                # Retain the exact approved call for a later command-session
+                # completion.  The queue may already contain following calls,
+                # so reconstructing this from the model transcript would be
+                # ambiguous after a restart or concurrent poll.
+                "arguments": dict(pending.arguments or {}),
                 "started_at": _now(),
+                **_scope_fields(pending.metadata or session.active_turn_metadata),
             }
             self._event(session, "approval", f"已批准 {pending.id}，准备执行工具 {pending.tool_name}")
             self._save(session)
@@ -975,6 +1363,91 @@ class AgentEngine:
                 self._save(session)
                 return self._result(session, "uncertain", "工具执行结果不确定，已暂停", exit_code=2)
 
+            if self._is_uncertain_command_outcome(normalized):
+                # The command session could not prove that its child tree
+                # stopped.  Keep the approval/execution claim as uncertain;
+                # do not append a possibly premature tool result or resume
+                # the model while the process may still be alive.
+                snapshot = dict(normalized.data or {})
+                command_id = self._command_id_from_snapshot(snapshot)
+                session.execution = {
+                    **(session.execution or {}),
+                    "status": "uncertain",
+                    "kind": "approved_command",
+                    "command_session_id": command_id,
+                    "command_status": "uncertain",
+                    "command_snapshot": snapshot,
+                    "uncertain_at": _now(),
+                    "updated_at": _now(),
+                }
+                self._event(session, "uncertain", "长命令无法确认已停止，已禁止模型继续或重试")
+                self._save(session)
+                return self._result(
+                    session,
+                    "uncertain",
+                    "命令停止结果不确定，已暂停；请先人工确认",
+                    data=snapshot,
+                    exit_code=2,
+                )
+
+            if self._is_running_command_outcome(normalized):
+                command_id = self._command_id_from_snapshot(normalized.data)
+                if not command_id:
+                    # A running result without an opaque session id cannot be
+                    # polled or safely recovered. Treat it exactly like an
+                    # uncertain external side effect; never call execute a
+                    # second time to discover what happened.
+                    self._append_pending_result(
+                        session,
+                        pending,
+                        "工具结果：命令报告仍在运行，但没有返回可轮询的 command session id；结果不确定。",
+                    )
+                    session.pending = None
+                    session.execution = {
+                        **(session.execution or {}),
+                        "status": "uncertain",
+                        "finished_at": _now(),
+                        "reason": "running command did not return a session id",
+                    }
+                    self._event(session, "uncertain", "长命令缺少可轮询的会话 ID，已禁止重试")
+                    self._save(session)
+                    return self._result(session, "uncertain", "命令执行结果不确定，已暂停", exit_code=2)
+                session.pending = None
+                session.execution = {
+                    **(session.execution or {}),
+                    "status": "running",
+                    "kind": "approved_command",
+                    "command_session_id": command_id,
+                    "command_status": "running",
+                    "command_snapshot": dict(normalized.data or {}),
+                    "updated_at": _now(),
+                }
+                self._event(session, "command", "命令仍在运行，可轮询或停止", id=command_id, status="running")
+                self._save(session)
+                return self._result(
+                    session,
+                    "running_command",
+                    "命令仍在运行，可轮询输出或显式停止",
+                    data=normalized.data,
+                )
+
+            if self._is_terminal_command_outcome(normalized):
+                command_id = self._command_id_from_snapshot(normalized.data)
+                session.execution = {
+                    **(session.execution or {}),
+                    "status": "running",
+                    "kind": "approved_command",
+                    "command_session_id": command_id,
+                    "command_status": str((normalized.data or {}).get("status") or "completed"),
+                    "command_snapshot": dict(normalized.data or {}),
+                    "updated_at": _now(),
+                }
+                return self._finish_command_locked(
+                    session,
+                    dict(normalized.data or {}),
+                    max_steps=max_steps,
+                )
+
             self._append_pending_result(session, pending, normalized.content, normalized.data)
             session.pending = None
             session.execution = None
@@ -982,16 +1455,311 @@ class AgentEngine:
             self._save(session)
             return self._resume_after_decision(session, max_steps=max_steps)
 
-    def _resume_after_decision(self, session: AgentSession, *, max_steps: int | None) -> RunResult:
+    def _resume_after_decision(
+        self,
+        session: AgentSession,
+        *,
+        max_steps: int | None,
+        command_data: dict[str, Any] | None = None,
+    ) -> RunResult:
         self._ensure_system(session)
-        result = self._loop_locked(session, max_steps=max_steps)
+        result = self._loop_locked(session, max_steps=max_steps, system_ready=True)
+        if command_data is not None:
+            # Preserve the final bounded command snapshot on the outer result
+            # even when the resumed model immediately produces text, another
+            # approval, or a step-limit pause.
+            result.data = dict(command_data)
         return result
 
     # ----- persistence helpers ------------------------------------------
 
-    def _recover_if_needed(self, session: AgentSession) -> RunResult | None:
+    @staticmethod
+    def _restore_turn_metadata(session: AgentSession) -> None:
+        """Recover scope for a pending/uncertain turn after process restart.
+
+        Only explicit metadata is trusted.  Legacy untagged messages are left
+        as main conversation content rather than guessed into a practice
+        window.
+        """
+
+        active = (
+            _turn_metadata(session.active_turn_metadata)
+            if isinstance(session.active_turn_metadata, dict)
+            else None
+        )
+        candidates: list[Any] = []
+        if session.pending is not None:
+            candidates.append(session.pending.metadata)
+        if isinstance(session.execution, dict):
+            candidates.append(session.execution.get("metadata", session.execution))
+        for candidate in candidates:
+            normalized = _turn_metadata(candidate)
+            # A blank/default metadata envelope is still a valid main turn;
+            # only explicit practice provenance may enter active scope.
+            if normalized.get("scope") == "practice":
+                session.active_turn_metadata = normalized
+                return
+        if active is not None:
+            session.active_turn_metadata = active
+            return
+        session.active_turn_metadata = {"scope": "main"}
+
+    @staticmethod
+    def _active_metadata(session: AgentSession) -> dict[str, Any]:
+        return _turn_metadata(session.active_turn_metadata)
+
+    @staticmethod
+    def _command_id_from_snapshot(value: Any) -> str:
+        if not isinstance(value, dict):
+            return ""
+        for key in ("command_session_id", "execution_id", "session_id"):
+            candidate = str(value.get(key) or "").strip()
+            if candidate:
+                return candidate
+        return ""
+
+    @classmethod
+    def _is_running_command_outcome(cls, outcome: ToolOutcome) -> bool:
+        return isinstance(outcome.data, dict) and str(outcome.data.get("status") or "") in {
+            "starting",
+            "running",
+        }
+
+    @classmethod
+    def _is_uncertain_command_outcome(cls, outcome: ToolOutcome) -> bool:
+        data = outcome.data
+        return bool(
+            isinstance(data, dict)
+            and data.get("command_session") is True
+            and cls._command_id_from_snapshot(data)
+            and str(data.get("status") or "") == "uncertain"
+        )
+
+    @classmethod
+    def _is_terminal_command_outcome(cls, outcome: ToolOutcome) -> bool:
+        data = outcome.data
+        if not isinstance(data, dict) or data.get("command_session") is not True:
+            return False
+        if not cls._command_id_from_snapshot(data):
+            return False
+        return str(data.get("status") or "") in {
+            "completed",
+            "failed",
+            "timed_out",
+            "stopped",
+        }
+
+    @staticmethod
+    def _is_running_command_snapshot(snapshot: Any) -> bool:
+        return isinstance(snapshot, dict) and str(snapshot.get("status") or "") in {
+            "starting",
+            "running",
+        }
+
+    @classmethod
+    def _is_uncertain_command_snapshot(cls, snapshot: Any) -> bool:
+        return bool(
+            isinstance(snapshot, dict)
+            and cls._command_id_from_snapshot(snapshot)
+            and str(snapshot.get("status") or "") == "uncertain"
+        )
+
+    def _command_scope(self, session: AgentSession, execution: dict[str, Any]) -> dict[str, str]:
+        """Build the owner binding used for every command-session operation."""
+
+        scope: dict[str, str] = {
+            "workspace": str(self.store.workspace),
+            "session_id": str(session.id),
+        }
+        for key in (
+            "scope",
+            "project_key",
+            "practice_thread_id",
+            "approval_id",
+            "tool_call_id",
+        ):
+            value = execution.get(key)
+            if value is not None and str(value).strip():
+                scope[key] = str(value).strip()
+        return scope
+
+    def _last_command_result(self, session: AgentSession, command_id: str) -> RunResult | None:
+        last = session.last_command
+        if not isinstance(last, dict) or str(last.get("command_session_id") or "") != command_id:
+            return None
+        snapshot = last.get("result")
+        if not isinstance(snapshot, dict):
+            return None
+        return self._result(
+            session,
+            "completed_command",
+            "命令结果已返回；不会重复执行命令",
+            data=snapshot,
+        )
+
+    def _finish_command_locked(
+        self,
+        session: AgentSession,
+        snapshot: dict[str, Any],
+        *,
+        max_steps: int | None,
+        resume_model: bool = True,
+    ) -> RunResult:
+        """Commit one terminal command snapshot and resume the saved queue.
+
+        The caller owns the session lock.  The command session ID and tool
+        call ID are checked against the durable claim before the transcript is
+        mutated, and ``last_command`` makes subsequent HTTP retries
+        idempotent after the claim has been cleared.
+        """
+
+        execution = dict(session.execution or {})
+        command_id = str(execution.get("command_session_id") or "").strip()
+        snapshot_id = self._command_id_from_snapshot(snapshot)
+        if not command_id or not snapshot_id or command_id != snapshot_id:
+            raise EngineError("命令会话 ID 与 durable execution claim 不匹配")
+        if self._is_running_command_snapshot(snapshot):
+            execution["command_snapshot"] = dict(snapshot)
+            execution["command_status"] = str(snapshot.get("status") or "running")
+            execution["updated_at"] = _now()
+            session.execution = execution
+            self._save(session)
+            return self._result(
+                session,
+                "running_command",
+                "命令仍在运行，可轮询输出或显式停止",
+                data=snapshot,
+            )
+
+        if self._is_uncertain_command_snapshot(snapshot):
+            # A timeout/stop that could not be confirmed must stay a durable
+            # blocker.  In particular, do not write a terminal tool message
+            # and resume the model while the process tree may still exist.
+            execution["status"] = "uncertain"
+            execution["command_snapshot"] = dict(snapshot)
+            execution["command_status"] = "uncertain"
+            execution["uncertain_at"] = execution.get("uncertain_at") or _now()
+            execution["updated_at"] = _now()
+            session.execution = execution
+            self._event(session, "uncertain", "长命令无法确认已停止，已禁止模型继续或重试")
+            self._save(session)
+            return self._result(
+                session,
+                "uncertain",
+                "命令停止结果不确定，已暂停；请先人工确认",
+                data=snapshot,
+                exit_code=2,
+            )
+
+        previous = self._last_command_result(session, command_id)
+        if previous is not None:
+            return previous
+        call_id = str(execution.get("call_id") or "").strip()
+        tool_name = str(execution.get("tool_name") or "run_command").strip()
+        if not call_id:
+            session.execution = {
+                **execution,
+                "status": "uncertain",
+                "reason": "running command claim has no tool call id",
+                "uncertain_at": _now(),
+            }
+            self._event(session, "uncertain", "长命令 claim 缺少 tool call id，已禁止重试")
+            self._save(session)
+            return self._result(session, "uncertain", "命令结果不确定，已暂停", exit_code=2)
+
+        arguments = execution.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        if not any(
+            message.role == "tool" and message.tool_call_id == call_id
+            for message in session.messages
+        ):
+            content = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+            self._append_tool_result(
+                session,
+                ToolCall(id=call_id, name=tool_name, arguments=dict(arguments)),
+                content,
+                snapshot,
+            )
+        session.last_command = {
+            "execution_id": command_id,
+            "command_session_id": command_id,
+            "status": str(snapshot.get("status") or "completed"),
+            "result": dict(snapshot),
+            "call_id": call_id,
+            "approval_id": str(execution.get("approval_id") or ""),
+            "finished_at": _now(),
+        }
+        if session.pending and session.pending.tool_call_id == call_id:
+            session.pending = None
+        session.execution = None
+        self._event(
+            session,
+            "tool",
+            f"已完成获批命令（{snapshot.get('status') or 'completed'}）",
+            id=command_id,
+            status=str(snapshot.get("status") or "completed"),
+        )
+        self._save(session)
+        if not resume_model:
+            return self._result(
+                session,
+                "cancelled",
+                "命令已停止，结果已保存；模型尚未继续",
+                data=snapshot,
+                exit_code=2,
+            )
+        return self._resume_after_decision(
+            session,
+            max_steps=max_steps,
+            command_data=snapshot,
+        )
+
+    def _recover_if_needed(
+        self,
+        session: AgentSession,
+        *,
+        max_steps: int | None = None,
+    ) -> RunResult | None:
         if not session.execution or session.execution.get("status") != "running":
             return None
+        execution = dict(session.execution)
+        command_id = str(execution.get("command_session_id") or "").strip()
+        if command_id:
+            # A command started in this process remains recoverable.  A
+            # missing in-memory session means the process that owned it ended;
+            # only then does the ordinary uncertain-recovery path apply.
+            try:
+                from .tools import poll_command_session
+
+                snapshot = poll_command_session(
+                    command_id,
+                    wait_seconds=0,
+                    scope=self._command_scope(session, execution),
+                )
+            except Exception as exc:
+                if "previous process" not in str(exc):
+                    raise
+                self.store.recover_running(
+                    session,
+                    reason="command session is no longer present after a process boundary",
+                )
+                self._event(session, "uncertain", "长命令会话已脱离当前进程，结果不确定，已禁止重试")
+                self._save(session)
+                return self._result(session, "uncertain", "检测到中断的长命令，需人工确认后处理", exit_code=2)
+            if self._is_running_command_snapshot(snapshot):
+                execution["command_snapshot"] = dict(snapshot)
+                execution["command_status"] = str(snapshot.get("status") or "running")
+                execution["updated_at"] = _now()
+                session.execution = execution
+                self._save(session)
+                return self._result(
+                    session,
+                    "running_command",
+                    "命令仍在运行，可轮询输出或显式停止",
+                    data=snapshot,
+                )
+            return self._finish_command_locked(session, snapshot, max_steps=max_steps)
         self.store.recover_running(session)
         self._event(session, "uncertain", "检测到上次执行中断，结果不确定，已禁止自动重试")
         self._save(session)
@@ -1001,7 +1769,16 @@ class AgentEngine:
         if session.execution and session.execution.get("status") in {"paused", "cancelled"}:
             session.execution = None
 
-    def _ensure_system(self, session: AgentSession) -> None:
+    def _ensure_system(
+        self,
+        session: AgentSession,
+        *,
+        runtime_instruction: str | None = None,
+    ) -> None:
+        if runtime_instruction is None and isinstance(session.background_action, dict):
+            candidate = session.background_action.get("instruction")
+            if isinstance(candidate, str) and candidate.strip():
+                runtime_instruction = candidate
         prompt = self.system_prompt.strip()
         # Keep the language contract at the engine boundary so custom prompts
         # and sessions created by older builds cannot omit the product default.
@@ -1051,6 +1828,11 @@ class AgentEngine:
                 # call.  The workflow tools still report their own validation
                 # errors when the artifact is next used.
                 pass
+        if runtime_instruction:
+            # The action instruction is a fixed server-created template.  The
+            # selected question and answer remain ordinary user data, so they
+            # cannot claim system authority.
+            prompt += "\n\n" + str(runtime_instruction).strip()
         prompt = prompt.rstrip() + "\n\n" + DEFAULT_LANGUAGE_DIRECTIVE
         if session.messages and session.messages[0].role == "system":
             session.messages[0].content = prompt
@@ -1088,7 +1870,13 @@ class AgentEngine:
         if len(text) > 20000:
             text = text[:20000] + "\n[工具结果已截断]"
         session.messages.append(
-            Message(role="tool", content=text, tool_call_id=call.id, name=call.name)
+            Message(
+                role="tool",
+                content=text,
+                tool_call_id=call.id,
+                name=call.name,
+                metadata=self._active_metadata(session),
+            )
         )
 
     def _append_pending_result(
@@ -1122,6 +1910,8 @@ class AgentEngine:
         # Extra values are kept deliberately small and are supplied only by the
         # engine (never raw tool arguments), so events remain safe to display.
         event.update({key: value for key, value in extra.items() if key in {"id", "status", "steps"}})
+        scope = self._active_metadata(session)
+        event.update(_scope_fields(scope))
         session.events.append(event)
         if len(session.events) > 200:
             session.events = session.events[-200:]
@@ -1146,16 +1936,25 @@ class AgentEngine:
         message: str,
         *,
         pending: PendingApproval | None = None,
+        data: dict[str, Any] | None = None,
         steps: int = 0,
         exit_code: int = 0,
     ) -> RunResult:
+        metadata = session.active_turn_metadata or session.last_turn_metadata
+        # Keep the legacy engine result contract for ordinary main turns:
+        # browser scope is persisted on the session/messages, while only a
+        # practice result needs a non-empty envelope for its filtered view.
+        if _turn_metadata(metadata).get("scope") != "practice":
+            metadata = None
         return RunResult(
             status=status,
             session=session,
             message=message,
             pending=pending,
+            data=(dict(data) if isinstance(data, dict) else data),
             steps=steps,
             exit_code=exit_code,
+            metadata=(dict(metadata) if isinstance(metadata, dict) else None),
         )
 
 
