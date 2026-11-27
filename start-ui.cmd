@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+chcp 65001 >nul
+title 简历项目助手
 set "PROJECT_DIR=%~dp0"
 set "PYTHONUTF8=1"
 set "FORWARD_ARGS=%*"

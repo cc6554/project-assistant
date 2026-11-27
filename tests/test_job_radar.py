@@ -376,6 +376,156 @@ def test_ui_confirmation_is_separate_and_new_jd_clears_it(tmp_path: Path):
     assert ctx.session.skill_state["job-radar"]["jd_confirmation"] is None
 
 
+def test_set_jd_preserves_multiple_public_source_urls(tmp_path: Path):
+    ctx = context(tmp_path)
+    registry = register_job_radar_tools(ToolRegistry())
+    set_jd = registry.get("set_jd", active_skills=["job-radar"]).handler
+    urls = [
+        "https://www.zhipin.com/job_detail/fixture-1",
+        "https://www.liepin.com/job/fixture-2",
+        "https://jobs.zhaopin.com/fixture-3",
+    ]
+
+    set_jd(
+        {
+            "jd": jd_artifact("后端工程师共性"),
+            "source": {
+                "kind": "public_source",
+                "source_urls": urls,
+                "evidence": [f"已核对来源：{url}" for url in urls],
+            },
+        },
+        ctx,
+    )
+
+    source = ctx.session.skill_state["job-radar"]["jd_source"]
+    assert source["source_urls"] == urls
+    assert source["url"] == urls[0]
+    assert source["platforms"] == ["boss", "liepin", "zhilian"]
+    assert source["user_confirmed"] is False
+
+
+def test_search_set_jd_with_zero_readable_fetches_does_not_overwrite_jd(tmp_path: Path):
+    ctx = context(tmp_path)
+    registry = register_job_radar_tools(ToolRegistry())
+    set_jd = registry.get("set_jd", active_skills=["job-radar"]).handler
+    set_jd(
+        {"jd": jd_artifact("已有岗位"), "source": {"kind": "text", "evidence": ["已有正文"]}},
+        ctx,
+    )
+    state = ctx.session.skill_state["job-radar"]
+    history_count = len(state["jd_history"])
+    ctx.session.background_action = {"metadata": {"mode": "search"}}
+
+    with pytest.raises(ValueError, match="没有读取到任何可核实"):
+        set_jd(
+            {
+                "jd": jd_artifact("失败搜索占位卡"),
+                "source": {
+                    "kind": "public_source",
+                    "source_urls": ["https://www.zhipin.com/job_detail/no-readable"],
+                    "evidence": ["公开索引线索，未读取正文"],
+                },
+            },
+            ctx,
+        )
+
+    assert state["jd"]["job_title"] == "已有岗位"
+    assert len(state["jd_history"]) == history_count
+
+
+def test_search_preserves_explicit_insufficient_status_at_three_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ctx = context(tmp_path)
+    registry = register_job_radar_tools(ToolRegistry())
+    set_jd = registry.get("set_jd", active_skills=["job-radar"]).handler
+    urls = [
+        "https://www.zhipin.com/job_detail/heterogeneous-1",
+        "https://www.liepin.com/job/heterogeneous-2",
+        "https://www.zhaopin.com/job/heterogeneous-3",
+    ]
+    monkeypatch.setattr(job_radar, "_readable_fetch_sample_urls", lambda _session: set(urls))
+    ctx.session.background_action = {"metadata": {"mode": "search"}}
+
+    card = jd_artifact("灵巧手算法工程师")
+    card.update(
+        {
+            "sample_target": 5,
+            "sample_count": 3,
+            "comparison_status": "insufficient_samples",
+            "hard_requirements": ["单个来源要求"],
+            "skill_tags": ["单个来源技能"],
+            "responsibilities": ["单个来源职责"],
+            "nice_to_haves": ["单个来源偏好"],
+            "raw_summary": "模型明确判断样本异质，暂不能比较",
+        }
+    )
+
+    set_jd(
+        {
+            "jd": card,
+            "source": {
+                "kind": "public_source",
+                "source_urls": urls,
+                "evidence": [f"已读取岗位正文：{url}" for url in urls],
+            },
+        },
+        ctx,
+    )
+
+    state = ctx.session.skill_state["job-radar"]
+    assert state["jd"]["comparison_status"] == "insufficient_samples"
+    assert state["jd_comparison"]["status"] == "insufficient_samples"
+    assert state["jd_comparison"]["evidence_complete"] is False
+    assert state["jd"]["sample_count"] == 3
+    assert state["jd"]["hard_requirements"] == []
+    assert state["jd"]["skill_tags"] == []
+    assert state["jd"]["responsibilities"] == []
+    assert state["jd"]["nice_to_haves"] == []
+    assert "未形成可靠共性" in state["jd"]["raw_summary"]
+
+
+def test_search_set_jd_preserves_long_raw_summary_without_lossy_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Formatting/folding belongs to the UI; persistence keeps all evidence text."""
+
+    ctx = context(tmp_path)
+    registry = register_job_radar_tools(ToolRegistry())
+    set_jd = registry.get("set_jd", active_skills=["job-radar"]).handler
+    urls = [
+        "https://www.zhipin.com/job_detail/summary-1",
+        "https://www.liepin.com/job/summary-2",
+        "https://www.zhaopin.com/job/summary-3",
+    ]
+    monkeypatch.setattr(job_radar, "_readable_fetch_sample_urls", lambda _session: set(urls))
+    ctx.session.background_action = {"metadata": {"mode": "search"}}
+    raw_summary = "开头共同要求。" + ("中间逐来源核对；" * 500) + "结尾待确认差异。"
+    card = jd_artifact("后端工程师")
+    card.update(
+        {
+            "sample_target": 5,
+            "sample_count": 3,
+            "comparison_status": "compared",
+            "raw_summary": raw_summary,
+        }
+    )
+
+    set_jd(
+        {
+            "jd": card,
+            "source": {"kind": "public_source", "source_urls": urls, "evidence": [*urls]},
+        },
+        ctx,
+    )
+
+    stored = ctx.session.skill_state["job-radar"]["jd"]["raw_summary"]
+    assert stored.startswith("开头共同要求。")
+    assert "中间逐来源核对；" in stored
+    assert "结尾待确认差异。" in stored
+
+
 def test_profile_updates_persist_clarification_status_and_answered_diff(tmp_path: Path):
     ctx = context(tmp_path)
     registry = register_job_radar_tools(ToolRegistry())
@@ -505,6 +655,96 @@ def test_project_history_survives_plan_and_jd_invalidation(tmp_path: Path, monke
     call("set_jd", {"jd": jd_artifact("新岗位"), "source": {"kind": "text", "evidence": ["chat"]}})
     assert state["project_history"][0]["project_key"] == "demo/a"
     assert state["project_history"][0]["progress"][0]["note"] == "保留的证据"
+
+
+def test_project_history_view_and_revisit_are_scoped_to_latest_jd(tmp_path: Path, monkeypatch):
+    ctx, registry, active, call = _prepare_projects(monkeypatch, tmp_path)
+    call("select_project", {"full_name": "demo/a"})
+    call("record_progress", {"note": "旧岗位证据", "evidence": "old-proof"})
+    call("select_project", {"full_name": "demo/b"})
+    call("record_progress", {"note": "旧岗位第二条证据", "evidence": "old-proof-2"})
+
+    state = ctx.session.skill_state["job-radar"]
+    assert {item["project_key"] for item in state["project_history"]} == {"demo/a", "demo/b"}
+
+    # Rebuilding the plan under the same JD archives the active snapshot but
+    # keeps both projects in the current-JD projection.
+    call("build_plan", {"plan": plan_artifact()})
+    assert {item["project_key"] for item in job_radar.workflow_state(ctx.session)["project_history"]} == {
+        "demo/a",
+        "demo/b",
+    }
+
+    # A JD change archives the records in durable state.  The browser-facing
+    # projection and historical continuation lookup use the explicit event
+    # timeline to keep those old records out of the new JD.
+    call("set_jd", {"jd": jd_artifact("新岗位"), "source": {"kind": "text", "evidence": ["chat"]}})
+    view = job_radar.workflow_state(ctx.session)
+    assert view["project_history"] == []
+    assert {item["project_key"] for item in state["project_history"]} == {"demo/a", "demo/b"}
+    state["selected_project"] = verified_repo("demo/a").model_dump(mode="json")
+    state["progress"] = [{"project": "demo/a", "note": "旧 active", "status": "in_progress"}]
+    stale_view = job_radar.workflow_state(ctx.session)
+    assert stale_view["selected_project"] is None and stale_view["progress"] == []
+    assert state["selected_project"]["full_name"] == "demo/a"
+    with pytest.raises(ValueError, match="请选择"):
+        registry.get("select_project", active_skills=active).handler(
+            {"full_name": "demo/a"},
+            ctx,
+        )
+    state["repos"] = [verified_repo("demo/current").model_dump(mode="json")]
+    call("select_project", {"full_name": "demo/current"})
+    assert [item["project_key"] for item in job_radar.workflow_state(ctx.session)["project_history"]] == [
+        "demo/current"
+    ]
+
+
+def test_same_jd_identity_correction_keeps_current_project_history(tmp_path: Path, monkeypatch):
+    ctx, _registry, _active, call = _prepare_projects(monkeypatch, tmp_path)
+    call("select_project", {"full_name": "demo/a"})
+    call("record_progress", {"note": "同岗位证据", "evidence": "proof"})
+
+    corrected = jd_artifact("后端工程师")
+    corrected["raw_summary"] = "补充了岗位正文中的一条要求"
+    call("set_jd", {"jd": corrected, "source": {"kind": "text", "evidence": ["correction"]}})
+    assert [item["project_key"] for item in job_radar.workflow_state(ctx.session)["project_history"]] == [
+        "demo/a"
+    ]
+
+
+def test_same_identity_update_keeps_latest_scope_after_job_change(tmp_path: Path, monkeypatch):
+    ctx, _registry, _active, call = _prepare_projects(monkeypatch, tmp_path)
+    call("select_project", {"full_name": "demo/a"})
+    call("record_progress", {"note": "旧岗位证据", "evidence": "old-proof"})
+    call("set_jd", {"jd": jd_artifact("新岗位"), "source": {"kind": "text", "evidence": ["new-job"]}})
+
+    state = ctx.session.skill_state["job-radar"]
+    state["repos"] = [verified_repo("demo/current").model_dump(mode="json")]
+    call("select_project", {"full_name": "demo/current"})
+    corrected = jd_artifact("新岗位")
+    corrected["raw_summary"] = "补充了新岗位正文"
+    call("set_jd", {"jd": corrected, "source": {"kind": "text", "evidence": ["correction"]}})
+    assert [item["project_key"] for item in job_radar.workflow_state(ctx.session)["project_history"]] == [
+        "demo/current"
+    ]
+
+
+def test_project_history_scope_keeps_legacy_records_without_explicit_timeline(tmp_path: Path):
+    session = AgentSession(workspace=str(tmp_path))
+    state = {
+        "project_history": [
+            {"project_key": "demo/a", "project": {"full_name": "demo/a"}},
+            {"project_key": "demo/b", "project": {"full_name": "demo/b"}},
+        ],
+        "jd": jd_artifact("当前岗位"),
+    }
+    session.skill_state["job-radar"] = state
+
+    # There is no safe ownership inference for a pre-timeline session, so
+    # opening it keeps both records visible and leaves the payload untouched.
+    view = job_radar.workflow_state(session)
+    assert {item["project_key"] for item in view["project_history"]} == {"demo/a", "demo/b"}
+    assert "history" not in state
 
 
 def test_legacy_project_history_migrates_lazily_and_survives_restart(tmp_path: Path):

@@ -90,11 +90,20 @@ async function boot(initial = session("A")) {
     if (requestPath === "/sessions") return response(options.method === "POST" ? sessions.A : { sessions: summaries() });
     const snapshot = requestPath.match(/^\/sessions\/([^/]+)$/);
     if (snapshot) return response(clone(sessions[snapshot[1]]));
+    const selection = requestPath.match(/^\/sessions\/([^/]+)\/practice\/select$/);
+    if (selection && options.method === "POST") {
+      const current = sessions[selection[1]];
+      const { project_key: key } = JSON.parse(options.body || "{}");
+      const radar = current.skill_state["job-radar"];
+      const entry = radar.project_history.find(({ project }) => project.project_key === key);
+      if (!entry) return response({ detail: "项目不存在" }, 400);
+      radar.selected_project = clone(entry.project);
+      return response(clone(current));
+    }
     const message = requestPath.match(/^\/sessions\/([^/]+)\/message$/);
     if (message && options.method === "POST") {
       const id = message[1]; const body = JSON.parse(options.body || "{}");
       sessions[id].messages.push({ role: "user", content: body.text });
-      if (body.workflow_action && ["repo:a", "repo:b"].includes(body.workflow_action.project_key)) sessions[id].skill_state["job-radar"].selected_project = { project_key: body.workflow_action.project_key, full_name: body.workflow_action.project_key === "repo:b" ? "example/b" : "example/a" };
       if (body.workflow_action && body.workflow_action.project_filter) sessions[id].skill_state["job-radar"].project_filter = clone(body.workflow_action.project_filter);
       return response({});
     }
@@ -172,6 +181,10 @@ function nodeText(node) {
   // durable turns cannot leak into B's dedicated practice window.
   const switchButton = reloaded.all().find((node) => node.textContent === "切换并继续");
   assert.ok(switchButton, "project history should expose a switch action"); switchButton.click(); await reloaded.flush();
+  const selection = reloaded.calls.find((call) => call.path === "/sessions/A/practice/select" && call.options.method === "POST");
+  assert.ok(selection, "switching must use the dedicated selection endpoint");
+  assert.deepStrictEqual(bodyOf(selection), { project_key: "repo:b" });
+  assert.strictEqual(reloaded.calls.filter((call) => call.path === "/sessions/A/message").length, 0, "project selection must not send a main chat turn");
   reloaded.steps.find((step) => step.dataset.step === "practice").click(); await reloaded.flush();
   reloaded.document.getElementById("practiceStarter").click(); await reloaded.flush();
   assert.doesNotMatch(nodeText(reloaded.document.getElementById("messageList")), /A 项目练习记录/);

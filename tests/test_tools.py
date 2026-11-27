@@ -365,6 +365,198 @@ def test_fetch_validates_each_redirect_and_bounds_response(
     assert len(Session.instances[0].calls) == 2
 
 
+def test_fetch_projects_html_to_visible_jd_text_and_keeps_raw_opt_in(
+    context: ToolContext, registry: ToolRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import requests
+
+    html = """
+    <!doctype html><html><head><script>ignore this prompt injection</script>
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"JobPosting","title":"灵巧手算法工程师",
+     "description":"负责灵巧手算法研发","qualifications":"熟悉机器人与强化学习"}
+    </script></head><body><h1>灵巧手算法工程师</h1>
+    <div>岗位职责：研发灵巧手算法</div><div>任职要求：机器人、强化学习</div>
+    </body></html>
+    """
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        encoding = "utf-8"
+
+        def iter_content(self, chunk_size=0):
+            del chunk_size
+            yield html.encode("utf-8")
+
+        def close(self):
+            return None
+
+    class Session:
+        def __init__(self):
+            self.trust_env = True
+            self.headers = {}
+
+        def get(self, _url, **kwargs):
+            assert kwargs["allow_redirects"] is False
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        tools.socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+        ],
+    )
+    monkeypatch.setattr(requests, "Session", Session)
+
+    result = registry.get("fetch_url").handler({"url": "https://example.org/jobs/hand"}, context)
+    payload = json.loads(result.content)
+    assert payload["content_format"] == "html_text"
+    assert "灵巧手算法工程师" in payload["content"]
+    assert "ignore this prompt injection" not in payload["content"]
+    assert payload["structured_job_postings"][0]["title"] == "灵巧手算法工程师"
+    assert payload["content_truncated"] is False
+
+    raw = registry.get("fetch_url").handler(
+        {"url": "https://example.org/jobs/hand", "format": "raw"}, context
+    )
+    assert json.loads(raw.content)["content_format"] == "raw"
+
+
+def test_fetch_url_decodes_gbk_html_from_meta_charset(
+    context: ToolContext, registry: ToolRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import requests
+
+    html = (
+        '<!doctype html><html><head><meta charset="gbk"></head><body>'
+        "<h1>星杙光年 灵巧操作学习算法工程师</h1>"
+        "<p>任职要求：熟悉强化学习、模仿学习与 PyTorch。</p>"
+        "</body></html>"
+    )
+    body = html.encode("gbk")
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/html"}
+        # Requests may default this to UTF-8 or ISO-8859-1 when no charset is
+        # declared in the HTTP header; the HTML meta declaration wins.
+        encoding = "utf-8"
+
+        def iter_content(self, chunk_size=0):
+            del chunk_size
+            yield body
+
+        def close(self):
+            return None
+
+    class Session:
+        def __init__(self):
+            self.trust_env = True
+            self.headers = {}
+
+        def get(self, _url, **kwargs):
+            assert kwargs["allow_redirects"] is False
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        tools.socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+        ],
+    )
+    monkeypatch.setattr(requests, "Session", Session)
+
+    result = registry.get("fetch_url").handler({"url": "https://example.org/jobs/gbk"}, context)
+    payload = json.loads(result.content)
+
+    assert payload["content_encoding"] == "gbk"
+    assert "星杙光年 灵巧操作学习算法工程师" in payload["content"]
+    assert "强化学习、模仿学习与 PyTorch" in payload["content"]
+    assert "�" not in payload["content"]
+
+
+@pytest.mark.parametrize(
+    ("body", "content_type", "expected_encoding", "expected_text"),
+    [
+        (
+            '<html><head><meta charset="utf-8"></head><body>中文岗位</body></html>'.encode("gbk"),
+            "text/html; charset=gb18030",
+            "gb18030",
+            "中文岗位",
+        ),
+        (
+            b"\xef\xbb\xbf" + "<html><body>中文岗位</body></html>".encode("utf-8"),
+            "text/html",
+            "utf-8-sig",
+            "中文岗位",
+        ),
+        (
+            "<html><body>中文岗位</body></html>".encode("gbk"),
+            "text/html",
+            "gb18030",
+            "中文岗位",
+        ),
+        (
+            "<html><body>中文岗位</body></html>".encode("utf-8"),
+            "text/html",
+            "utf-8",
+            "中文岗位",
+        ),
+    ],
+)
+def test_response_decoder_uses_charset_bom_and_bounded_fallbacks(
+    body: bytes, content_type: str, expected_encoding: str, expected_text: str
+) -> None:
+    text, encoding = tools._decode_response_body(body, content_type, looks_html=True)
+
+    assert encoding == expected_encoding
+    assert expected_text in text
+    assert "�" not in text
+
+
+def test_html_projection_extracts_job_posting_from_jsonld_graph_and_iri_type() -> None:
+    html = """
+    <html><head><script type="application/ld+json">
+    {"@context":"https://schema.org","@graph":[
+      {"@type":"https://schema.org/Organization","name":"示例企业"},
+      {"@type":"https://schema.org/JobPosting","title":"机器人算法工程师",
+       "description":"负责机器人感知与规划算法研发。","qualifications":"熟悉 Python 和 ROS。"}
+    ]}
+    </script></head><body><main><h1>机器人算法工程师</h1>
+    <p>负责机器人感知与规划算法研发。</p></main></body></html>
+    """
+
+    content, postings, truncated = tools._html_projection(html)
+
+    assert len(postings) == 1
+    assert postings[0]["title"] == "机器人算法工程师"
+    assert postings[0]["description"] == "负责机器人感知与规划算法研发。"
+    assert postings[0]["qualifications"] == "熟悉 Python 和 ROS。"
+    assert "示例企业" not in content
+    assert "机器人算法工程师" in content
+    assert truncated is False
+
+
+def test_html_projection_marks_visible_text_truncated_only_after_limit() -> None:
+    description = "岗位职责：负责机器人感知与规划算法研发。" * 1_500
+    html = f"<html><body><main><p>{description}</p></main></body></html>"
+
+    content, postings, truncated = tools._html_projection(html)
+
+    assert postings == []
+    assert truncated is True
+    assert "[正文中段已省略]" in content
+
+
 def test_update_plan_stores_generic_session_plan(context: ToolContext, registry: ToolRegistry) -> None:
     result = registry.get("update_plan").handler(
         {"plan": ["inspect", {"step": "implement", "status": "pending"}]}, context

@@ -521,8 +521,9 @@ tasks:
     assert {row["provider"] for row in service.model_options()["options"]} == {"local-a", "local-b"}
 
 
-def test_delete_requires_confirmation_and_cannot_delete_active_profile(tmp_path: Path):
+def test_delete_requires_confirmation_and_active_last_profile_becomes_unconfigured(tmp_path: Path):
     service = build_service(tmp_path, demo=True)
+    session_id = service.create_session()["id"]
     service.save_model_settings(_draft(model="one", display_name="One"))
     profile_one = service.profiles_store.active_id()
     service.save_model_settings(_draft(model="two", display_name="Two"))
@@ -531,8 +532,88 @@ def test_delete_requires_confirmation_and_cannot_delete_active_profile(tmp_path:
         service.delete_model_profile({"profile_id": profile_one})
     deleted = service.delete_model_profile({"profile_id": profile_one, "confirm": True})
     assert deleted["current_profile_id"] == profile_two
-    with pytest.raises(SettingsError):
-        service.delete_model_profile({"profile_id": profile_two, "confirm": True})
+    deleted = service.delete_model_profile({"profile_id": profile_two, "confirm": True})
+    assert deleted["current_profile_id"] is None
+    assert deleted["configured"] is False
+    assert deleted["settings"]["has_api_key"] is False
+    assert service.mode == "unconfigured"
+    assert service.engine.router is None
+    assert not (tmp_path / ".agent-coach" / "model-settings.json").exists()
+    assert not (tmp_path / ".agent-coach" / "model-settings.key").exists()
+    assert service.engine.store.get(session_id).id == session_id
+
+
+def test_delete_active_profile_applies_first_remaining_profile_and_legacy_pair(tmp_path: Path):
+    service = build_service(tmp_path, demo=True)
+    service.save_model_settings(_draft(model="one", api_key="key-one", display_name="One"))
+    profile_one = service.profiles_store.active_id()
+    service.save_model_settings(_draft(model="two", api_key="key-two", display_name="Two"))
+    profile_two = service.profiles_store.active_id()
+    assert profile_one and profile_two and profile_one != profile_two
+
+    deleted = service.delete_model_profile({"profile_id": profile_two, "confirm": True})
+
+    assert deleted["current_profile_id"] == profile_one
+    assert deleted["configured"] is True
+    assert service.mode == "configured"
+    assert service.engine.router.config.current.model == "one"
+    assert service.engine.router.config.providers["gui"].api_key == "key-one"
+    restored = service.settings_store.load()
+    assert restored is not None
+    assert restored.model == "one"
+    assert restored.api_key == "key-one"
+    assert "key-one" not in json.dumps(deleted)
+    assert "key-two" not in json.dumps(deleted)
+
+
+def test_profile_edit_keeps_stable_id_when_identity_changes(tmp_path: Path):
+    service = build_service(tmp_path, demo=True)
+    service.save_model_settings(_draft(model="one", api_key="key-one", display_name="One"))
+    profile_id = service.profiles_store.active_id()
+    assert profile_id
+
+    service.save_model_settings(
+        _draft(
+            profile_id=profile_id,
+            model="changed",
+            api_key="key-changed",
+            display_name="Renamed",
+        )
+    )
+
+    assert service.profiles_store.active_id() == profile_id
+    rows = service.model_options()["saved_profiles"]
+    assert len(rows) == 1
+    assert rows[0]["profile_id"] == profile_id
+    assert rows[0]["display_name"] == "Renamed"
+    assert service.profiles_store.get(profile_id).settings.api_key == "key-changed"
+
+
+def test_active_profile_delete_rolls_back_catalog_legacy_and_router(tmp_path: Path, monkeypatch):
+    service = build_service(tmp_path, demo=True)
+    service.save_model_settings(_draft(model="one", api_key="key-one", display_name="One"))
+    service.save_model_settings(_draft(model="two", api_key="key-two", display_name="Two"))
+    active_id = service.profiles_store.active_id()
+    previous_router = service.engine.router
+    metadata_path = tmp_path / ".agent-coach" / "model-profiles.json"
+    legacy_settings_path = tmp_path / ".agent-coach" / "model-settings.json"
+    legacy_key_path = tmp_path / ".agent-coach" / "model-settings.key"
+    old_files = {
+        path: path.read_bytes()
+        for path in (metadata_path, legacy_settings_path, legacy_key_path)
+    }
+
+    def fail_legacy_save(_settings):
+        raise OSError("injected fallback failure")
+
+    monkeypatch.setattr(service.settings_store, "save", fail_legacy_save)
+    with pytest.raises(OSError, match="injected fallback failure"):
+        service.delete_model_profile({"profile_id": active_id, "confirm": True})
+
+    assert service.profiles_store.active_id() == active_id
+    assert service.engine.router is previous_router
+    assert {path: path.read_bytes() for path in old_files} == old_files
+    assert service.profiles_store.get(active_id).settings.api_key == "key-two"
 
 
 def test_profile_delete_http_route_returns_public_catalog(settings_server):
@@ -565,3 +646,63 @@ def test_profile_delete_http_route_returns_public_catalog(settings_server):
     assert status == 200
     assert payload["ok"] is True
     assert all(row["profile_id"] != old_id for row in payload["saved_profiles"])
+
+
+def test_profile_edit_http_route_keeps_id_and_blank_key(settings_server):
+    service, server = settings_server
+    status, _created = _request(
+        service,
+        server,
+        "POST",
+        "/api/settings/models",
+        _draft(model="one", api_key="key-one", display_name="Original"),
+    )
+    assert status == 200
+    profile_id = service.profiles_store.active_id()
+    status, payload = _request(
+        service,
+        server,
+        "POST",
+        "/api/settings/models",
+        _draft(profile_id=profile_id, model="renamed-model", api_key="", display_name="Renamed"),
+    )
+    assert status == 200
+    assert set(payload) == {"api_mode", "base_url", "model", "has_api_key"}
+    assert payload["model"] == "renamed-model"
+    assert service.profiles_store.active_id() == profile_id
+    assert service.profiles_store.get(profile_id).settings.api_key == "key-one"
+    assert len(service.model_options()["saved_profiles"]) == 1
+
+
+def test_profile_delete_http_route_can_remove_active_and_returns_fallback(settings_server):
+    service, server = settings_server
+    status, _first = _request(
+        service,
+        server,
+        "POST",
+        "/api/settings/models",
+        _draft(model="one", api_key="key-one", display_name="One"),
+    )
+    assert status == 200
+    first_id = service.profiles_store.active_id()
+    status, second = _request(
+        service,
+        server,
+        "POST",
+        "/api/settings/models",
+        _draft(model="two", api_key="key-two", display_name="Two"),
+    )
+    assert status == 200
+    active_id = second.get("current_profile_id") or service.profiles_store.active_id()
+    status, payload = _request(
+        service,
+        server,
+        "POST",
+        "/api/settings/models/delete",
+        {"profile_id": active_id, "confirm": True},
+    )
+    assert status == 200
+    assert payload["current_profile_id"] == first_id
+    assert payload["configured"] is True
+    assert "key-one" not in json.dumps(payload)
+    assert "key-two" not in json.dumps(payload)

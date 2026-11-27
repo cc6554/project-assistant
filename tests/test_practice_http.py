@@ -147,6 +147,67 @@ def register_approval_tool(service: Any) -> None:
     )
 
 
+def test_http_candidate_selection_persists_without_chat_and_restores_project(live_http_service, monkeypatch):
+    service, server = live_http_service
+    session = service.engine.new_session()
+    other = service.engine.new_session()
+    state = job_radar.ensure_state(session)
+    state["repos"] = [
+        {"project_key": key, "full_name": f"fixture/{key}", "code_verified": True,
+         "code_paths": ["src/main.py"], "code_evidence": ["合成源码证据"]}
+        for key in ("first", "second")
+    ] + [{"project_key": "unverified", "full_name": "fixture/unverified"}]
+    service.engine.store.save(session)
+    path = f"/api/sessions/{session.id}/practice/select"
+
+    def unexpected_model_call(*args, **kwargs):
+        pytest.fail("selecting an existing candidate must not call the model")
+
+    monkeypatch.setattr(service.engine, "run", unexpected_model_call)
+    for key in ("unknown", "unverified"):
+        status, _ = request(service, server, "POST", path, {"project_key": key})
+        assert status == 400
+    status, _ = request(service, server, "POST", f"/api/sessions/{other.id}/practice/select", {"project_key": "first"})
+    assert status == 400
+
+    with service._lock:
+        service._busy[session.id] = "fixture-busy"
+    try:
+        status, _ = request(service, server, "POST", path, {"project_key": "first"})
+        assert status == 409
+    finally:
+        with service._lock:
+            service._busy.pop(session.id)
+
+    status, payload = request(service, server, "POST", path, {"project_key": "first"})
+    assert status == 200, payload
+    assert payload["messages"] == []
+    assert payload["practice_threads"] == []
+    assert payload["skill_state"]["job-radar"]["selected_project"]["project_key"] == "first"
+
+    fresh = service.engine.store.get(session.id)
+    fresh.skill_state["job-radar"]["progress"] = [{"status": "in_progress", "note": "A 的进度", "evidence": "A 的证据"}]
+    fresh.pending = PendingApproval(tool_name="http_fixture_approval", summary="审批中", preview="synthetic")
+    service.engine.store.save(fresh)
+    status, _ = request(service, server, "POST", path, {"project_key": "second"})
+    assert status == 409
+    fresh = service.engine.store.get(session.id)
+    assert job_radar.workflow_state(fresh)["selected_project"]["project_key"] == "first"
+    fresh.pending = None
+    service.engine.store.save(fresh)
+
+    status, payload = request(service, server, "POST", path, {"project_key": "second"})
+    assert status == 200, payload
+    assert payload["skill_state"]["job-radar"]["progress"] == []
+    status, payload = request(service, server, "POST", path, {"project_key": "first"})
+    assert status == 200, payload
+    workflow = payload["skill_state"]["job-radar"]
+    assert [record["note"] for record in workflow["progress"]] == ["A 的进度"]
+    assert {record["project_key"] for record in workflow["project_history"]} == {"first", "second"}
+    assert payload["messages"] == []
+    assert payload["practice_threads"] == []
+
+
 def test_http_practice_message_persists_scope_and_main_reset(live_http_service):
     service, server = live_http_service
     session_id, thread_id = seed_practice(service, server, StaticRouter())

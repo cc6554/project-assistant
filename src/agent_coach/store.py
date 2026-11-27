@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .contracts import AgentSession
+from .contracts import AgentSession, _utc_now
 
 try:  # pragma: no cover - which branch runs depends on the host platform
     import fcntl  # type: ignore
@@ -58,10 +58,6 @@ class RevisionConflict(StoreError):
 
 class SessionBusy(StoreError, TimeoutError):
     """Another process currently owns the session lock."""
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def canonical_path(path: str | Path) -> Path:
@@ -192,6 +188,15 @@ class SessionStore:
         validate_session_id(session_id)
         return self.state_dir / f"{session_id}.lock"
 
+    @staticmethod
+    def _legacy_timestamp(path: Path) -> str | None:
+        """Return a stable UTC timestamp for a legacy session document."""
+
+        try:
+            return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        except OSError:
+            return None
+
     @contextlib.contextmanager
     def lock(self, session_id: str, *, timeout: float = 0.0) -> Iterator[None]:
         """Hold one session mutex; nested use by the same thread is reentrant."""
@@ -224,6 +229,17 @@ class SessionStore:
         expected_id = validate_session_id(session_id or path.stem)
         if session.id != expected_id:
             raise StoreError("session 文件名与 payload id 不一致")
+        # Session JSON written before durable timestamps were introduced has no
+        # timestamp fields.  Fill them only in memory from the file mtime so
+        # repeated reads keep the same ordering without rewriting the legacy
+        # document or assigning a fresh ``now`` on every validation.
+        if session.created_at is None or session.updated_at is None:
+            fallback = self._legacy_timestamp(path)
+            if fallback is not None:
+                if session.created_at is None:
+                    session.created_at = fallback
+                if session.updated_at is None:
+                    session.updated_at = fallback
         return session
 
     def get(self, session_id: str) -> AgentSession:
@@ -248,6 +264,9 @@ class SessionStore:
                 workspace=str(self.workspace),
                 active_skills=list(active_skills or []),
             )
+            timestamp = _utc_now()
+            session.created_at = timestamp
+            session.updated_at = timestamp
             path = self._path(session.id)
             try:
                 # Creation is exclusive and does not overwrite a pre-existing id.
@@ -299,6 +318,16 @@ class SessionStore:
             # safe but still advances the revision to make writes observable.
             next_revision = current.revision + 1
         session.revision = next_revision
+        if not session.created_at and current is not None:
+            session.created_at = current.created_at
+        # ``updated_at`` is maintained at the storage boundary so every kind
+        # of session mutation (model turns, JD edits, title changes, pinning)
+        # participates in the same durable recency ordering.  Old JSON files
+        # may have no timestamp; retain their optional ``created_at`` until
+        # the first write upgrades them.
+        session.updated_at = _utc_now()
+        if not session.created_at:
+            session.created_at = session.updated_at
         payload = session.model_dump(mode="json")
         temp = path.with_name(f".{sid}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
@@ -323,16 +352,17 @@ class SessionStore:
     def list(self) -> list[AgentSession]:
         """Load all valid sessions in this workspace, newest first."""
 
-        rows: list[tuple[float, AgentSession]] = []
+        rows: list[tuple[int, float, AgentSession]] = []
         for path in self.state_dir.glob("*.json"):
             try:
-                rows.append((path.stat().st_mtime, self._read_path(path)))
+                session = self._read_path(path)
+                rows.append((1 if session.pinned else 0, path.stat().st_mtime, session))
             except (StoreError, OSError):
                 # A malformed/stale file should not make the sessions command
                 # unusable; callers can inspect the file themselves if needed.
                 continue
-        rows.sort(key=lambda item: item[0], reverse=True)
-        return [session for _, session in rows]
+        rows.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [session for _, _, session in rows]
 
     list_sessions = list
 

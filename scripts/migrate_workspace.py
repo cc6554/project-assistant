@@ -1,4 +1,4 @@
-"""Safely copy one Agent Coach workspace to a fresh directory.
+"""Safely copy one 简历项目助手 workspace to a fresh directory.
 
 The migration boundary is deliberately small.  Workspace files are copied as
 bytes, except for persisted session documents where the workspace binding and
@@ -616,7 +616,7 @@ def migrate_workspace(source: str | Path, target: str | Path) -> dict[str, Any]:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="将 Agent Coach 工作区迁移到全新目录")
+    parser = argparse.ArgumentParser(description="将简历项目助手工作区迁移到全新目录")
     parser.add_argument("source", help="旧工作区绝对路径")
     parser.add_argument("target", help="新工作区绝对路径（必须不存在）")
     return parser

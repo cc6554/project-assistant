@@ -1,5 +1,7 @@
 @echo off
 setlocal
+chcp 65001 >nul
+title 简历项目助手
 set PYTHONUTF8=1
 if defined AGENT_COACH_PYTHON (
   "%AGENT_COACH_PYTHON%" "%~dp0run.py" --workspace "%~dp0work" %*

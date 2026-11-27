@@ -204,6 +204,7 @@ async function boot({ saveMode = "success", includeSecondSession = false } = {})
   if (includeSecondSession) sessions.B = makeSession("B", 1);
   const calls = [];
   const pending = { value: null };
+  const importPending = { value: null };
   const summaries = () => Object.values(sessions).map((session) => ({
     id: session.id,
     title: session.title,
@@ -227,6 +228,14 @@ async function boot({ saveMode = "success", includeSecondSession = false } = {})
     if (requestPath === "/settings/ui") return response({ theme: "dark" });
     if (requestPath === "/settings/models" || requestPath === "/settings/models/options") return response({ profiles: [], saved_profiles: [] });
     const saveMatch = requestPath.match(/^\/sessions\/([^/]+)\/jd$/);
+    const importMatch = requestPath.match(/^\/sessions\/([^/]+)\/jd\/import$/);
+    if (importMatch && options.method === "POST") {
+      const id = importMatch[1];
+      const body = JSON.parse(options.body || "{}");
+      assert.ok(Array.isArray(body.source_urls), "JD import should send source_urls in the DOM harness");
+      if (saveMode === "delayed" && !importPending.value) return new Promise((resolve) => { importPending.value = { id, resolve }; });
+      return response({ status: "completed", result: { status: "completed", message: "Synthetic JD import" } });
+    }
     if (saveMatch && options.method === "POST") {
       const id = saveMatch[1];
       const body = JSON.parse(options.body || "{}");
@@ -295,7 +304,7 @@ async function boot({ saveMode = "success", includeSecondSession = false } = {})
   const jdStep = steps.find((button) => button.dataset.step === "jd");
   jdStep.click();
   await flush();
-  return { document, sessions, calls, pending, flush, all, find, steps };
+  return { document, sessions, calls, pending, importPending, flush, all, find, steps };
 }
 
 function childrenMatching(rootNode, predicate) {
@@ -403,6 +412,19 @@ async function run() {
   assert.strictEqual(isolated.document.getElementById("jobEditBackdrop").classList.contains("hidden"), false, "late A save must not close B's editor");
   assert.strictEqual(isolated.find((node) => node.dataset && node.dataset.jobEditField === "job_title").value, "B 岗位", "late A save must not overwrite B's editor");
   assert.strictEqual(isolated.sessions.B.skill_state["job-radar"].jd.job_title, "B 岗位", "late A save must not mutate B's stored JD");
+
+  const isolatedImport = await boot({ saveMode: "delayed", includeSecondSession: true });
+  isolatedImport.document.getElementById("jdSourceText").value = "A 的延迟 JD";
+  isolatedImport.document.getElementById("jdImportSubmit").click();
+  await isolatedImport.flush();
+  assert.ok(isolatedImport.importPending.value, "delayed JD import should remain pending");
+  isolatedImport.find((node) => node.dataset && node.dataset.sessionId === "B").click();
+  await isolatedImport.flush();
+  assert.strictEqual(isolatedImport.document.getElementById("jdSourceText").value, "", "switching sessions should restore an independent JD draft");
+  isolatedImport.importPending.value.resolve(response({ status: "completed", result: { status: "completed", message: "Late A import" } }));
+  await isolatedImport.flush();
+  assert.strictEqual(isolatedImport.document.getElementById("jdSourceText").value, "", "late JD import must not overwrite the target session draft");
+  assert.strictEqual(isolatedImport.document.getElementById("jdImportStatus").textContent.includes("Late A import"), false, "late JD import must not leak status into the target session");
   console.log("JD editor DOM scenarios passed");
 }
 

@@ -23,15 +23,16 @@ JD_SYSTEM_PROMPT = """你是招聘信息结构化引擎。用户会给你一张�
 5. hard_requirements 与 nice_to_haves 按 JD 原文的「任职要求/加分项」区分；
 6. 严格通过 emit_result 工具提交结果，不要输出多余解释。"""
 
-JD_TEXT_PROMPT = """你是招聘信息结构化引擎。下面是网络搜索到的、可能属于同一岗位的若干条招聘信息文本（标题：摘要，可能来自不同网站、同岗位不同渠道）。
+JD_TEXT_PROMPT = """你是招聘信息结构化引擎。下面是围绕一个目标岗位名称检索到的若干条独立招聘样本（标题：摘要，可能来自不同公司、平台或渠道）。不同公司不代表岗位不可比较；只有证据明确显示为不同职类、专业方向或层级时才排除样本。
 
 工作规则：
-1. 从这些文本中提取该岗位的结构化信息；跨渠道重复的内容合并去重；
+1. 逐条阅读全部样本并去重；hard_requirements、skill_tags、responsibilities 和 nice_to_haves 只写至少两个独立样本明确支持的共同要求；
 2. 只提取文本中明确出现的信息，严禁根据岗位名臆造要求；文本中没有的字段留空或留 null；
-3. 文本不完整或互相矛盾时，把涉及的字段名放入 uncertain_fields；
-4. 若这些文本不足以判断具体岗位（比如是聚合页、无关内容），job_title 留空并在 uncertain_fields 标注；
-5. skill_tags 使用规范、简短的技术名词（例如 PyTorch、LangChain、RAG、Go、Kubernetes、React），不要句子；
-6. 严格通过 emit_result 工具提交结果，不要输出多余解释。"""
+3. 只出现在一个样本中的要求写入 raw_summary 的单样本差异，不放入共同字段；文本不完整或互相矛盾时，把涉及的字段名放入 uncertain_fields；
+4. 样本少于 3 条时，sample_target 设为 3，sample_count 设为实际可读条数，comparison_status 设为 insufficient_samples，明确说明暂不足形成共性；达到 3 条时设为 compared，并在 raw_summary 标明每项共同要求的支持样本数/总数和样本编号；单条材料使用 single_source；
+5. 若这些文本不足以判断具体岗位（比如是聚合页、无关内容），job_title 留空并在 uncertain_fields 标注；
+6. skill_tags 使用规范、简短的技术名词（例如 PyTorch、LangChain、RAG、Go、Kubernetes、React），不要句子；
+7. 严格通过 emit_result 工具提交结果，不要输出多余解释。"""
 
 
 def parse_jd_text(
@@ -60,8 +61,8 @@ def parse_jd_text(
             Message(
                 role="user",
                 content=(
-                    "以下是搜索到的岗位招聘信息文本（可能来自不同渠道的同一岗位）：\n\n"
-                    f"{user_content}\n\n请合并去重后，通过工具输出完整的岗位结构化信息。"
+                    "以下是同一个目标岗位的独立招聘样本（不同公司可以是可比较样本）：\n\n"
+                    f"{user_content}\n\n请按样本交叉核对后，通过工具输出完整的岗位结构化信息。"
                 ),
             ),
         ],

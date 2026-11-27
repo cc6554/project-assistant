@@ -28,6 +28,16 @@ import uuid
 
 import requests
 
+from .github_profiles import (
+    clear_github_token as _clear_github_profile_token,
+    delete_github_profile as _delete_github_profile,
+    github_profile_catalog as _github_profile_catalog,
+    load_github_token as _load_github_profile_token,
+    save_github_profile as _save_github_profile,
+    save_legacy_github_token as _save_legacy_github_token,
+    select_github_profile as _select_github_profile,
+    update_github_profile as _update_github_profile,
+)
 from .legacy.tools.credentials import environment_github_token, github_token_scope
 from .settings import (
     MAX_API_KEY_BYTES,
@@ -248,37 +258,19 @@ def _validate_token(token: Any) -> str:
 def save_github_token(workspace: str | Path, token: str) -> dict[str, Any]:
     """Encrypt and save a GitHub token in this workspace only."""
 
-    clean = _validate_token(token)
-    token_path = _token_path(workspace)
-    disabled_path = _token_disabled_path(workspace)
     try:
-        _reject_record_link(token_path)
-        _reject_record_link(disabled_path)
-        encrypted = protect_key(clean)
-        _atomic_write(token_path, encrypted)
-        disabled_path.unlink(missing_ok=True)
+        return _save_legacy_github_token(workspace, token)
     except (SettingsError, OSError) as exc:
-        raise IntegrationError("GitHub Token 保存失败") from exc
-    return {"saved": True, "has_token": True}
+        raise IntegrationError(str(exc) or "GitHub Token 保存失败") from exc
 
 
 def clear_github_token(workspace: str | Path) -> dict[str, Any]:
     """Remove the workspace's encrypted GitHub token, if present."""
 
-    path = _token_path(workspace)
-    disabled_path = _token_disabled_path(workspace)
     try:
-        _reject_record_link(path)
-        _reject_record_link(disabled_path)
-        # This marker is intentionally non-secret.  It distinguishes an
-        # explicit UI clear from a workspace that has never stored a token, so
-        # the legacy CLI environment fallback cannot unexpectedly re-enable
-        # GitHub access after a clear.
-        _atomic_write(disabled_path, b"cleared\n")
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        raise IntegrationError("GitHub Token 清除失败") from exc
-    return {"cleared": True, "has_token": False}
+        return _clear_github_profile_token(workspace)
+    except (SettingsError, OSError) as exc:
+        raise IntegrationError(str(exc) or "GitHub Token 清除失败") from exc
 
 
 def load_github_token(workspace: str | Path) -> str | None:
@@ -288,28 +280,59 @@ def load_github_token(workspace: str | Path) -> str | None:
     never included in an exception or public status payload.
     """
 
-    path = _token_path(workspace)
-    disabled_path = _token_disabled_path(workspace)
     try:
-        _reject_record_link(path)
-        _reject_record_link(disabled_path)
-        if not path.is_file() or path.is_symlink():
-            if disabled_path.is_file():
-                return None
-            return environment_github_token()
-        if path.stat().st_size > MAX_PROTECTED_RECORD_BYTES:
-            raise SettingsError("GitHub Token 记录超出大小限制")
-        value = unprotect_key(path.read_bytes())
-        return _validate_token(value)
+        return _load_github_profile_token(workspace)
     except (OSError, SettingsError, IntegrationError, ValueError):
-        # A damaged saved record is unavailable; preserve CLI compatibility by
-        # falling back only when the workspace was not explicitly cleared.
+        # Preserve CLI compatibility for an inaccessible workspace, while the
+        # profile module itself suppresses this fallback after explicit clear.
         try:
-            if disabled_path.is_file():
+            disabled = _token_disabled_path(workspace)
+            _reject_record_link(disabled)
+            if disabled.is_file():
                 return None
-        except OSError:
-            return None
+        except (OSError, IntegrationError):
+            pass
         return environment_github_token()
+
+
+def github_profile_catalog(workspace: str | Path) -> dict[str, Any]:
+    try:
+        return _github_profile_catalog(workspace)
+    except (SettingsError, OSError) as exc:
+        raise IntegrationError(str(exc) or "GitHub profile 读取失败") from exc
+
+
+def save_github_profile(workspace: str | Path, display_name: Any, token: Any) -> dict[str, Any]:
+    try:
+        return _save_github_profile(workspace, display_name, token)
+    except (SettingsError, OSError) as exc:
+        raise IntegrationError(str(exc) or "GitHub profile 保存失败") from exc
+
+
+def update_github_profile(
+    workspace: str | Path,
+    profile_id: Any,
+    display_name: Any = None,
+    token: Any = None,
+) -> dict[str, Any]:
+    try:
+        return _update_github_profile(workspace, profile_id, display_name, token)
+    except (SettingsError, OSError) as exc:
+        raise IntegrationError(str(exc) or "GitHub profile 更新失败") from exc
+
+
+def delete_github_profile(workspace: str | Path, profile_id: Any) -> dict[str, Any]:
+    try:
+        return _delete_github_profile(workspace, profile_id)
+    except (SettingsError, OSError) as exc:
+        raise IntegrationError(str(exc) or "GitHub profile 删除失败") from exc
+
+
+def select_github_profile(workspace: str | Path, profile_id: Any) -> dict[str, Any]:
+    try:
+        return _select_github_profile(workspace, profile_id)
+    except (SettingsError, OSError) as exc:
+        raise IntegrationError(str(exc) or "GitHub profile 切换失败") from exc
 
 
 def get_github_token(workspace: str | Path) -> str | None:
@@ -930,67 +953,155 @@ def list_github_repositories(
     }
 
 
-def search_jobs(query: str, *, platform: str = "boss", limit: int = 6) -> dict[str, Any]:
-    """Search a supported public recruitment index without model synthesis."""
+def search_jobs(query: str, *, platform: str = "web", limit: int = 18) -> dict[str, Any]:
+    """Search public job pages without model synthesis.
+
+    ``web`` is the default and deliberately does not constrain the query to a
+    single vendor.  The legacy platform names remain accepted for callers that
+    explicitly need their old site-scoped behavior.
+    """
 
     if not isinstance(query, str) or not query.strip():
         raise IntegrationError("query 不能为空")
+    if any(line.strip() for line in query.splitlines()[1:]):
+        raise IntegrationError("岗位搜索一次只接受一个目标岗位名称；请勿输入多个岗位方向")
     if len(query.encode("utf-8")) > 4096:
         raise IntegrationError("query 超出长度限制")
-    if not isinstance(platform, str) or platform not in {"boss", "liepin", "zhilian"}:
+    if not isinstance(platform, str) or platform not in {"web", "all", "boss", "liepin", "zhilian"}:
         raise IntegrationError("platform 不受支持")
-    limit = _safe_limit(limit, default=6, maximum=10, name="limit")
+    if platform == "all":
+        platform = "web"
+    # ``search_jobs`` returns bounded leads, not fetched source evidence.  A
+    # pool of 15–20 gives the owner Agent enough independent URLs to read
+    # three to five actual JDs while keeping snippets out of an oversized
+    # model context.
+    limit = _safe_limit(limit, default=18, maximum=20, name="limit")
     from .legacy.tools import job_sources
 
+    diagnostics: dict[str, Any] = {
+        "query": query.strip(),
+        "platform": platform,
+        "requested": limit,
+        "candidate_count": 0,
+        "search_lead_count": 0,
+        "source_evidence_count": 0,
+        "actual_jd_count": 0,
+        "source_evidence_target": {"minimum": 3, "maximum": 5},
+        "status": "pending",
+        "errors": [],
+        "next_step": "对候选链接逐条调用 fetch_url；搜索摘要不是 JD 证据。",
+    }
     try:
         rows = job_sources.search(query.strip(), platform=platform, n=limit)
     except ValueError as exc:
+        search_diagnostics = getattr(exc, "diagnostics", None)
+        if isinstance(search_diagnostics, Mapping):
+            diagnostics.update(dict(search_diagnostics))
+        diagnostics["status"] = "failed"
+        diagnostics.setdefault("errors", []).append(
+            {"error_type": type(exc).__name__, "message": str(exc)[:240]}
+        )
         return {
             "ok": False,
             "platform": platform,
             "results": [],
             "partial": False,
             "message": str(exc),
+            "diagnostics": diagnostics,
         }
-    except Exception:
+    except MemoryError:
+        raise
+    except Exception as exc:
+        diagnostics["status"] = "failed"
+        diagnostics["errors"].append(
+            {"error_type": type(exc).__name__, "message": str(exc)[:240]}
+        )
         return {
             "ok": False,
             "platform": platform,
             "results": [],
             "partial": False,
-            "message": "公开招聘平台暂时无法访问，请粘贴可核实的岗位链接或正文。",
+            "message": (
+                "公开网页搜索暂时无法访问，请粘贴企业招聘官网或招聘网站的岗位链接/正文。"
+                if platform == "web"
+                else "公开招聘平台暂时无法访问，请粘贴可核实的岗位链接或正文。"
+            ),
+            "diagnostics": diagnostics,
         }
 
-    safe_rows: list[dict[str, str]] = []
+    search_diagnostics = getattr(rows, "diagnostics", None)
+    if isinstance(search_diagnostics, Mapping):
+        diagnostics.update(dict(search_diagnostics))
+
+    safe_rows: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
     for item in rows if isinstance(rows, list) else []:
         if not isinstance(item, Mapping):
             continue
         url = str(item.get("url") or "")
-        if job_sources.platform_for(url) != platform:
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        title = str(item.get("title") or "")[: job_sources.MAX_SEARCH_TITLE_CHARS]
+        text = str(item.get("text") or "")[: job_sources.MAX_SEARCH_SNIPPET_CHARS]
+        if platform == "web":
+            # Reclassify from the URL and untrusted result text instead of
+            # trusting a search adapter's declared kind.  This keeps a career
+            # list/aggregator visibly separate from an individual JD.
+            kind = job_sources.result_kind(url, "web", title=title, text=text)
+        else:
+            if job_sources.platform_for(url) != platform:
+                continue
+            kind = job_sources.result_kind(url, platform)
+        # ``search`` is expected to return only approved recruitment paths;
+        # keep this second boundary here because integrations is the public
+        # tool contract and may receive rows from a future adapter.
+        if kind is None:
             continue
         safe_rows.append(
             {
-                "platform": str(item.get("platform") or platform),
+                "platform": str(item.get("platform") or ("全网公开网页" if platform == "web" else platform)),
                 "url": url,
-                "title": str(item.get("title") or "")[:500],
-                "text": str(item.get("text") or "")[:4000],
+                "title": title,
+                "text": text,
                 "method": str(item.get("method") or "公开搜索索引"),
+                # Never trust an adapter-provided label: a list page must not
+                # be allowed to masquerade as an independent job detail.
+                "result_kind": kind,
+                # These fields make the evidence boundary machine-readable:
+                # this tool has found a lead, not read a source JD.
+                "source_kind": "search_lead",
+                "evidence_status": "unverified",
+                "readable": False,
+                "lead_only": True,
             }
         )
+    diagnostics["candidate_count"] = len(safe_rows)
+    diagnostics["search_lead_count"] = len(safe_rows)
+    diagnostics["source_evidence_count"] = 0
+    diagnostics["actual_jd_count"] = 0
+    diagnostics["returned_count"] = min(len(safe_rows), limit)
+    diagnostics["status"] = "ok" if len(safe_rows) >= limit else ("partial" if safe_rows else "failed")
     if not safe_rows:
         return {
             "ok": False,
             "platform": platform,
             "results": [],
             "partial": False,
-            "message": "公开索引没有返回可核实的平台岗位链接；平台可能需要登录。请粘贴岗位正文或来源链接。",
+            "message": (
+                "公开网页搜索没有返回可核实的岗位详情或招聘索引页；请粘贴企业招聘官网或招聘网站的岗位链接/正文。"
+                if platform == "web"
+                else "公开索引没有返回可核实的平台岗位详情或招聘索引页；这不代表平台站内没有岗位。请打开平台站内搜索后粘贴可核实链接或正文。"
+            ),
+            "diagnostics": diagnostics,
         }
     return {
         "ok": True,
         "platform": platform,
         "results": safe_rows[:limit],
         "partial": len(safe_rows) < limit,
-        "message": "公开搜索索引结果，仅包含可核实链接和摘要。",
+        "message": "公开网页搜索结果是 search_lead 候选，仅包含可核实链接和摘要；需逐条调用 fetch_url，search_index 聚合页不是单条 JD。",
+        "diagnostics": diagnostics,
     }
 
 
@@ -1510,6 +1621,8 @@ __all__ = [
     "MAX_IMPORT_FILES",
     "MAX_IMPORT_TOTAL_BYTES",
     "clear_github_token",
+    "delete_github_profile",
+    "github_profile_catalog",
     "get_github_token",
     "github_token_context",
     "github_token_status",
@@ -1522,5 +1635,8 @@ __all__ = [
     "parse_github_user_url",
     "read_github",
     "save_github_token",
+    "save_github_profile",
+    "select_github_profile",
+    "update_github_profile",
     "search_jobs",
 ]

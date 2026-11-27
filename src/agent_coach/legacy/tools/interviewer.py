@@ -15,7 +15,7 @@ from ..core.schema import Message
 from ..domain.schemas import UserSkillProfile
 from .profile_builder import build_profile_from_text, question_similar
 
-NEXT_QUESTION_PROMPT = """你是技术求职教练，正在通过访谈补全用户的技能档案。
+NEXT_QUESTION_PROMPT = """你是简历项目助手，正在通过访谈补全用户的技能档案。
 
 当前技能档案：
 {profile}
@@ -129,7 +129,7 @@ def apply_interview_answer(
 
 # ── 待澄清自由对话（类 Codex 的灵活一问一答）──────────────────────
 
-CLARIFY_TURN_PROMPT = """你是技术求职教练，正在通过一对一的自然对话完善用户的技能档案（类似 Codex 的交互：用户可以随时追问、解释、跑题，你再自然拉回来）。
+CLARIFY_TURN_PROMPT = """你是简历项目助手，正在通过一对一的自然对话完善用户的技能档案（类似 Codex 的交互：用户可以随时追问、解释、跑题，你再自然拉回来）。
 
 你手头有一份「待澄清问题清单」作为提纲（按顺序排列）。你的任务是把这份清单**融进自然的对话**里逐条推进：
 - 你的回复（reply）是主力：口语化、有温度，先简短回应用户刚说的内容，再顺势自然地问出清单里的问题，不要生硬念题单；
@@ -210,7 +210,7 @@ def clarify_turn(
     return ClarifyTurn.model_validate(result)
 
 
-CLARIFY_OPENING_PROMPT = """你是技术求职教练，正在通过自然对话完善用户的技能档案。下面是待澄清问题清单（提纲，按顺序）：
+CLARIFY_OPENING_PROMPT = """你是简历项目助手，正在通过自然对话完善用户的技能档案。下面是待澄清问题清单（提纲，按顺序）：
 {outline}
 请输出一句自然的开场白（口语化、有温度，1~2 句），把第一条问题融进对话里自然地提出来，不要像念题单，不要编号。
 严格通过 emit_result 工具输出。"""

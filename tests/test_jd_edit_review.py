@@ -35,6 +35,12 @@ def test_jd_http_round_trip_preserves_every_display_and_editor_field(live_server
         "raw_summary": "负责多模态模型训练、评测及推理服务建设。",
         "uncertain_fields": ["salary"],
     }
+    expected_jd = {
+        **jd,
+        "sample_target": 1,
+        "sample_count": 1,
+        "comparison_status": "single_source",
+    }
 
     status, saved = request(
         service,
@@ -44,12 +50,12 @@ def test_jd_http_round_trip_preserves_every_display_and_editor_field(live_server
         {"jd": jd, "confirmed": True},
     )
     assert status == 200
-    assert saved["jd"] == jd
+    assert saved["jd"] == expected_jd
     assert saved["confirmed"] is True
 
     status, loaded = request(service, server, "GET", f"/api/sessions/{session_id}/jd")
     assert status == 200
-    assert loaded["jd"] == jd
+    assert loaded["jd"] == expected_jd
 
 
 def test_jd_static_editor_uses_independent_rows_and_renderer_options():
@@ -93,6 +99,7 @@ def test_jd_static_editor_uses_independent_rows_and_renderer_options():
     assert re.search(rf"function\s+{re.escape(jd_call.group(1))}\s*\(", app), (
         f"JD card helper {jd_call.group(1)} is called but not defined"
     )
+
     # Blue skill pills need a pill radius and the shared blue theme token.  The
     # exact shade remains theme-controlled through --accent-2.
     css_rules = re.findall(r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]*)\}", styles)

@@ -6,7 +6,7 @@ from ..core.llm.router import ModelRouter
 from ..core.schema import Message
 from ..domain.schemas import JDCard, LearningPlan, UserSkillProfile
 
-PLAN_SYSTEM_PROMPT = """你是资深技术求职教练，要根据岗位要求和用户现有技能档案，产出可执行的学习计划。
+PLAN_SYSTEM_PROMPT = """你是简历项目助手，要根据岗位要求和用户现有技能档案，产出可执行的学习计划。
 
 差距判定规则（status）：
 - met：用户档案中有对应技能，且 proficiency≥proficient 或有多来源/项目证据；

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .bootstrap import build_engine, doctor_config, init_config
+from .branding import PRODUCT_NAME
 from .engine import AgentEngine, ApprovalMismatch, EngineError, RunResult
 from .store import SessionNotFound, SessionStore, StoreError, validate_session_id
 
@@ -47,7 +48,7 @@ def _runtime_options(parser: argparse.ArgumentParser, *, suppress_defaults: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agent-coach", description="校招雷达 · 持久化求职辅导 CLI")
+    parser = argparse.ArgumentParser(prog="agent-coach", description=f"{PRODUCT_NAME} · 持久化求职辅导 CLI")
     _runtime_options(parser)
     sub = parser.add_subparsers(dest="command")
 
@@ -189,7 +190,7 @@ def _command_run(args: argparse.Namespace) -> int:
 
 
 def _repl(engine: AgentEngine, session_id: str) -> int:
-    print("校招雷达 已启动。输入 /help 查看命令；/quit 退出。")
+    print(f"{PRODUCT_NAME} 已启动。输入 /help 查看命令；/quit 退出。")
     while True:
         try:
             raw = input(f"[{session_id[:8]}] > ")

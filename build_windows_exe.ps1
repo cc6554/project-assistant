@@ -1,9 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Python = 'F:\Doubao\job-radar-coach\.venv\Scripts\python.exe',
-    [string]$PackageName = 'AgentCoachDesktop',
+    [string]$PackageName = 'JobCoachDesktop',
+    [string]$ExecutableName = '求职教练.exe',
     [switch]$InstallDesktopDeps,
-    [switch]$SkipZip
+    [switch]$SkipZip,
+    [string]$SpeechModelDir,
+    [string]$SpeechDepsPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,8 +22,75 @@ $OutputDir = Join-Path $DistPath $PackageName
 $ZipPath = Join-Path $DistPath "$PackageName-windows.zip"
 $DesktopDepsPath = Join-Path $BuildRoot 'desktop-deps'
 
+$SpeechOptionSpecified = $PSBoundParameters.ContainsKey('SpeechModelDir') -or $PSBoundParameters.ContainsKey('SpeechDepsPath')
+$SpeechDefaultModelDir = Join-Path $ProjectDir 'build\offline-speech\model-base'
+$SpeechDefaultDepsPath = Join-Path $ProjectDir 'build\offline-speech\pip-target'
+$SpeechModelPath = if ($SpeechOptionSpecified) { $SpeechModelDir } else { $SpeechDefaultModelDir }
+$SpeechDepsPathResolved = if ($SpeechOptionSpecified) { $SpeechDepsPath } else { $SpeechDefaultDepsPath }
+
+function Get-SpeechBundleProblem {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModelPath,
+        [Parameter(Mandatory = $true)][string]$DepsPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ModelPath -PathType Container)) {
+        return "model directory not found: $ModelPath"
+    }
+    if (-not (Test-Path -LiteralPath $DepsPath -PathType Container)) {
+        return "runtime directory not found: $DepsPath"
+    }
+
+    foreach ($modelFile in @('config.json', 'tokenizer.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $ModelPath $modelFile) -PathType Leaf)) {
+            return "model file missing: $modelFile"
+        }
+    }
+    if (-not ((Test-Path -LiteralPath (Join-Path $ModelPath 'model.bin') -PathType Leaf) -or
+              (Test-Path -LiteralPath (Join-Path $ModelPath 'model.safetensors') -PathType Leaf))) {
+        return 'model weights missing: model.bin or model.safetensors'
+    }
+
+    foreach ($packageDir in @('faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'onnxruntime', 'numpy', 'huggingface_hub')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $DepsPath $packageDir) -PathType Container)) {
+            return "runtime package missing: $packageDir"
+        }
+    }
+    return $null
+}
+
+if ($SpeechOptionSpecified -and ([string]::IsNullOrWhiteSpace($SpeechModelPath) -or [string]::IsNullOrWhiteSpace($SpeechDepsPathResolved))) {
+    throw 'SpeechModelDir and SpeechDepsPath must be supplied together when enabling offline speech.'
+}
+
+$SpeechEnabled = $false
+if ($SpeechOptionSpecified) {
+    $SpeechBundleProblem = Get-SpeechBundleProblem -ModelPath $SpeechModelPath -DepsPath $SpeechDepsPathResolved
+    if ($null -ne $SpeechBundleProblem) {
+        throw "Offline speech bundle validation failed: $SpeechBundleProblem"
+    }
+    $SpeechModelPath = (Resolve-Path -LiteralPath $SpeechModelPath).Path
+    $SpeechDepsPathResolved = (Resolve-Path -LiteralPath $SpeechDepsPathResolved).Path
+    $SpeechEnabled = $true
+} elseif ((Test-Path -LiteralPath $SpeechModelPath -PathType Container) -and
+          (Test-Path -LiteralPath $SpeechDepsPathResolved -PathType Container)) {
+    $SpeechBundleProblem = Get-SpeechBundleProblem -ModelPath $SpeechModelPath -DepsPath $SpeechDepsPathResolved
+    if ($null -eq $SpeechBundleProblem) {
+        $SpeechModelPath = (Resolve-Path -LiteralPath $SpeechModelPath).Path
+        $SpeechDepsPathResolved = (Resolve-Path -LiteralPath $SpeechDepsPathResolved).Path
+        $SpeechEnabled = $true
+    } else {
+        Write-Warning "Offline speech bundle is incomplete; continuing with the legacy non-speech build: $SpeechBundleProblem"
+    }
+} else {
+    Write-Host 'Offline speech bundle not found; continuing with the legacy non-speech build.'
+}
+
 if ($PackageName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
     throw "PackageName must be a simple filename stem: $PackageName"
+}
+if ($ExecutableName -notmatch '^[^\\/:*?"<>|]+\.exe$') {
+    throw "ExecutableName must be a safe .exe filename: $ExecutableName"
 }
 
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
@@ -34,7 +104,11 @@ $env:TEMP = $TempPath
 $env:TMP = $TempPath
 $env:PIP_CACHE_DIR = Join-Path $BuildRoot 'pip-cache'
 $env:PYINSTALLER_CONFIG_DIR = $PyInstallerConfig
-$env:PYTHONPATH = "$DesktopDepsPath;$($ProjectDir)\src"
+$PythonPathEntries = @($DesktopDepsPath, (Join-Path $ProjectDir 'src'))
+if ($SpeechEnabled) {
+    $PythonPathEntries = @($SpeechDepsPathResolved) + $PythonPathEntries
+}
+$env:PYTHONPATH = ($PythonPathEntries -join ';')
 
 if ($InstallDesktopDeps) {
     # Keep all new wheels in the project build directory.  The selected
@@ -108,16 +182,44 @@ $Args = @(
     '--collect-all', 'webview',
     '--collect-all', 'pythonnet',
     '--collect-all', 'clr_loader',
-    (Join-Path $ProjectDir 'packaged_launcher.py')
+    '--exclude-module', 'torch'
 )
+
+if ($SpeechEnabled) {
+    $Args += @(
+        '--paths', $SpeechDepsPathResolved,
+        '--add-data', ($SpeechModelPath + ';models/faster-whisper-base'),
+        '--hidden-import', 'numpy',
+        '--collect-all', 'faster_whisper',
+        '--collect-all', 'ctranslate2',
+        '--collect-all', 'av',
+        '--collect-all', 'tokenizers',
+        '--collect-all', 'onnxruntime',
+        '--collect-all', 'huggingface_hub'
+    )
+    # The packaged Windows path has a native NLS fallback, but collect
+    # OpenCC when the speech target contains it so the same source remains
+    # fully script-normalizing on other platforms and in source probes.
+    if (Test-Path -LiteralPath (Join-Path $SpeechDepsPathResolved 'opencc') -PathType Container) {
+        $Args += @('--collect-all', 'opencc')
+    }
+}
+$Args += (Join-Path $ProjectDir 'packaged_launcher.py')
 
 Write-Host "Building $PackageName in $OutputDir ..."
 & $Python @Args
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
-$ExePath = Join-Path $OutputDir "$PackageName.exe"
-if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
-    throw "Build completed without expected executable: $ExePath"
+$BuiltExePath = Join-Path $OutputDir "$PackageName.exe"
+if (-not (Test-Path -LiteralPath $BuiltExePath -PathType Leaf)) {
+    throw "Build completed without expected executable: $BuiltExePath"
+}
+$ExePath = Join-Path $OutputDir $ExecutableName
+if ($BuiltExePath -ne $ExePath) {
+    if (Test-Path -LiteralPath $ExePath) {
+        throw "Refusing to replace existing executable: $ExePath"
+    }
+    Move-Item -LiteralPath $BuiltExePath -Destination $ExePath
 }
 
 # Ship a small, key-free configuration template beside the executable.  The
@@ -139,4 +241,4 @@ if (-not $SkipZip) {
     $zipInfo = Get-Item -LiteralPath $ZipPath
     Write-Host "ZIP: $($zipInfo.FullName) ($($zipInfo.Length) bytes)"
 }
-Write-Host 'Smoke command: .\AgentCoachDesktop.exe --headless --port 0'
+Write-Host "Smoke command: .\$ExecutableName --headless --port 0"

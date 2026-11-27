@@ -363,6 +363,18 @@ async function run() {
   const workflow = await boot({ terminal: "error", withApproval: true });
   workflow.document.getElementById("clarificationClose").click();
   await workflow.flush();
+  const chatScroll = workflow.document.getElementById("chatScroll");
+  const history = workflow.document.getElementById("messageList");
+  chatScroll.clientHeight = 250;
+  Object.defineProperty(chatScroll, "scrollHeight", { get: () => history.children.length * 100 });
+  const addMessage = () => workflow.sessions.A.messages.push({ role: "assistant", content: `聊天消息 ${workflow.sessions.A.messages.length + 1}` });
+  const refreshChat = async () => {
+    workflow.document.getElementById("refreshButton").click();
+    await workflow.flush();
+  };
+  for (let i = 0; i < 10; i += 1) addMessage();
+  await refreshChat();
+  chatScroll.scrollTop = 0;
   workflow.composer.value = "页面里的主输入草稿";
   workflow.document.getElementById("backToChat").click();
   await workflow.flush();
@@ -370,6 +382,17 @@ async function run() {
   assert.strictEqual(workflow.chatColumn.parentNode, workflow.chatHost, "the existing chat column is mounted in the workflow dialog");
   assert.strictEqual(workflow.document.getElementById("composerInput").value, "页面里的主输入草稿", "workflow dialog preserves the shared composer draft");
   assert.ok(workflow.all().some((node) => node.dataset && node.dataset.action === "approve"), "workflow dialog keeps the approval action visible");
+  assert.strictEqual(history.children.length, 10, "the main dialog renders the full history");
+  assert.strictEqual(chatScroll.scrollTop, 750, "opening the main dialog shows the newest messages");
+  addMessage();
+  await refreshChat();
+  assert.strictEqual(chatScroll.scrollTop, 850, "updates follow the newest messages when already at the bottom");
+  chatScroll.scrollTop = 200;
+  addMessage();
+  await refreshChat();
+  assert.strictEqual(chatScroll.scrollTop, 200, "updates preserve the user's position in the older messages");
+  workflow.document.getElementById("backToChat").click();
+  assert.strictEqual(chatScroll.scrollTop, 200, "an open main dialog keeps the user's reading position");
   workflow.document.getElementById("workflowChatClose").click();
   await workflow.flush();
   assert.strictEqual(workflow.document.getElementById("workflowChatBackdrop").classList.contains("hidden"), true, "workflow dialog can close without leaving the page");
@@ -388,6 +411,7 @@ async function run() {
   workflow.document.getElementById("backToChat").click();
   await workflow.flush();
   assert.strictEqual(jdBackdrop.classList.contains("hidden"), true, "shared chat hides the embedded JD form temporarily");
+  assert.strictEqual(chatScroll.scrollTop, 950, "reopening from another workflow page shows the newest messages");
   workflow.document.getElementById("workflowChatClose").click();
   await workflow.flush();
   assert.strictEqual(jdBackdrop.classList.contains("hidden"), false, "closing chat restores the JD form");

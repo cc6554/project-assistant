@@ -82,6 +82,8 @@ def test_api_guards_and_bounded_paths(live_server):
     assert status == 400
     status, info = request(service, server, "GET", "/api%2Finfo")
     assert status == 200 and info["app"] == "agent-coach"
+    assert info["display_name"] == "简历项目助手"
+    assert info["agent_name"] == "简历项目助手"
     status, _ = request(service, server, "GET", "/api/info", Authorization="Bearer wrong")
     assert status == 401
     status, _ = request(
@@ -513,7 +515,10 @@ def test_jd_profile_routes_clone_and_delete_preserve_uploads(live_server, tmp_pa
     status, listing = request(service, server, "GET", "/api/sessions")
     assert status == 200
     source_summary = next(row for row in listing["sessions"] if row["id"] == source_id)
-    assert source_summary["title"] == "后端工程师 · Example Labs"
+    assert source_summary["title"] == "后端工程师"
+    # The company remains in the durable JD artifact; it is simply omitted
+    # from the generated sidebar title.
+    assert source_summary["company"] == "Example Labs"
     assert source_summary["jd_confirmed"] is True
 
     status, cloned = request(

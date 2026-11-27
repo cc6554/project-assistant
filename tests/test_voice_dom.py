@@ -8,7 +8,7 @@ import pytest
 
 
 def test_voice_dom_regression() -> None:
-    """Exercise speech lifecycle and stale-input guards without a microphone."""
+    """Exercise offline MediaRecorder/API lifecycle and stale-input guards with fake media only."""
 
     node = shutil.which("node")
     if not node:

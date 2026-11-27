@@ -1,4 +1,4 @@
-"""Headless acceptance smoke for a packaged Agent Coach build.
+"""Headless acceptance smoke for a packaged desktop build.
 
 The check deliberately starts the supplied executable with a fresh, private
 workspace.  It discovers the loopback URL from the headless marker (or the
@@ -9,8 +9,10 @@ workspace is touched.
 Examples::
 
     python scripts/verify_frozen_parity.py \
-        --exe dist/AgentCoachDesktop/AgentCoachDesktop.exe \
-        --archive dist/AgentCoachDesktop-windows.zip
+        --exe dist/ResumeProjectAssistantDesktop/简历项目助手.exe \
+        --archive dist/ResumeProjectAssistantDesktop-windows.zip \
+        --expected-exe-name 简历项目助手.exe \
+        --brand-text 简历
 
 For a source launcher smoke, ``--exe`` may point at ``packaged_launcher.py``;
 the script will invoke it with the current Python interpreter.  This is useful
@@ -250,7 +252,7 @@ def _stop_process(process: subprocess.Popen[str] | None) -> None:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         # Popen.kill targets this process handle; no system-wide process name
-        # matching is used, so another Agent Coach instance is untouched.
+        # matching is used, so another 简历项目助手 instance is untouched.
         try:
             process.kill()
             process.wait(timeout=5)
@@ -288,9 +290,16 @@ def _profile_payload() -> dict[str, Any]:
     }
 
 
-def _check_http_surface(api: LocalAPI, checks: Checks, workspace: Path, source_root: Path) -> None:
+def _check_http_surface(
+    api: LocalAPI,
+    checks: Checks,
+    workspace: Path,
+    source_root: Path,
+    *,
+    brand_text: str,
+) -> None:
     info = _expect_json(checks, api, "GET", "/api/info", status=200)
-    checks.require(info.get("app") == "agent-coach", "info identifies Agent Coach")
+    checks.require(info.get("app") == "agent-coach", "info identifies agent-coach service")
     checks.require(info.get("mode") == "demo", "headless process is in demo mode")
     checks.require(info.get("workflow") == "job-radar", "job-radar workflow is enabled")
 
@@ -307,7 +316,10 @@ def _check_http_surface(api: LocalAPI, checks: Checks, workspace: Path, source_r
 
     root = api.get("/")
     checks.require(root.status == 200, "static index is served", f"got {root.status}")
-    checks.require("求职" in root.text and "lang=\"zh-CN\"" in root.text, "static index contains Chinese UI")
+    checks.require(
+        brand_text in root.text and "lang=\"zh-CN\"" in root.text,
+        "static index contains the expected Chinese brand",
+    )
     css = api.get("/static/styles.css")
     checks.require(css.status == 200, "static stylesheet is served", f"got {css.status}")
     checks.require(
@@ -401,11 +413,31 @@ def _archive_candidates(executable: Path) -> list[Path]:
     ]
 
 
-def _check_archive(archive: Path, checks: Checks) -> None:
+def _check_archive(
+    archive: Path,
+    checks: Checks,
+    *,
+    expected_exe_name: str | None,
+    legacy_exe_names: set[str],
+) -> None:
     try:
         with zipfile.ZipFile(archive) as bundle:
             bad = bundle.testzip()
             checks.require(bad is None, "release ZIP CRC is valid", str(bad) if bad else "")
+            archive_names = [entry.filename.replace("\\", "/") for entry in bundle.infolist()]
+            archive_basenames = {Path(name).name for name in archive_names}
+            if expected_exe_name:
+                checks.require(
+                    expected_exe_name in archive_basenames,
+                    "release ZIP contains the expected executable",
+                    expected_exe_name,
+                )
+            for legacy_name in sorted(legacy_exe_names):
+                checks.require(
+                    legacy_name not in archive_basenames,
+                    "release ZIP excludes a legacy executable",
+                    legacy_name,
+                )
             forbidden: list[str] = []
             for entry in bundle.infolist():
                 normalized = entry.filename.replace("\\", "/")
@@ -450,9 +482,22 @@ def _check_workspace_clean(workspace: Path, checks: Checks) -> None:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a deterministic headless smoke against a packaged Agent Coach build")
+    parser = argparse.ArgumentParser(description="Run a deterministic headless smoke against a packaged desktop build")
     parser.add_argument("--exe", required=True, help="path to the EXE; a .py source launcher is also accepted for preparation")
     parser.add_argument("--archive", help="release ZIP to CRC-check; nearby -windows.zip is auto-detected when present")
+    parser.add_argument("--expected-exe-name", help="require this executable basename in the supplied package and archive")
+    parser.add_argument(
+        "--legacy-exe-name",
+        action="append",
+        dest="legacy_exe_names",
+        default=[],
+        help="reject this executable basename from the archive; may be repeated",
+    )
+    parser.add_argument(
+        "--brand-text",
+        default="求职",
+        help="Chinese brand text that must appear in the served index (default: 求职)",
+    )
     parser.add_argument("--timeout", type=float, default=30.0, help="startup/API timeout in seconds (default: 30)")
     parser.add_argument("--keep-workspace", action="store_true", help="retain the private temporary QA workspace after the run")
     return parser.parse_args(argv)
@@ -525,6 +570,12 @@ def main(argv: list[str] | None = None) -> int:
     if not executable.is_file():
         print(f"FAIL: executable is not a file: {executable}", file=sys.stderr)
         return 2
+    if args.expected_exe_name and executable.name != args.expected_exe_name:
+        print(
+            f"FAIL: executable name is {executable.name!r}, expected {args.expected_exe_name!r}",
+            file=sys.stderr,
+        )
+        return 2
 
     qa_root, temp_root, workspace, source_root = _make_qa_tree()
     process: subprocess.Popen[str] | None = None
@@ -538,7 +589,13 @@ def main(argv: list[str] | None = None) -> int:
         process, output = _start_process(executable, workspace)
         url = _discover_url(process, workspace, output, timeout=args.timeout)
         api = LocalAPI(url, timeout=min(10.0, args.timeout))
-        _check_http_surface(api, checks, workspace, source_root)
+        _check_http_surface(
+            api,
+            checks,
+            workspace,
+            source_root,
+            brand_text=args.brand_text,
+        )
         _check_workspace_clean(workspace, checks)
 
         archive: Path | None = None
@@ -549,7 +606,12 @@ def main(argv: list[str] | None = None) -> int:
         if archive is None:
             checks.skip("release ZIP CRC/content checks", "no release ZIP supplied or found")
         else:
-            _check_archive(archive, checks)
+            _check_archive(
+                archive,
+                checks,
+                expected_exe_name=args.expected_exe_name,
+                legacy_exe_names=set(args.legacy_exe_names),
+            )
             archive_checked = True
         status = "pass"
         return_code = 0

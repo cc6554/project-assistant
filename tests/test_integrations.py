@@ -550,6 +550,11 @@ def test_search_jobs_keeps_only_real_platform_links_and_reports_empty(monkeypatc
     assert "平台需要登录" in unavailable["message"]
 
 
+def test_search_jobs_rejects_multiple_role_lines():
+    with pytest.raises(integrations.IntegrationError, match="一个目标岗位"):
+        integrations.search_jobs("后端工程师\n算法工程师", platform="boss")
+
+
 def test_search_jobs_tool_is_deterministic_and_does_not_call_model(monkeypatch, tmp_path: Path):
     from agent_coach.legacy.tools import job_sources
 

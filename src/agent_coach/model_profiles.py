@@ -370,17 +370,47 @@ class ModelProfilesStore:
         meta["active_profile_id"] = None
         self._write_meta(meta)
 
-    def delete(self, profile_id: str) -> None:
+    def delete(self, profile_id: str) -> ModelProfile | None:
+        """Delete a profile and return the deterministic active fallback.
+
+        The active profile is allowed to be removed.  When another profile
+        remains, catalog order chooses the fallback and the caller can apply
+        that profile to the legacy settings/router.  A final deletion leaves
+        an explicit ``active_profile_id: null`` catalog so the caller can
+        clear any legacy settings pair before exposing an unconfigured state.
+        """
+
         wanted = normalize_profile_id(profile_id)
         meta = self._read_meta()
-        if meta.get("active_profile_id") == wanted:
-            raise SettingsError("不能删除当前正在使用的配置")
-        remaining = [item for item in meta["profiles"] if item["profile_id"] != wanted]
-        if len(remaining) == len(meta["profiles"]):
+        old = next((item for item in meta["profiles"] if item["profile_id"] == wanted), None)
+        if old is None:
             raise KeyError("profile 不存在")
-        self._key_path(wanted).unlink(missing_ok=True)
+        was_active = meta.get("active_profile_id") == wanted
+        remaining = [item for item in meta["profiles"] if item["profile_id"] != wanted]
+        fallback: ModelProfile | None = None
+        if was_active and remaining:
+            fallback = self._read_profile(remaining[0])
+
+        key_path = self._key_path(wanted)
+        try:
+            previous_key = key_path.read_bytes() if key_path.is_file() else None
+            previous_meta = self.meta_path.read_bytes() if self.meta_path.is_file() else None
+        except OSError as exc:
+            raise SettingsError("读取旧 profile 配置失败") from exc
         meta["profiles"] = remaining
-        self._write_meta(meta)
+        if was_active:
+            meta["active_profile_id"] = fallback.profile_id if fallback is not None else None
+        try:
+            key_path.unlink(missing_ok=True)
+            self._write_meta(meta)
+        except Exception:
+            try:
+                _restore_file(key_path, previous_key)
+                _restore_file(self.meta_path, previous_meta)
+            except Exception as rollback_exc:
+                raise SettingsError("profile 删除失败且回滚失败") from rollback_exc
+            raise
+        return fallback
 
     def migrate_legacy(self, legacy_store: ModelSettingsStore) -> ModelProfile | None:
         """Create the stable ``default`` profile from old single settings once."""

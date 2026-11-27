@@ -34,7 +34,10 @@ assert.match(css, /@media \(max-width: 680px\)/);
 // These client correlation hints were previously rejected by the strict
 // endpoint contract and must never be sent from the browser.
 assert.doesNotMatch(app, /question_id\s*:/);
-assert.doesNotMatch(app, /request_id\s*:/);
+const clarificationSubmit = functionBody(app, "submitClarification");
+assert.doesNotMatch(clarificationSubmit, /question_id\s*:/);
+assert.doesNotMatch(clarificationSubmit, /request_id\s*:/);
+assert.match(functionBody(app, "sendInterviewMessage"), /request_id\s*:/, "only the scoped interview endpoint may use its own idempotency key");
 assert.match(app, /\$\("clarificationAnswer"\)\.addEventListener\("input"/);
 assert.match(app, /state\.clarification\.completed/);
 assert.match(app, /metadata\.confirmed === true/);

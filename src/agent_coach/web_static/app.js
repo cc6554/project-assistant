@@ -6,6 +6,29 @@
   const THEME_STORAGE_KEY = "jr-theme";
   const DEFAULT_THEME = "dark";
   const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+  const MAX_IMAGE_ATTACHMENTS = 10;
+  const MAX_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
+  const MAX_SOURCE_URLS = 10;
+  const JD_SEARCH_CONTEXT_STORAGE_KEY = "agent-coach:jd-search-context";
+  // Keep the empty-search recovery destination generic.  The query is user
+  // data and is appended only after URL encoding; it must never choose a
+  // recruitment platform or alter the fixed public-search host/path.
+  const JD_PUBLIC_WEB_SEARCH_TARGET = Object.freeze({ label: "公开网页", base: "https://www.bing.com/search?q=" });
+  const JD_SEARCH_PLATFORM = "web";
+  const PROFILE_LOCAL_MAX_FILES = 1000;
+  const PROFILE_LOCAL_MAX_FILE_BYTES = 2 * 1024 * 1024;
+  const PROFILE_LOCAL_MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+  const PROFILE_LOCAL_DOCUMENT_EXTENSIONS = new Set([
+    ".c", ".cc", ".cfg", ".conf", ".cpp", ".css", ".csv", ".doc", ".docm", ".docx", ".go", ".h", ".hpp",
+    ".html", ".ini", ".java", ".js", ".json", ".jsx", ".log", ".md", ".markdown", ".mjs", ".pdf", ".ppt",
+    ".pptm", ".pptx", ".py", ".rst", ".rs", ".sh", ".sql", ".swift", ".tex", ".toml", ".ts", ".tsx", ".txt",
+    ".vue", ".xls", ".xlsm", ".xlsx", ".xml", ".yaml", ".yml", ".zsh"
+  ]);
+  const PROFILE_LOCAL_BLOCKED_DIRECTORY_NAMES = new Set([
+    ".cache", ".git", ".obsidian", ".ssh", ".trash", "__pycache__", "cache", "caches", "node_modules", "tmp", "temp"
+  ]);
+  const PROFILE_LOCAL_BLOCKED_SEGMENT_RE = /(?:^|[._-])(?:api[_-]?key|credential|credentials|key|keys|passwd|password|private|secret|secrets|token|tokens)(?=$|[._-])/i;
+  const PROFILE_LOCAL_ENV_RE = /^\.env(?:\..*)?$/i;
   const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]);
   const IMAGE_EXTENSIONS = /\.(?:jpe?g|png|gif|webp)$/i;
   const UNSUPPORTED_IMAGE_EXTENSIONS = /\.(?:avif|bmp|tiff?|heic|heif|jxl|svg)$/i;
@@ -16,6 +39,9 @@
   const PRACTICE_WINDOW_VIEW = "practice";
   const PRACTICE_WINDOW_NAME = "agent-coach-practice";
   const PRACTICE_WINDOW_FEATURES = "popup=yes,resizable=yes,scrollbars=yes,width=1160,height=860,left=80,top=60";
+  const INTERVIEW_WINDOW_VIEW = "interview";
+  const INTERVIEW_WINDOW_NAME = "agent-coach-interview";
+  const INTERVIEW_WINDOW_FEATURES = "popup=yes,resizable=yes,scrollbars=yes,width=1160,height=860,left=100,top=70";
 
   const ICONS = {
     plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
@@ -42,7 +68,9 @@
     warning: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 4 9 16H3z"/><path d="M12 9v5M12 17.5v.1"/></svg>',
     bot: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="3"/><path d="M12 3v4M8 13h.01M16 13h.01M8 16h8"/></svg>',
     user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>',
-    mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="12" rx="4"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"/></svg>'
+    mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="12" rx="4"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"/></svg>',
+    pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 3 8 8M6.5 9.5l8-8 3 3-2.2 4.2 3.7 3.7-4.2 2.2-8 8-.7-4.3-3.4-3.4z"/></svg>',
+    edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m4 16.5-.8 4.3 4.3-.8L19 8.5 15.5 5zM13.8 6.7l3.5 3.5M4 21h16"/></svg>'
   };
 
   const state = {
@@ -83,11 +111,25 @@
     themeSyncSerial: 0,
     voice: {
       active: false,
-      recognition: null,
+      stopping: false,
+      starting: false,
+      recorder: null,
+      stream: null,
       meter: null,
       generation: 0,
       latestText: "",
-      target: null
+      target: null,
+      session: null,
+      transcribeAbortController: null,
+      status: {
+        available: null,
+        mode: "offline",
+        message: "正在检查本机离线语音…",
+        maxDurationSeconds: 120
+      },
+      statusRequest: null,
+      statusAbortController: null,
+      statusTimeoutId: null
     },
     jobEditor: {
       open: false,
@@ -98,7 +140,8 @@
       serial: 0,
       previousFocus: null
     },
-    jdImport: { open: false, opening: false, busy: false, sessionId: "", drafts: new Map(), previousFocus: null },
+    jdImport: { open: false, opening: false, busy: false, sessionId: "", drafts: new Map(), previousFocus: null, jobId: "", mode: "", searchQuery: "", searchPlatform: JD_SEARCH_PLATFORM, status: "", statusCode: "", statusKind: "", result: null, progress: null, error: "", diagnostic: "", controlAction: "", pollTimer: null, pollInFlight: false, requestSerial: 0 },
+    interview: { open: false, standalone: false, sessionId: "", threadId: "", messages: [], events: [], pending: null, execution: {}, queuedCalls: 0, lastResult: null, lastResultRetryable: false, loading: false, busy: false, error: "", startPending: false, jobId: "", optimisticMessage: null, requestSerial: 0, child: null, children: new Map(), launchPending: false, refreshTimer: null, refreshInFlight: false, stale: false },
     clarification: {
       open: false,
       busy: false,
@@ -163,11 +206,32 @@
       busy: false,
       previousFocus: null
     },
+    sessionEditor: {
+      open: false,
+      busy: false,
+      sessionId: "",
+      previousFocus: null
+    },
+    workspaceSwitch: {
+      open: false,
+      busy: false,
+      pickerBusy: false,
+      pickerRequestSerial: 0,
+      previousFocus: null,
+      canSwitch: true,
+      blockedReason: ""
+    },
     localImportTarget: "composer",
     localImportSessionId: "new",
     github: {
       hasToken: false,
-      busy: false
+      busy: false,
+      profiles: [],
+      activeProfileId: "",
+      editorOpen: false,
+      editorProfileId: "",
+      editorHasToken: false,
+      requestSerial: 0
     },
     renderSerial: 0,
     lastResultSeen: new Map(),
@@ -177,6 +241,8 @@
     sessionRequestSerial: 0,
     modelSettings: {
       open: false,
+      view: "manager",
+      editorOpen: false,
       busyAction: "",
       hasApiKey: false,
       currentProfileId: "",
@@ -185,7 +251,9 @@
       loadedIdentity: null,
       newProfile: false,
       previousFocus: null,
-      requestSerial: 0
+      requestSerial: 0,
+      managerBusy: false,
+      managerSerial: 0
     }
   };
 
@@ -328,6 +396,29 @@
     return token;
   }
 
+  function persistTokenForReload(nextToken) {
+    const token = String(nextToken || "").trim();
+    if (!token) return false;
+    try {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+      if (window.sessionStorage.getItem(TOKEN_STORAGE_KEY) === token) return true;
+    } catch (_error) {
+      // Fall back to the URL fragment when browser storage is unavailable.
+    }
+    try {
+      const fallbackHash = `#token=${encodeURIComponent(token)}`;
+      const pathname = String(window.location.pathname || "");
+      const search = String(window.location.search || "");
+      if (window.history && typeof window.history.replaceState === "function") {
+        window.history.replaceState(null, document.title, `${pathname}${search}${fallbackHash}`);
+      }
+      if (String(window.location.hash || "") !== fallbackHash) window.location.hash = fallbackHash;
+      return String(window.location.hash || "") === fallbackHash;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function handleTokenHashChange() {
     const nextToken = tokenFromHash();
     if (!nextToken || nextToken === state.token) {
@@ -372,6 +463,56 @@
     setText($("currentTitle"), state.practiceWindow.projectKey ? `实操 · ${state.practiceWindow.projectKey}` : "Agent 实操");
   }
 
+  function readInterviewWindowParams() {
+    let params = null;
+    try { params = new URLSearchParams(window.location.search || ""); } catch (_error) { params = null; }
+    const view = String(params?.get("view") || "").trim().toLowerCase();
+    if (view !== INTERVIEW_WINDOW_VIEW) return { standalone: false, sessionId: "", start: false };
+    return { standalone: true, sessionId: String(params?.get("session_id") || "").trim(), start: ["1", "true", "yes"].includes(String(params?.get("start") || "").trim().toLowerCase()) };
+  }
+
+  function applyInterviewWindowChrome() {
+    if (!state.interview.standalone) return;
+    document.documentElement.dataset.windowView = INTERVIEW_WINDOW_VIEW;
+    document.body.classList.add("interview-window");
+    setText($("modeBreadcrumb"), "技能访谈");
+    setText($("currentTitle"), "技能访谈 · 当前岗位");
+  }
+
+  function interviewWindowUrl(sessionId, start = true) {
+    const id = String(sessionId || "").trim(); if (!id) return "";
+    try {
+      const target = new URL(window.location.href);
+      for (const keyName of Array.from(target.searchParams.keys())) if (/^(?:token|api[_-]?key|access[_-]?token|authorization|secret|password)$/i.test(keyName)) target.searchParams.delete(keyName);
+      target.searchParams.set("view", INTERVIEW_WINDOW_VIEW); target.searchParams.set("session_id", id);
+      if (start) target.searchParams.set("start", "1"); else target.searchParams.delete("start");
+      target.hash = state.token ? `#token=${encodeURIComponent(state.token)}` : "";
+      return target.href;
+    } catch (_error) { return ""; }
+  }
+
+  function interviewWindowKey(sessionId) { return String(sessionId || "").trim(); }
+  function interviewWindowName(sessionId) {
+    const value = interviewWindowKey(sessionId); let hash = 2166136261;
+    for (let index = 0; index < value.length; index += 1) { hash ^= value.charCodeAt(index); hash = Math.imul(hash, 16777619); }
+    return `${INTERVIEW_WINDOW_NAME}-${(hash >>> 0).toString(36)}`;
+  }
+
+  function openInterviewBrowserWindow(url, sessionId) {
+    if (!url || typeof window.open !== "function") return false;
+    try {
+      const key = interviewWindowKey(sessionId); const existing = state.interview.children.get(key);
+      if (existing && !existing.closed) { state.interview.child = existing; focusPracticeWindow(existing); return true; }
+      const child = window.open(url, interviewWindowName(sessionId), INTERVIEW_WINDOW_FEATURES);
+      if (!child) return false;
+      state.interview.child = child; state.interview.children.set(key, child); focusPracticeWindow(child); return true;
+    } catch (_error) { return false; }
+  }
+
+  function interviewWindowSelectionMatches() {
+    return !state.interview.standalone || String(state.interview.sessionId || "") === String(state.currentSessionId || "");
+  }
+
   function practiceWindowUrl(sessionId, projectKey, start = false) {
     const id = String(sessionId || "").trim();
     const key = String(projectKey || "").trim();
@@ -397,6 +538,45 @@
     } catch (_error) {
       return "";
     }
+  }
+
+  function openInterviewNativeWindow(url, sessionId) {
+    if (!url || state.interview.standalone) return false;
+    const nativeApi = window.pywebview && window.pywebview.api;
+    const nativeOpen = nativeApi && nativeApi.open_interview_window;
+    if (typeof nativeOpen !== "function") return false;
+    const fallback = () => {
+      state.interview.launchPending = false;
+      if (!openInterviewBrowserWindow(url, sessionId)) void openInterviewChatDialog({ start: true });
+    };
+    try {
+      const result = nativeOpen.call(nativeApi, url);
+      if (result && typeof result.then === "function") {
+        state.interview.launchPending = true;
+        result.then((payload) => {
+          state.interview.launchPending = false;
+          if (!payload || payload.opened === false) fallback();
+        }).catch(fallback);
+        return true;
+      }
+      state.interview.launchPending = false;
+      if (result && typeof result === "object" && result.opened === false) return false;
+      return result !== false;
+    } catch (_error) {
+      state.interview.launchPending = false;
+      return false;
+    }
+  }
+
+  function requestInterviewWindowClose() {
+    const nativeApi = window.pywebview && window.pywebview.api;
+    const nativeClose = nativeApi && nativeApi.close_interview_window;
+    if (typeof nativeClose === "function") {
+      try { nativeClose.call(nativeApi, state.interview.sessionId); } catch (_error) { /* browser fallback below */ }
+    }
+    try {
+      if (window.opener || String(window.name || "").startsWith(INTERVIEW_WINDOW_NAME + "-")) window.close();
+    } catch (_error) { /* optional */ }
   }
 
   function focusPracticeWindow(child) {
@@ -509,7 +689,7 @@
     try {
       response = await fetch(`${API_ROOT}${path}`, init);
     } catch (_error) {
-      throw new ApiError("无法连接到 校招雷达服务");
+      throw new ApiError("无法连接到 简历项目助手服务");
     }
     let payload = null;
     const contentType = response.headers.get("content-type") || "";
@@ -820,13 +1000,27 @@
   }
 
   function sessionTitle(session) {
-    if (session && session.title) return String(session.title);
+    const customTitle = String(session && (session.custom_title || (session.title_source === "custom" ? session.title : "")) || "").trim();
+    if (customTitle) return customTitle;
     const workflow = session && session.skill_state && session.skill_state["job-radar"];
     const jd = (session && session.jd) || (workflow && workflow.jd) || (session && session.job_state && session.job_state.jd) || {};
     const jobTitle = String(session && session.job_title || jd && jd.job_title || "").trim();
     const company = String(session && session.company || jd && jd.company || "").trim();
-    if (jobTitle && company) return `${jobTitle} · ${company}`;
-    if (jobTitle || company) return jobTitle || company;
+    if (jobTitle) return jobTitle;
+    // Older servers returned ``岗位 · 公司`` in ``title``. Keep the company
+    // field available in the JD panel while removing it from automatic
+    // sidebar/header titles for those legacy snapshots too.
+    let generatedTitle = String(session && (session.display_title || session.title) || "").trim();
+    if (company && generatedTitle) {
+      for (const separator of [" · ", " • ", " | ", "｜", " / "]) {
+        const suffix = `${separator}${company}`;
+        if (generatedTitle.endsWith(suffix)) {
+          generatedTitle = generatedTitle.slice(0, -suffix.length).trim();
+          break;
+        }
+      }
+    }
+    if (generatedTitle && generatedTitle !== company) return generatedTitle;
     const messages = (session && session.messages) || [];
     const firstUser = messages.find((message) => message && message.role === "user");
     const text = firstUser ? contentText(firstUser.content).replace(/\s+/g, " ").trim() : "新会话";
@@ -837,13 +1031,13 @@
     return ((session && session.messages) || []).filter((message) => message && message.role !== "system");
   }
 
-  // Practice turns are persisted by the service with an explicit metadata
-  // envelope.  Main and legacy messages have no practice metadata and must
-  // never be inferred into the project window after a reload or switch.
+  // Scoped turns are persisted by the service with an explicit metadata
+  // envelope. Main and legacy messages have no scoped metadata and must
+  // never be inferred into a practice or interview window after a reload or switch.
   function messageScope(message) {
     if (!message || typeof message !== "object") return "main";
     const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
-    return metadata.scope === "practice" ? "practice" : "main";
+    return ["practice", "interview", "jd-import"].includes(String(metadata.scope || "")) ? String(metadata.scope) : "main";
   }
 
   function messageProjectKey(message) {
@@ -858,6 +1052,12 @@
     return String(metadata.practice_thread_id || "").trim();
   }
 
+  function messageInterviewThreadId(message) {
+    if (!message || typeof message !== "object") return "";
+    const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+    return String(metadata.interview_thread_id || message.interview_thread_id || "").trim();
+  }
+
   // Events are also projected with their canonical scope fields at the top
   // level. Accept the nested envelope emitted by the current service and the
   // exact projection used by session snapshots, while keeping message
@@ -865,7 +1065,8 @@
   function eventScope(event) {
     if (!event || typeof event !== "object") return "main";
     const metadata = event.metadata && typeof event.metadata === "object" ? event.metadata : {};
-    return metadata.scope === "practice" || event.scope === "practice" ? "practice" : "main";
+    const scope = String(metadata.scope || event.scope || "");
+    return ["practice", "interview", "jd-import"].includes(scope) ? scope : "main";
   }
 
   function eventProjectKey(event) {
@@ -924,7 +1125,11 @@
     if (state.workflowChat.open && state.workflowChat.scope === "practice") {
       return practiceMessages(session, state.workflowChat.practiceProjectKey || selectedProjectKey(), state.practice.threadId);
     }
-    return visibleMessages(session).filter((message) => messageScope(message) !== "practice");
+    if (state.workflowChat.open && state.workflowChat.scope === "interview") {
+      const thread = String(state.interview.threadId || "");
+      return (state.interview.messages.length ? state.interview.messages : visibleMessages(session)).filter((message) => messageScope(message) === "interview" && (!thread || messageInterviewThreadId(message) === thread));
+    }
+    return visibleMessages(session).filter((message) => messageScope(message) === "main");
   }
 
   function practiceHasMessages(session = state.currentSession, projectKey = state.workflowChat.practiceProjectKey || selectedProjectKey(), threadId = state.practice.threadId) {
@@ -1096,7 +1301,7 @@
     else if (mode === "configured") { setText(label, "模型已配置"); }
     else if (mode === "error") { badge.classList.add("error"); setText(label, "服务异常"); }
     else { badge.classList.add("unconfigured"); setText(label, "未配置模型"); }
-    setText($("modeBreadcrumb"), state.practiceWindow.standalone ? "Agent 实操" : mode === "demo" ? "岗位雷达 · 演示模式" : "岗位雷达");
+    setText($("modeBreadcrumb"), state.practiceWindow.standalone ? "Agent 实操" : mode === "demo" ? "简历项目助手 · 演示模式" : "简历项目助手");
     setText($("workspacePath"), info.workspace || "等待服务返回工作区");
     setText($("workspaceMeta"), mode === "configured" ? "内容将发送到已配置的模型" : mode === "demo" ? "离线脚本模型 · 不代表真实模型" : "本地服务已连接");
     $("workspaceStatusDot").classList.toggle("offline", mode === "error");
@@ -1105,12 +1310,12 @@
       const show = mode === "unconfigured" || mode === "error";
       onboarding.classList.toggle("hidden", !show);
       if (mode === "error") {
-        setText($("onboardingTitle"), "暂时无法连接 校招雷达服务");
-        setText($("onboardingText"), "请确认 校招雷达服务已启动并刷新页面；模型设置入口在侧栏底部。");
+        setText($("onboardingTitle"), "暂时无法连接 简历项目助手服务");
+        setText($("onboardingText"), "请确认 简历项目助手服务已启动并刷新页面；连接设置入口在侧栏底部。");
         setText($("onboardingOpenModelSettings"), "打开模型设置");
       } else {
         setText($("onboardingTitle"), "还没有配置模型");
-        setText($("onboardingText"), "点击侧栏底部“管理 API 配置”填写协议、API 地址、模型和密钥；保存后建议新建会话。");
+        setText($("onboardingText"), "点击侧栏底部“连接设置”填写协议、API 地址、模型和密钥；保存后建议新建会话。");
         setText($("onboardingOpenModelSettings"), "打开模型设置");
       }
     }
@@ -1123,7 +1328,11 @@
       if (node.classList.contains("session-row")) node.remove();
       else if (!node.parentElement || !node.parentElement.classList.contains("session-row")) node.remove();
     });
-    const rows = [...state.sessions].sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")));
+    const rows = [...state.sessions].sort((a, b) => {
+      const pinOrder = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned));
+      if (pinOrder) return pinOrder;
+      return String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""));
+    });
     setText($("sessionCount"), rows.length);
     empty.classList.toggle("hidden", rows.length > 0);
     rows.forEach((summary) => {
@@ -1145,6 +1354,14 @@
       body.appendChild(title);
       const meta = document.createElement("span");
       meta.className = "session-meta";
+      if (summary.pinned) {
+        const pin = document.createElement("span");
+        pin.className = "session-pin-indicator";
+        pin.appendChild(icon("pin"));
+        pin.title = "已置顶";
+        pin.setAttribute("aria-label", "已置顶");
+        meta.appendChild(pin);
+      }
       const dot = document.createElement("span");
       dot.className = "session-state-dot";
       const busy = Boolean(summary.busy || state.jobs.has(id));
@@ -1157,6 +1374,22 @@
       body.appendChild(meta);
       button.appendChild(body);
       row.appendChild(button);
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "session-action session-rename";
+      rename.dataset.sessionRename = id;
+      rename.setAttribute("aria-label", `重命名会话 ${sessionTitle(summary)}`);
+      rename.title = "重命名会话";
+      rename.appendChild(icon("edit"));
+      row.appendChild(rename);
+      const pinAction = document.createElement("button");
+      pinAction.type = "button";
+      pinAction.className = "session-action session-pin";
+      pinAction.dataset.sessionPin = id;
+      pinAction.setAttribute("aria-label", summary.pinned ? `取消置顶会话 ${sessionTitle(summary)}` : `置顶会话 ${sessionTitle(summary)}`);
+      pinAction.title = summary.pinned ? "取消置顶" : "置顶";
+      pinAction.appendChild(icon("pin"));
+      row.appendChild(pinAction);
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "session-delete";
@@ -1190,7 +1423,7 @@
     const label = document.createElement("div");
     label.className = "message-label";
     const labelText = document.createElement("span");
-    labelText.textContent = role === "user" ? "你" : role === "tool" ? `工具${message.name ? ` · ${message.name}` : ""}` : "求职教练";
+    labelText.textContent = role === "user" ? "你" : role === "tool" ? `工具${message.name ? ` · ${message.name}` : ""}` : "简历项目助手";
     label.appendChild(labelText);
     if (message.at || message.created_at) {
       const time = document.createElement("span");
@@ -1209,7 +1442,7 @@
       message.tool_calls.forEach((call) => calls.appendChild(createToolCard(call, toolMap.get(String(call.id || "")))));
       bubble.appendChild(calls);
     }
-    if (!bubble.childNodes.length) bubble.textContent = role === "assistant" ? "求职教练正在准备下一步…" : "";
+    if (!bubble.childNodes.length) bubble.textContent = role === "assistant" ? "简历项目助手正在准备下一步…" : "";
     body.appendChild(bubble);
     article.appendChild(body);
     return article;
@@ -1258,6 +1491,7 @@
     const list = $("messageList");
     list.replaceChildren();
     const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
     const messages = chatMessages(state.currentSession);
     const toolMap = new Map(messages.filter((message) => message.role === "tool" && message.tool_call_id).map((message) => [String(message.tool_call_id), message]));
     messages.forEach((message) => {
@@ -1283,21 +1517,60 @@
           : "这是当前项目的独立实操记录。发送第一条消息后，教练会沿用同一求职会话的完整背景。";
       list.appendChild(empty);
     }
-    const optimisticState = practiceScope ? state.practice.optimisticMessage : state.optimisticMessage;
+    if (interviewScope && !messages.length && !state.interview.optimisticMessage) {
+      const empty = document.createElement("div"); empty.className = "practice-empty-state";
+      empty.textContent = state.interview.loading ? "正在准备技能访谈…" : state.interview.error ? `暂时无法读取技能访谈：${state.interview.error}` : "这里只显示当前技能访谈记录。AI 会一次问一个问题。";
+      list.appendChild(empty);
+    }
+    if (interviewScope && state.interview.error) {
+      const errorCard = document.createElement("article");
+      errorCard.className = "interview-error-state";
+      const title = document.createElement("strong");
+      title.textContent = "本次技能访谈未完成";
+      errorCard.appendChild(title);
+      const detail = document.createElement("p");
+      detail.textContent = state.interview.error;
+      errorCard.appendChild(detail);
+      if (state.interview.lastResultRetryable) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "action-button secondary";
+        retry.dataset.interviewRetry = "start";
+        retry.textContent = "重试访谈首问";
+        retry.disabled = Boolean(state.interview.startPending || state.interview.busy);
+        retry.addEventListener("click", () => { void retryInterviewStart(); });
+        errorCard.appendChild(retry);
+      }
+      list.appendChild(errorCard);
+    }
+    const optimisticState = practiceScope ? state.practice.optimisticMessage : interviewScope ? state.interview.optimisticMessage : state.optimisticMessage;
     const optimisticMatches = optimisticState && optimisticState.sessionId === String(state.currentSessionId || "")
-      && (!practiceScope || !optimisticState.projectKey || optimisticState.projectKey === (state.workflowChat.practiceProjectKey || selectedProjectKey()));
+      && (!practiceScope || !optimisticState.projectKey || optimisticState.projectKey === (state.workflowChat.practiceProjectKey || selectedProjectKey()))
+      && (!interviewScope || optimisticState.threadId === state.interview.threadId);
     const serverHasPracticeOptimistic = practiceScope && optimisticState
       ? messages.some((message) => message.role === "user" && messageScope(message) === "practice" && (!optimisticState.projectKey || messageProjectKey(message) === optimisticState.projectKey) && messagePracticeThreadId(message) === state.practice.threadId && contentText(message.content).includes(String(optimisticState.text || "").slice(0, 80)))
       : false;
-    const serverHasCurrentOptimistic = practiceScope ? serverHasPracticeOptimistic : serverHasOptimisticUser(state.currentSession, optimisticState);
+    const serverHasInterviewOptimistic = interviewScope && optimisticState
+      ? messages.some((message) => message.role === "user" && messageScope(message) === "interview" && contentText(message.content).includes(String(optimisticState.text || "").slice(0, 80)))
+      : false;
+    const serverHasCurrentOptimistic = practiceScope ? serverHasPracticeOptimistic : interviewScope ? serverHasInterviewOptimistic : serverHasOptimisticUser(state.currentSession, optimisticState);
     if (optimisticMatches && !serverHasCurrentOptimistic) {
-      const optimistic = createMessageElement({ role: "user", content: optimisticState.text, scope: practiceScope ? "practice" : "main", project_key: optimisticState.projectKey }, new Map());
+      const optimistic = createMessageElement({ role: "user", content: optimisticState.text, scope: practiceScope ? "practice" : interviewScope ? "interview" : "main", project_key: optimisticState.projectKey, interview_thread_id: optimisticState.threadId }, new Map());
       optimistic.classList.add("pending-message");
       list.appendChild(optimistic);
     }
     const hasMessages = list.childElementCount > 0;
     $("welcomePanel").classList.toggle("hidden", hasMessages);
-    if (shouldScroll) requestAnimationFrame(() => { $("chatScroll").scrollTop = $("chatScroll").scrollHeight; });
+    if (shouldScroll) {
+      const { open, scope, practiceProjectKey } = state.workflowChat;
+      const sessionId = state.currentSessionId;
+      requestAnimationFrame(() => {
+        if (state.currentSessionId !== sessionId || state.workflowChat.open !== open
+          || state.workflowChat.scope !== scope || state.workflowChat.practiceProjectKey !== practiceProjectKey) return;
+        const chatScroll = $("chatScroll");
+        chatScroll.scrollTop = chatScroll.scrollHeight;
+      });
+    }
   }
 
   function commandScopeEnvelope() {
@@ -1539,17 +1812,22 @@
   function renderActivity() {
     const panel = $("activityPanel");
     const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
     const practiceKey = state.workflowChat.practiceProjectKey || selectedProjectKey();
     const scopedSnapshotLoaded = practiceScope
       && state.practice.loaded
       && state.practice.sessionId === String(state.currentSessionId || "")
       && state.practice.projectKey === String(practiceKey || "").trim()
       && Boolean(state.practice.threadId);
-    const allEvents = scopedSnapshotLoaded
+    const interviewSnapshotLoaded = interviewScope && state.interview.sessionId === String(state.currentSessionId || "") && Boolean(state.interview.threadId);
+    const allEvents = interviewSnapshotLoaded
+      ? state.interview.events
+      : scopedSnapshotLoaded
       ? state.practice.events
       : (Array.isArray(state.currentSession && state.currentSession.events) ? state.currentSession.events : []);
     const events = allEvents.filter((event) => {
-      if (!practiceScope) return !event || eventScope(event) !== "practice";
+      if (interviewScope) return eventScope(event) === "interview" && messageInterviewThreadId(event) === state.interview.threadId;
+      if (!practiceScope) return !event || eventScope(event) !== "practice" && eventScope(event) !== "interview" && eventScope(event) !== "jd-import";
       if (eventScope(event) !== "practice") return false;
       const eventKey = eventProjectKey(event);
       const eventThread = eventPracticeThreadId(event);
@@ -1557,13 +1835,13 @@
     }).slice(-5);
     const busy = sessionBusy(state.currentSession);
     const queued = sessionHasQueue(state.currentSession);
-    const queuedForScope = practiceScope ? practiceQueueMatches(state.currentSession) : queued;
+    const queuedForScope = practiceScope ? practiceQueueMatches(state.currentSession) : interviewScope ? false : queued;
     const commandScope = commandScopeEnvelope();
     const commandScopeMatches = state.commandRuntime.sessionId === String(state.currentSessionId || "")
       && state.commandRuntime.scopeKey === commandScopeKey(commandScope);
-    const commands = commandScopeMatches ? state.commandRuntime.items : [];
+    const commands = interviewScope ? [] : commandScopeMatches ? state.commandRuntime.items : [];
     const commandBusy = commands.some(commandIsRunning);
-    const scopeBusy = practiceScope ? Boolean(state.currentSession && state.currentSession.practice_busy) || Boolean(state.practice.optimisticMessage) && busy : busy;
+    const scopeBusy = interviewScope ? Boolean(state.interview.busy) : practiceScope ? Boolean(state.currentSession && state.currentSession.practice_busy) || Boolean(state.practice.optimisticMessage) && busy : busy;
     panel.classList.toggle("hidden", events.length === 0 && !scopeBusy && !queuedForScope && !commands.length && !state.commandRuntime.error);
     const list = $("activityList");
     list.replaceChildren();
@@ -1603,11 +1881,12 @@
     if (!record || typeof record !== "object") return { scope: "main" };
     const metadata = record.metadata && typeof record.metadata === "object" ? record.metadata : {};
     const scope = String(record.scope || metadata.scope || "main").trim().toLowerCase();
-    if (scope !== "practice") return { scope: "main" };
+    if (!["practice", "interview"].includes(scope)) return { scope: "main" };
     return {
-      scope: "practice",
+      scope,
       project_key: String(record.project_key || metadata.project_key || "").trim(),
-      practice_thread_id: String(record.practice_thread_id || metadata.practice_thread_id || "").trim()
+      practice_thread_id: String(record.practice_thread_id || metadata.practice_thread_id || "").trim(),
+      interview_thread_id: String(record.interview_thread_id || metadata.interview_thread_id || "").trim()
     };
   }
 
@@ -1618,6 +1897,26 @@
       && envelope.project_key === String(projectKey || "").trim()
       && Boolean(String(threadId || "").trim())
       && envelope.practice_thread_id === String(threadId || "").trim();
+  }
+
+  function interviewTurnMatches(record, threadId = state.interview.threadId) {
+    const envelope = scopedTurnEnvelope(record);
+    return envelope.scope === "interview"
+      && Boolean(String(threadId || "").trim())
+      && envelope.interview_thread_id === String(threadId || "").trim();
+  }
+
+  function interviewApprovalMatches(session = state.currentSession) {
+    if (!session) return false;
+    const threadId = String(state.interview.threadId || "").trim();
+    return [session.pending, session.execution].some((record) => interviewTurnMatches(record, threadId));
+  }
+
+  function interviewQueueMatches(session = state.currentSession) {
+    const queueCount = Number(state.interview.queuedCalls || 0) || Number(session && session.queued_calls || 0);
+    if (!queueCount || queueCount <= 0) return false;
+    const active = state.interview.pending || state.interview.execution || (session && (session.pending || session.execution));
+    return interviewTurnMatches(active, state.interview.threadId);
   }
 
   function practiceQueueMatches(session) {
@@ -1633,10 +1932,19 @@
     region.replaceChildren();
     const session = state.currentSession;
     if (!session) return;
-    const pending = session.pending;
-    const execution = session.execution || {};
-    const liveWorker = Boolean(session.busy || state.jobs.has(String(session.id)));
     const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
+    // Interview snapshots carry their own filtered pending/execution state.
+    // Never fall back to the root session here: a main turn may be pending at
+    // the same time as an otherwise idle interview thread.
+    const pending = interviewScope ? state.interview.pending : session.pending;
+    const execution = interviewScope ? (state.interview.execution || {}) : (session.execution || {});
+    const queuedCalls = interviewScope ? Number(state.interview.queuedCalls || 0) : Number(session.queued_calls || 0);
+    const liveWorker = interviewScope
+      ? Boolean(state.interview.busy || state.interview.startPending || state.interview.jobId)
+      : Boolean(session.busy || state.jobs.has(String(session.id)));
+    if (interviewScope && pending && !interviewTurnMatches(pending, state.interview.threadId)) return;
+    if (interviewScope && !pending && !interviewTurnMatches(execution, state.interview.threadId) && !interviewQueueMatches(session) && !liveWorker) return;
     if (practiceScope && pending && !practiceApprovalMatches(session)) {
       const notice = document.createElement("article");
       notice.className = "approval-card practice-main-approval-notice";
@@ -1651,7 +1959,13 @@
       actions.appendChild(open); body.appendChild(actions); notice.appendChild(body); region.appendChild(notice); hydrateIcons(notice);
       return;
     }
-    const isUnknown = !liveWorker && ["uncertain", "running"].includes(String(execution.status || "")) && approvalIdFor(session);
+    const scopeMatches = interviewScope
+      ? (Boolean(pending && interviewTurnMatches(pending, state.interview.threadId)) || interviewTurnMatches(execution, state.interview.threadId))
+      : practiceScope
+        ? (Boolean(pending && practiceApprovalMatches(session)) || practiceApprovalMatches(session))
+        : true;
+    const isUnknown = scopeMatches && !liveWorker && ["uncertain", "running"].includes(String(execution.status || ""))
+      && (interviewScope ? String(pending?.id || execution.approval_id || execution.call_id || "") : approvalIdFor(session));
     if (practiceScope && isUnknown && !practiceApprovalMatches(session)) {
       const notice = document.createElement("article");
       notice.className = "approval-card practice-main-approval-notice";
@@ -1666,10 +1980,10 @@
       actions.appendChild(open); body.appendChild(actions); notice.appendChild(body); region.appendChild(notice); hydrateIcons(notice);
       return;
     }
-    if (pending && !isUnknown) {
+    if (pending && scopeMatches && !isUnknown) {
       const card = document.createElement("article");
       card.className = "approval-card";
-      card.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">需要确认的操作</div><h3>请确认求职教练的下一步操作</h3></div></div>`;
+      card.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">需要确认的操作</div><h3>请确认简历项目助手的下一步操作</h3></div></div>`;
       const body = document.createElement("div");
       body.className = "approval-body";
       const summary = document.createElement("p");
@@ -1700,7 +2014,7 @@
       const reject = document.createElement("button");
       reject.type = "button"; reject.className = "action-button reject"; reject.dataset.action = "reject";
       reject.appendChild(icon("close")); reject.appendChild(document.createTextNode("拒绝"));
-      if (sessionBusy(session)) { approve.disabled = true; reject.disabled = true; }
+      if (liveWorker) { approve.disabled = true; reject.disabled = true; }
       actions.append(approve, reject);
       body.appendChild(actions);
       const foot = document.createElement("p");
@@ -1712,7 +2026,6 @@
       hydrateIcons(card);
       return;
     }
-    const queuedCalls = Number(session.queued_calls || 0);
     if (practiceScope && !practiceQueueMatches(session) && !pending && !liveWorker && !isUnknown && Number.isFinite(queuedCalls) && queuedCalls > 0) {
       const notice = document.createElement("article");
       notice.className = "approval-card practice-main-approval-notice";
@@ -1727,7 +2040,10 @@
       actions.appendChild(open); body.appendChild(actions); notice.appendChild(body); region.appendChild(notice); hydrateIcons(notice);
       return;
     }
-    if (!pending && !liveWorker && !isUnknown && Number.isFinite(queuedCalls) && queuedCalls > 0) {
+    if (interviewScope && !interviewQueueMatches(session) && !pending && !liveWorker && !isUnknown) return;
+    if (!pending && !liveWorker && !isUnknown && Number.isFinite(queuedCalls) && queuedCalls > 0
+      && (!practiceScope || practiceQueueMatches(session))
+      && (!interviewScope || interviewQueueMatches(session))) {
       const card = document.createElement("article");
       card.className = "approval-card queue-recovery-card";
       card.innerHTML = `<div class="approval-head"><span class="approval-icon" data-icon="warning"></span><div><div class="approval-kicker">工具队列待恢复</div><h3>上一轮工具调用尚未完成</h3></div></div>`;
@@ -1780,19 +2096,26 @@
   }
 
   function renderBusy() {
-    const busy = sessionBusy(state.currentSession);
-    const pending = Boolean(state.currentSession && state.currentSession.pending);
-    const queued = sessionHasQueue(state.currentSession);
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
+    const loadingSession = Boolean(state.loadingSession);
+    const busy = interviewScope ? Boolean(state.interview.busy || state.interview.startPending) : sessionBusy(state.currentSession);
+    const pending = interviewScope ? Boolean(state.interview.pending && interviewTurnMatches(state.interview.pending, state.interview.threadId)) : Boolean(state.currentSession && state.currentSession.pending);
+    const queued = interviewScope ? Number(state.interview.queuedCalls || 0) > 0 : sessionHasQueue(state.currentSession);
     const practiceScope = state.workflowChat.open && state.workflowChat.scope === "practice";
     const practicePending = practiceScope && pending && practiceApprovalMatches(state.currentSession);
     const practiceQueue = practiceScope && practiceQueueMatches(state.currentSession);
     const stalePractice = practiceScope && state.practiceWindow.standalone && state.practiceWindow.stale;
-    const blocked = busy || pending || queued || stalePractice;
-    $("busyBar").classList.toggle("hidden", !busy);
+    const blocked = loadingSession || busy || pending || queued || stalePractice;
+    const indicatorBusy = loadingSession || busy;
+    $("busyBar").classList.toggle("hidden", !indicatorBusy);
     $("sendButton").disabled = blocked;
     $("composerInput").disabled = blocked;
-    $("sendButton").setAttribute("aria-busy", busy ? "true" : "false");
-    $("composerInput").placeholder = practiceScope
+    $("sendButton").setAttribute("aria-busy", indicatorBusy ? "true" : "false");
+    $("composerInput").placeholder = loadingSession
+      ? "正在加载当前会话…"
+      : interviewScope
+      ? (pending ? "请先处理访谈中的待确认操作…" : queued ? "请先继续访谈工具队列…" : busy ? "AI 正在准备下一个问题…" : "回答当前问题，AI 会继续一次一个问题…")
+      : practiceScope
       ? (stalePractice
         ? "主窗口已切换练习项目，请从当前项目重新打开实操…"
         : pending
@@ -1807,22 +2130,28 @@
       : queued
         ? "上一轮工具队列待继续，请先点击下方“继续执行工具队列”…"
         : busy
-          ? "求职教练正在处理当前会话…"
+          ? "简历项目助手正在处理当前会话…"
           : "粘贴 JD、说明已有技能，或上传相关材料…";
     const job = currentJob();
     setText(
       $("busyText"),
-      job
-          ? "求职教练正在运行，状态每秒更新…"
+      loadingSession
+        ? "正在加载当前会话…"
+        : job
+          ? "简历项目助手正在运行，状态每秒更新…"
           : "会话正在恢复，状态会自动更新…",
     );
   }
 
-  function renderAll({ scroll = false } = {}) {
+  function renderAll({ scroll = false, scrollOnChatOpen = false } = {}) {
+    const chatScroll = state.workflowChat.open && state.workflowChat.scope === "main" ? $("chatScroll") : null;
+    const previousChatTop = chatScroll?.scrollTop;
+    const wasAtBottom = chatScroll && chatScroll.scrollHeight - chatScroll.clientHeight - previousChatTop <= 4;
     state.renderSerial += 1;
+    if (state.sessionEditor.open && state.sessionEditor.sessionId !== String(state.currentSessionId || "")) closeRenameSession({ restore: false });
     if (state.jobEditor.open && state.jobEditor.sessionId !== String(state.currentSessionId || "")) closeJobEditor();
     renderHeader();
-    renderMessages(scroll);
+    renderMessages(scroll && !chatScroll);
     renderActivity();
     renderApproval();
     renderBusy();
@@ -1852,13 +2181,18 @@
     });
     enhanceVoiceInputs();
     hydrateIcons();
+    if (chatScroll) {
+      const bottom = Math.max(0, chatScroll.scrollHeight - chatScroll.clientHeight);
+      const top = scrollOnChatOpen || wasAtBottom ? bottom : Math.min(previousChatTop, bottom);
+      if (chatScroll.scrollTop !== top) chatScroll.scrollTo({ top, behavior: "instant" });
+    }
   }
 
   const WORKFLOW_STEPS = [
     { id: "jd", title: "① 岗位 JD", hint: "粘贴目标岗位 JD，或上传岗位截图。你也可以手动填写；未知信息请留空。", prompt: "请整理我接下来提供的目标岗位 JD，保留不确定字段，保存到当前求职会话。" },
     { id: "profile", title: "② 技能档案", hint: "补充已有技能、熟练程度和事实证据，上传简历或项目材料。待澄清问题会保留在这里。", prompt: "请根据我提供的简历和技能事实整理当前会话的技能档案，缺少证据的内容请向我澄清。" },
-    { id: "plan", title: "③ 计划 & 项目", hint: "基于岗位和技能档案分析差距、制定计划。每次选择一个练习项目，可逐个完成多个项目。", prompt: "请根据当前会话的岗位 JD 和技能档案分析差距，生成学习计划并搜索适合我的候选练习项目。" },
-    { id: "practice", title: "④ Agent 实操", hint: "围绕选定项目继续实操，记录真实结果和证据。文件修改、命令执行仍由你确认。", prompt: "请围绕当前已选练习项目给出今天的实操任务，逐步指导我执行，并根据实际结果记录进度与证据。" }
+    { id: "plan", title: "③ 计划 & 项目", hint: "基于岗位和技能档案分析差距、制定计划，并为实操准备候选项目。", prompt: "请根据当前会话的岗位 JD 和技能档案分析差距，生成学习计划并搜索适合我的候选练习项目。" },
+    { id: "practice", title: "④ Agent 实操", hint: "选择候选项目后开始实操，记录真实结果和证据。文件修改、命令执行仍由你确认。", prompt: "请围绕当前已选练习项目给出今天的实操任务，逐步指导我执行，并根据实际结果记录进度与证据。" }
   ];
 
   function workflowData() {
@@ -1874,7 +2208,9 @@
       jd: saved(data.jd) ? "已保存" : "待填写",
       profile: saved(data.profile) ? (questions.length ? "待澄清" : "已保存") : "待填写",
       plan: saved(data.plan) ? (saved(data.selected_project) ? "已选项目" : "已有计划") : "待生成",
-      practice: Array.isArray(data.progress) && data.progress.length ? (data.progress.some(progressIsCompleted) ? "已记录完成" : "已有进度") : "待开始"
+      practice: Array.isArray(data.progress) && data.progress.length
+        ? (data.progress.some(progressIsCompleted) ? "已记录完成" : "已有进度")
+        : selectedProjectKey(data) ? "可开始" : projectCandidates(data).length ? "待选择" : "待开始"
     };
     qsa("[data-step]").forEach((button) => {
       const id = button.dataset.step;
@@ -1888,7 +2224,7 @@
 
   function selectWorkflowStep(id) {
     if (!WORKFLOW_STEPS.some((step) => step.id === id)) return;
-    if (state.voice.active || state.voice.stopping) stopVoiceInput({ cancel: true });
+    if (state.voice.active || state.voice.stopping || state.voice.starting) stopVoiceInput({ cancel: true });
     if (state.jdImport.open) saveJdDraft();
     state.selectedStep = id;
     state.pageView = true;
@@ -1905,9 +2241,9 @@
   }
 
   function composerDraftKey(scope = state.workflowChat.scope, sessionId = state.currentSessionId, projectKey = state.workflowChat.practiceProjectKey || state.practice.projectKey) {
-    const normalizedScope = scope === "practice" ? "practice" : "main";
+    const normalizedScope = ["practice", "interview"].includes(scope) ? scope : "main";
     const normalizedSession = String(sessionId || "new");
-    const normalizedProject = normalizedScope === "practice" ? String(projectKey || "") : "";
+    const normalizedProject = normalizedScope === "practice" ? String(projectKey || "") : normalizedScope === "interview" ? String(state.interview.threadId || "") : "";
     return JSON.stringify([normalizedSession, normalizedScope, normalizedProject]);
   }
 
@@ -1945,12 +2281,13 @@
 
   function openWorkflowChatDialog({ focus = true, scrollApproval = false } = {}) {
     if (!state.pageView) return false;
+    const openingMainChat = !state.workflowChat.open || state.workflowChat.scope !== "main";
     if (state.jdImport.open) {
       saveJdDraft();
       $("jdImportBackdrop")?.classList.add("hidden");
       state.jdImport.open = false;
     }
-    if ((state.voice.active || state.voice.stopping) && state.workflowChat.scope !== "main") stopVoiceInput({ cancel: true });
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.workflowChat.scope !== "main") stopVoiceInput({ cancel: true });
     const wasPractice = state.workflowChat.scope === "practice";
     captureComposerDraft(state.workflowChat.scope);
     if (wasPractice) state.practice.viewSerial += 1;
@@ -1968,21 +2305,21 @@
     state.workflowChat.practiceProjectKey = "";
     restoreComposerDraft("main");
     const step = WORKFLOW_STEPS.find((item) => item.id === state.selectedStep);
-    setText($("workflowChatTitle"), step ? `${step.title} · 当前会话` : "求职辅导对话");
+    setText($("workflowChatTitle"), step ? `${step.title} · 当前会话` : "简历项目助手对话");
     backdrop.classList.remove("hidden");
     backdrop.setAttribute("aria-hidden", "false");
     document.body.classList.add("modal-open");
+    renderAll({ scrollOnChatOpen: openingMainChat });
     if (focus) window.requestAnimationFrame(() => {
-      if (!state.workflowChat.open) return;
-      if (scrollApproval) {
+      if (!state.workflowChat.open || state.workflowChat.scope !== "main") return;
+      if (scrollApproval && !openingMainChat) {
         const region = $("approvalRegion");
         if (region && typeof region.scrollIntoView === "function") region.scrollIntoView({ behavior: "smooth", block: "center" });
       }
       const input = $("composerInput");
-      if (input && !input.disabled) input.focus();
-      else $("workflowChatClose")?.focus();
+      if (input && !input.disabled) input.focus({ preventScroll: true });
+      else $("workflowChatClose")?.focus({ preventScroll: true });
     });
-    renderAll();
     return true;
   }
 
@@ -2026,7 +2363,7 @@
         showStandalonePracticeStale(sessionId, state.practiceWindow.projectKey, "当前练习项目已不可用。为避免把消息写入错误项目，请关闭此窗口并从当前项目重新打开实操。");
         return false;
       }
-      toast("请先在“计划 & 项目”中选定练习项目。", "");
+      toast("请先在“Agent 实操”中选择练习项目。", "");
       return false;
     }
     if (state.practiceWindow.standalone && state.practiceWindow.projectKey && state.practiceWindow.projectKey !== projectKey) {
@@ -2051,7 +2388,7 @@
       $("jdImportBackdrop")?.classList.add("hidden");
       state.jdImport.open = false;
     }
-    if (state.voice.active || state.voice.stopping) stopVoiceInput({ cancel: true });
+    if (state.voice.active || state.voice.stopping || state.voice.starting) stopVoiceInput({ cancel: true });
     captureComposerDraft(state.workflowChat.scope);
     const host = $("practiceChatHost");
     const backdrop = $("workflowChatBackdrop");
@@ -2133,10 +2470,216 @@
     return true;
   }
 
+  function interviewThreadMessages(payload) {
+    const rows = payload && Array.isArray(payload.messages) ? payload.messages : [];
+    return rows.filter((message) => message && typeof message === "object").map((message) => ({
+      ...message,
+      metadata: { ...(message.metadata && typeof message.metadata === "object" ? message.metadata : {}), scope: "interview", interview_thread_id: String(message.interview_thread_id || message.metadata?.interview_thread_id || state.interview.threadId || "") }
+    }));
+  }
+
+  function interviewLastResult(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    const result = source.last_result ?? source.lastResult ?? source.result;
+    if (!result || typeof result !== "object") return null;
+    if (result.result && typeof result.result === "object") return result.result;
+    return result;
+  }
+
+  function interviewLastResultError(payload) {
+    const result = interviewLastResult(payload);
+    if (!result) return "";
+    const status = String(result.status || "").trim().toLowerCase();
+    if (!["failed", "error"].includes(status)) return "";
+    return String(result.error || result.message || result.detail || "技能访谈本轮执行失败，请重试。").trim();
+  }
+
+  function interviewThreadId(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    return String(source.interview_thread_id || source.interviewThreadId || source.thread_id || source.threadId || (source.thread && (source.thread.id || source.thread.thread_id)) || "").trim();
+  }
+
+  function interviewContextMatches(sessionId, threadId = "", serial = state.interview.requestSerial) {
+    return serial === state.interview.requestSerial
+      && String(state.currentSessionId || "") === String(sessionId || "")
+      && state.interview.sessionId === String(sessionId || "")
+      && (!threadId || !state.interview.threadId || state.interview.threadId === String(threadId));
+  }
+
+  async function ensureInterviewThread(sessionId, serial = state.interview.requestSerial) {
+    if (!sessionId || !interviewContextMatches(sessionId, "", serial)) return "";
+    if (state.interview.threadId) return state.interview.threadId;
+    const payload = await request(`/sessions/${encodeURIComponent(sessionId)}/interview`, { method: "POST", body: {} });
+    if (!interviewContextMatches(sessionId, "", serial)) return "";
+    const threadId = interviewThreadId(payload);
+    if (!threadId) throw new Error("服务未返回技能访谈记录标识。");
+    state.interview.threadId = threadId;
+    state.interview.jobId = String(payload?.job_id || payload?.jobId || payload?.job?.id || "");
+    state.interview.busy = Boolean(state.interview.jobId || payload?.interview_busy || payload?.busy);
+    return threadId;
+  }
+
+  async function refreshInterviewThread(sessionId = state.interview.sessionId, threadId = state.interview.threadId, serial = state.interview.requestSerial) {
+    if (!sessionId || !threadId || !interviewContextMatches(sessionId, threadId, serial) || state.interview.refreshInFlight) return null;
+    state.interview.refreshInFlight = true;
+    try {
+      const payload = await request(`/sessions/${encodeURIComponent(sessionId)}/interview/${encodeURIComponent(threadId)}`);
+      if (!interviewContextMatches(sessionId, threadId, serial)) return null;
+      state.interview.messages = interviewThreadMessages(payload);
+      state.interview.events = Array.isArray(payload?.events) ? payload.events : [];
+      state.interview.pending = payload?.pending && typeof payload.pending === "object"
+        ? { ...payload.pending, scope: "interview", interview_thread_id: String(payload.pending.interview_thread_id || threadId) }
+        : null;
+      state.interview.execution = payload?.execution && typeof payload.execution === "object"
+        ? { ...payload.execution, scope: "interview", interview_thread_id: String(payload.execution.interview_thread_id || threadId) }
+        : {};
+      state.interview.queuedCalls = Number(payload?.queued_calls || 0);
+      state.interview.lastResult = interviewLastResult(payload);
+      const lastResultError = interviewLastResultError(payload);
+      state.interview.lastResultRetryable = Boolean(lastResultError && payload?.opening_completed !== true && payload?.opening_started !== true);
+      state.interview.busy = Boolean(payload?.running || payload?.interview_busy || payload?.execution?.busy);
+      state.interview.error = String(payload?.error || lastResultError || "");
+      if (payload?.job_id || payload?.active_job) state.interview.jobId = String(payload.job_id || payload.active_job || "");
+      if (!state.interview.busy) { state.interview.jobId = ""; state.interview.optimisticMessage = null; }
+      renderAll();
+      return payload;
+    } finally { state.interview.refreshInFlight = false; }
+  }
+
+  async function retryInterviewStart() {
+    const sessionId = String(state.interview.sessionId || state.currentSessionId || "").trim();
+    const threadId = String(state.interview.threadId || "").trim();
+    if (!sessionId || !threadId || state.interview.startPending || state.interview.busy || !interviewContextMatches(sessionId, threadId)) return false;
+    const serial = state.interview.requestSerial;
+    state.interview.startPending = true;
+    state.interview.error = "";
+    renderAll();
+    try {
+      const payload = await request(`/sessions/${encodeURIComponent(sessionId)}/interview`, {
+        method: "POST",
+        body: { interview_thread_id: threadId }
+      });
+      if (!interviewContextMatches(sessionId, threadId, serial)) return true;
+      state.interview.jobId = String(payload?.job_id || payload?.jobId || payload?.job?.id || "");
+      state.interview.busy = Boolean(state.interview.jobId || payload?.busy || payload?.interview_busy);
+      await refreshInterviewThread(sessionId, threadId, serial);
+      startInterviewRefresh();
+      return true;
+    } catch (error) {
+      if (interviewContextMatches(sessionId, threadId, serial)) {
+        state.interview.error = error.message || "无法重试技能访谈。";
+        state.interview.lastResultRetryable = true;
+      }
+      return false;
+    } finally {
+      if (interviewContextMatches(sessionId, threadId, serial)) {
+        state.interview.startPending = false;
+        renderAll();
+      }
+    }
+  }
+
+  function clearInterviewRefresh() {
+    if (state.interview.refreshTimer) { window.clearInterval(state.interview.refreshTimer); state.interview.refreshTimer = null; }
+  }
+
+  function startInterviewRefresh() {
+    clearInterviewRefresh();
+    if (!state.interview.sessionId || !state.interview.threadId) return;
+    const serial = state.interview.requestSerial;
+    const refresh = async () => {
+      if (!interviewContextMatches(state.interview.sessionId, state.interview.threadId, serial)) return;
+      try {
+        await refreshInterviewThread(state.interview.sessionId, state.interview.threadId, serial);
+        await refreshCurrentSession(state.interview.sessionId, { scroll: false, clearOptimistic: false });
+      } catch (error) { if (interviewContextMatches(state.interview.sessionId, state.interview.threadId, serial)) state.interview.error = error.message || "无法读取访谈状态。"; }
+    };
+    void refresh();
+    state.interview.refreshTimer = window.setInterval(() => { void refresh(); }, 1000);
+  }
+
+  async function sendInterviewMessage(text) {
+    const value = String(text || "").trim();
+    const sessionId = String(state.interview.sessionId || state.currentSessionId || "");
+    const threadId = String(state.interview.threadId || "");
+    if (!value || !sessionId || !threadId || state.interview.busy || state.interview.startPending || !interviewContextMatches(sessionId, threadId)) return false;
+    state.interview.busy = true; state.interview.error = ""; state.interview.optimisticMessage = { sessionId, threadId, text: value }; renderAll();
+    try {
+      const payload = await request(`/sessions/${encodeURIComponent(sessionId)}/interview/${encodeURIComponent(threadId)}/message`, { method: "POST", body: { text: value, request_id: `interview-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` } });
+      if (!interviewContextMatches(sessionId, threadId)) return true;
+      state.interview.jobId = String(payload?.job_id || payload?.jobId || payload?.job?.id || "");
+      await refreshInterviewThread(sessionId, threadId);
+      startInterviewRefresh();
+      return true;
+    } catch (error) {
+      if (interviewContextMatches(sessionId, threadId)) { state.interview.busy = false; state.interview.optimisticMessage = null; state.interview.error = error.message || "发送访谈回答失败，回答仍保留在输入框。"; renderAll(); }
+      return false;
+    }
+  }
+
+  async function openInterviewChatDialog({ focus = true, start = true } = {}) {
+    if (!state.pageView || !state.currentSessionId) return false;
+    const sessionId = String(state.currentSessionId || "");
+    if (state.jdImport.open) { saveJdDraft(); $("jdImportBackdrop")?.classList.add("hidden"); state.jdImport.open = false; }
+    if (state.voice.active || state.voice.stopping || state.voice.starting) stopVoiceInput({ cancel: true });
+    captureComposerDraft(state.workflowChat.scope);
+    const host = $("practiceChatHost"), backdrop = $("workflowChatBackdrop"), chat = mountSharedChat(host);
+    if (!host || !backdrop || !chat) return false;
+    const active = document.activeElement;
+    if (!state.workflowChat.open) { state.workflowChat.open = true; state.workflowChat.previousFocus = active; }
+    state.workflowChat.scope = "interview"; state.workflowChat.practiceProjectKey = "";
+    const sameSession = state.interview.sessionId === sessionId;
+    const serial = ++state.interview.requestSerial;
+    state.interview.sessionId = sessionId; state.interview.standalone = state.interview.standalone || false;
+    if (!sameSession) {
+      state.interview.threadId = ""; state.interview.messages = []; state.interview.events = [];
+      state.interview.pending = null; state.interview.execution = {}; state.interview.queuedCalls = 0;
+      state.interview.lastResult = null; state.interview.lastResultRetryable = false;
+      state.interview.error = ""; state.interview.optimisticMessage = null;
+    }
+    state.interview.loading = true;
+    const kicker = qs(".workflow-chat-header .inspect-kicker"); if (kicker) kicker.textContent = "技能访谈 · 独立记录";
+    setText($("workflowChatTitle"), "技能访谈 · 当前岗位");
+    backdrop.classList.remove("hidden"); backdrop.setAttribute("aria-hidden", "false"); document.body.classList.add("modal-open"); renderAll();
+    try {
+      const threadId = await ensureInterviewThread(sessionId, serial);
+      if (!threadId || !interviewContextMatches(sessionId, threadId, serial)) return false;
+      await refreshInterviewThread(sessionId, threadId, serial);
+      // The scoped open endpoint owns the idempotent opening turn. Reopening
+      // an existing thread only reads its transcript and never submits a
+      // second first question.
+      state.interview.loading = false; startInterviewRefresh(); renderAll();
+    } catch (error) {
+      if (interviewContextMatches(sessionId, "", serial)) { state.interview.loading = false; state.interview.error = error.message || "无法打开技能访谈。"; renderAll(); }
+      return false;
+    }
+    if (focus) window.requestAnimationFrame(() => { if (state.workflowChat.open && state.workflowChat.scope === "interview") { const input = $("composerInput"); if (input && !input.disabled) input.focus(); else $("workflowChatClose")?.focus(); } });
+    return true;
+  }
+
+  async function openInterviewWindow() {
+    // A selected session id is enough to open the scoped child immediately;
+    // the parent may still be finishing its snapshot refresh. Waiting here
+    // would lose the browser's user-gesture permission for window.open and
+    // make a direct click look like it did nothing.
+    if (state.interview.launchPending) return true;
+    if (state.newSession.busy) return false;
+    if (!state.currentSessionId) { const created = await createSession(); if (!created) return false; }
+    const sessionId = String(state.currentSessionId || "");
+    if (!sessionId) return false;
+    selectWorkflowStep("profile");
+    if (state.interview.standalone) return openInterviewChatDialog({ start: true });
+    const url = interviewWindowUrl(sessionId, true);
+    if (openInterviewNativeWindow(url, sessionId)) return true;
+    if (openInterviewBrowserWindow(url, sessionId)) return true;
+    return openInterviewChatDialog({ start: true });
+  }
+
   function closeWorkflowChatDialog({ restore = true } = {}) {
     if (!state.workflowChat.open) return;
-    if ((state.voice.active || state.voice.stopping) && state.voice.target && $("workflowChatBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target && $("workflowChatBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
     const wasPractice = state.workflowChat.scope === "practice";
+    const wasInterview = state.workflowChat.scope === "interview";
     captureComposerDraft(state.workflowChat.scope);
     if (wasPractice && state.practiceWindow.standalone) {
       // Closing a child window only detaches this view. The backend job is
@@ -2154,8 +2697,19 @@
       requestPracticeWindowClose();
       return;
     }
+    if (wasInterview && state.interview.standalone) {
+      clearInterviewRefresh();
+      state.workflowChat.open = false;
+      state.workflowChat.scope = "main";
+      state.interview.optimisticMessage = null;
+      $("workflowChatBackdrop").classList.add("hidden");
+      $("workflowChatBackdrop").setAttribute("aria-hidden", "true");
+      document.body.classList.remove("modal-open");
+      requestInterviewWindowClose();
+      return;
+    }
     if (wasPractice) state.practice.viewSerial += 1;
-    if (state.workflowChat.scope === "practice") restoreComposerDraft("main");
+    if (state.workflowChat.scope === "practice" || wasInterview) restoreComposerDraft("main");
     const chat = qs(".chat-column");
     if (chat && chat.parentNode !== $("chatHome")) $("chatHome").prepend(chat);
     state.workflowChat.open = false;
@@ -2169,7 +2723,7 @@
       $("jdImportBackdrop")?.classList.remove("hidden");
       state.jdImport.open = true;
     }
-    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.jdImport.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.sessionEditor.open && !state.clarification.open && !state.jdImport.open) document.body.classList.remove("modal-open");
     const previous = state.workflowChat.previousFocus;
     state.workflowChat.previousFocus = null;
     if (restore) restoreSidebarAwareFocus(previous);
@@ -2177,7 +2731,7 @@
   }
 
   function showSharedChat() {
-    if (state.voice.active || state.voice.stopping) stopVoiceInput({ cancel: true });
+    if (state.voice.active || state.voice.stopping || state.voice.starting) stopVoiceInput({ cancel: true });
     if (state.workflowChat.open) closeWorkflowChatDialog({ restore: false });
     if (state.jdImport.open) saveJdDraft();
     restoreInspectorPaneHost();
@@ -2186,6 +2740,7 @@
     if (chat && chat.parentNode !== $("chatHome")) $("chatHome").prepend(chat);
     $("workflowPage").classList.add("hidden");
     $("chatHome").classList.remove("hidden");
+    syncInspectorToggle();
     $("composerInput").focus();
   }
 
@@ -2308,8 +2863,15 @@
   const projectFilterDrafts = new Map();
   const projectFilterServerSnapshots = new Map();
   let pageSession = null;
-  let profileTab = "text";
+  let profileTab = "self_report";
+  let profileInputMode = "text";
   let profileFiles = [];
+  let profileResumeFiles = [];
+  let profileLocalFiles = [];
+  let profileLocalImported = [];
+  let profileLocalPath = "";
+  let profileLocalPickerBusy = false;
+  let profileLocalPickerSerial = 0;
   let planProjectFiles = [];
   let pageSubmitting = false;
 
@@ -2370,14 +2932,24 @@
       rerank: Boolean(values.rerank)
     };
   }
-  const PAGE_FIELDS = ["profileSource", "profileText", "profilePath", "profileAnswer", "planInclude", "planExclude", "planMinStars", "planOther", "planRerank", "planPaperProjects", "planProjectUrl"];
+  const PAGE_FIELDS = ["profileInputMode", "profileText", "profileLocalPath", "planInclude", "planExclude", "planMinStars", "planOther", "planRerank", "planPaperProjects", "planProjectUrl"];
   function syncPageDrafts() {
     const id = String(state.currentSessionId || "new");
     if (pageSession === id) return;
     if (pageSession !== null) {
       const values = {};
       PAGE_FIELDS.forEach((name) => { values[name] = $(name).type === "checkbox" ? $(name).checked : $(name).value; });
-      pageDrafts.set(pageSession, { values, tab: profileTab, files: profileFiles, projectFiles: planProjectFiles.map((item) => ({ ...item })) });
+      pageDrafts.set(pageSession, {
+        values,
+        tab: profileTab,
+        inputMode: profileInputMode,
+        files: profileFiles,
+        resumeFiles: profileResumeFiles,
+        localFiles: profileLocalFiles,
+        localImported: profileLocalImported.map((item) => ({ ...item })),
+        localPath: profileLocalPath,
+        projectFiles: planProjectFiles.map((item) => ({ ...item }))
+      });
     }
     pageSession = id;
     const draft = pageDrafts.get(id);
@@ -2390,17 +2962,30 @@
         planMinStars: savedFilter.minStars,
         planOther: savedFilter.other,
         planRerank: savedFilter.rerank,
-        planPaperProjects: savedFilter.paperProjects
+        planPaperProjects: savedFilter.paperProjects,
+        profileInputMode: draft?.inputMode || "text",
+        profileLocalPath: draft?.localPath || ""
       }[name];
-      const value = draft?.values[name] ?? (filterValue !== undefined ? filterValue : name === "planMinStars" ? "50" : name === "profileSource" ? "self_report" : ["planRerank", "planPaperProjects"].includes(name) ? true : "");
+      const value = draft?.values[name] ?? (filterValue !== undefined ? filterValue : name === "planMinStars" ? "50" : name === "profileInputMode" ? "text" : ["planRerank", "planPaperProjects"].includes(name) ? true : "");
       if (el.type === "checkbox") el.checked = value;
       else el.value = value;
     });
     profileFiles = draft?.files || [];
+    profileResumeFiles = draft?.resumeFiles || [];
+    profileLocalFiles = draft?.localFiles || [];
+    profileLocalImported = (draft?.localImported || []).map((item) => ({ ...item }));
+    profileInputMode = String(draft?.inputMode || $("profileInputMode")?.value || "text") === "document" ? "document" : "text";
+    profileLocalPath = String(draft?.localPath || $("profileLocalPath")?.value || "");
     planProjectFiles = (draft?.projectFiles || []).map((item) => ({ ...item }));
     $("profileDocuments").value = "";
-    setProfileTab(draft?.tab || "text");
+    $("profileResumeDocuments").value = "";
+    $("profileLocalFilePicker").value = "";
+    $("profileLocalFolderPicker").value = "";
+    setProfileTab(draft?.tab || "self_report");
+    setProfileInputMode(profileInputMode);
     renderProfileFiles();
+    renderProfileResumeFiles();
+    renderProfileLocalFiles();
     renderPlanProjectResources();
     setText($("profileImportStatus"), ""); setText($("planPageStatus"), "");
   }
@@ -2438,12 +3023,93 @@
     }
     projectFilterServerSnapshots.set(id, signature);
   }
-  function setProfileTab(tab) {
-    profileTab = tab;
-    qsa("[data-profile-tab]").forEach((el) => el.setAttribute("aria-selected", String(el.dataset.profileTab === tab)));
-    qsa("[data-profile-panel]").forEach((el) => el.classList.toggle("hidden", el.dataset.profilePanel !== tab));
+  function normalizeProfileTab(tab) {
+    const value = String(tab || "").trim();
+    return ["self_report", "resume", "local_log", "interview"].includes(value) ? value : "self_report";
   }
-  function renderProfileFiles() { $("profileDocumentList").textContent = profileFiles.map((file) => file.name).join("、"); }
+  function profileSourceForTab(tab = profileTab) {
+    return ({ self_report: "self_report", resume: "resume", local_log: "work_log" })[normalizeProfileTab(tab)] || "self_report";
+  }
+  function fileDisplayName(file) {
+    return String(file && (file.webkitRelativePath || file.name || file.path || file.workspace_path || file.workspacePath) || "未命名材料").trim() || "未命名材料";
+  }
+  function setProfileInputMode(mode) {
+    profileInputMode = String(mode || "text").trim() === "document" ? "document" : "text";
+    const select = $("profileInputMode");
+    if (select) select.value = profileInputMode;
+    $("profileTextPanel")?.classList.toggle("hidden", profileInputMode !== "text");
+    $("profileDocumentPanel")?.classList.toggle("hidden", profileInputMode !== "document");
+  }
+  function setProfileTab(tab) {
+    profileTab = normalizeProfileTab(tab);
+    qsa("[data-profile-tab]").forEach((el) => el.setAttribute("aria-selected", String(el.dataset.profileTab === profileTab)));
+    qsa("[data-profile-panel]").forEach((el) => el.classList.toggle("hidden", el.dataset.profilePanel !== profileTab));
+    const interview = profileTab === "interview";
+    ["profileImportActions"].forEach((id) => {
+      const control = $(id);
+      if (control) control.classList.toggle("hidden", interview);
+    });
+    setProfileInputMode(profileInputMode);
+    renderProfileFiles();
+    renderProfileResumeFiles();
+    renderProfileLocalFiles();
+  }
+  function renderProfileFiles() {
+    const list = $("profileDocumentList");
+    if (list) list.textContent = profileFiles.map(fileDisplayName).join("、");
+  }
+  function renderProfileResumeFiles() {
+    const list = $("profileResumeDocumentList");
+    if (list) list.textContent = profileResumeFiles.map(fileDisplayName).join("、");
+  }
+  function renderProfileLocalFiles() {
+    const list = $("profileLocalFileList");
+    if (!list) return;
+    list.replaceChildren();
+    const imported = profileLocalImported.map((item) => ({ ...item, _label: projectResourceLabel(item) }));
+    const browser = profileLocalFiles.map((file) => ({ file, _label: fileDisplayName(file) }));
+    [...imported, ...browser].forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "profile-local-file";
+      row.textContent = item._label;
+      list.appendChild(row);
+    });
+    const path = $("profileLocalPath");
+    if (path && path.value !== profileLocalPath) path.value = profileLocalPath;
+  }
+  function profileLocalBrowserPath(file) {
+    return String(file && (file.webkitRelativePath || file.name || file.path || "") || "").replace(/\\/g, "/").trim();
+  }
+  function profileLocalBrowserPathBlocked(path) {
+    const segments = String(path || "").split("/").filter(Boolean);
+    if (!segments.length) return true;
+    const fileName = segments[segments.length - 1];
+    if (PROFILE_LOCAL_ENV_RE.test(fileName)) return true;
+    return segments.some((segment, index) => {
+      const normalized = segment.toLowerCase();
+      if (index < segments.length - 1 && (normalized.startsWith(".") || PROFILE_LOCAL_BLOCKED_DIRECTORY_NAMES.has(normalized))) return true;
+      return PROFILE_LOCAL_BLOCKED_SEGMENT_RE.test(segment);
+    });
+  }
+  function profileLocalBrowserSelection(files) {
+    const accepted = [];
+    const skipped = [];
+    let totalBytes = 0;
+    for (const file of Array.from(files || []).filter(Boolean)) {
+      const path = profileLocalBrowserPath(file);
+      const extensionMatch = path.toLowerCase().match(/\.[^./\\]+$/);
+      const size = Number(file.size);
+      if (profileLocalBrowserPathBlocked(path)) { skipped.push({ file, reason: "sensitive_path" }); continue; }
+      if (!extensionMatch || !PROFILE_LOCAL_DOCUMENT_EXTENSIONS.has(extensionMatch[0])) { skipped.push({ file, reason: "unsupported_binary_or_extension" }); continue; }
+      if (Number.isFinite(size) && size > PROFILE_LOCAL_MAX_FILE_BYTES) { skipped.push({ file, reason: "file_too_large" }); continue; }
+      const nextBytes = totalBytes + (Number.isFinite(size) && size > 0 ? size : 0);
+      if (accepted.length >= PROFILE_LOCAL_MAX_FILES) { skipped.push({ file, reason: "max_files" }); continue; }
+      if (nextBytes > PROFILE_LOCAL_MAX_TOTAL_BYTES) { skipped.push({ file, reason: "max_bytes" }); continue; }
+      accepted.push(file);
+      totalBytes = nextBytes;
+    }
+    return { accepted, skipped, totalBytes };
+  }
   function projectResourcePath(resource) {
     return String(resource && (resource.path || resource.name || resource.workspace_path || resource.workspacePath) || "").trim();
   }
@@ -2502,7 +3168,10 @@
   function renderWorkflowPage() {
     syncProjectFilterServerSnapshot();
     syncPageDrafts();
-    if (!state.pageView) return;
+    if (!state.pageView) {
+      syncInspectorToggle();
+      return;
+    }
     syncPlanFilterControlsFromSession();
     const step = WORKFLOW_STEPS.find((item) => item.id === state.selectedStep);
     $("workflowPage").classList.remove("hidden"); $("chatHome").classList.add("hidden");
@@ -2519,7 +3188,7 @@
           ? "正在处理；回复、运行记录和待确认操作会显示在对话窗口。"
           : "";
     $("workflowPageStatus").classList.toggle("hidden", !state.currentSession?.pending && !busy && !queued);
-    ["profileImportSubmit", "planGenerate", "planProjectRegister", "planProjectUpload", "planProjectLocalImport", "planProjectUrl", "planOther", "planOtherDiscuss", "planPaperProjects", "planRerank"].forEach((id) => { const control = $(id); if (control) control.disabled = Boolean(pageSubmitting || busy || queued || state.currentSession?.pending || state.loadingSession); });
+    ["profileImportSubmit", "profileInputMode", "profileLocalFileButton", "profileLocalFolderButton", "planGenerate", "planProjectRegister", "planProjectUpload", "planProjectLocalImport", "planProjectUrl", "planOther", "planOtherDiscuss", "planPaperProjects", "planRerank"].forEach((id) => { const control = $(id); if (control) control.disabled = Boolean(pageSubmitting || profileLocalPickerBusy || busy || queued || state.currentSession?.pending || state.loadingSession); });
     const practiceOpen = $("practiceStarter");
     // Opening practice is always a read/view action.  A pending main turn or
     // a running queue blocks starting another turn, but must not hide durable
@@ -2531,11 +3200,13 @@
     qs(".project-filter-card", results)?.remove();
     const data = workflowData();
     const missingPlan = !data.jd || !data.profile;
-    const missingPractice = !data.plan || !data.selected_project;
+    const missingPractice = !selectedProjectKey(data);
     $("planPrerequisite").classList.toggle("hidden", !missingPlan);
     $("planPrerequisite").textContent = "还需要岗位 JD 和技能档案。请先到前两步填写并确认，再生成学习计划与项目。";
     $("practicePrerequisite").classList.toggle("hidden", !missingPractice);
-    $("practicePrerequisite").textContent = "还需要学习计划和选定的练习项目。请先到“计划 & 项目”准备好，再开始实操；下方对话仍可继续补充材料或提问。";
+    $("practicePrerequisite").textContent = projectCandidates(data).length
+      ? "请从下方候选项目中选择一个。选定后即可开始实操。"
+      : "请先到“计划 & 项目”生成候选项目，再回到这里选择。";
     $("planGenerate").disabled ||= missingPlan;
     $("practiceStarter").disabled ||= missingPractice;
     $("profileCopy").disabled = !data.profile || state.loadingSession || state.newSession.busy;
@@ -2545,6 +3216,9 @@
     if (step.id === "profile" && data.profile?.skills?.length) {
       if (data.profile.summary) { const summary = document.createElement("p"); summary.className = "profile-summary"; summary.textContent = data.profile.summary; results.prepend(summary); }
       results.prepend(pageTable("当前档案", ["技能", "熟练程度", "事实证据"], data.profile.skills.map((skill) => [typeof skill === "string" ? skill : skill.name || skill.skill, jobEnumLabel(skill.proficiency || skill.level || skill.status), skill.evidence || skill.proof]), { className: "profile-table", headerLines: { "熟练程度": ["熟练", "程度"] } }));
+    }
+    if (step.id === "profile" && $("profileInterviewStatus")) {
+      setText($("profileInterviewStatus"), state.interview.error ? `访谈状态：${state.interview.error}` : state.interview.busy || state.interview.loading ? "访谈正在进行；回答会继续更新技能档案。" : "准备使用当前岗位 JD 和技能档案开始。");
     }
     if (step.id === "plan" && data.plan) {
       results.prepend(pageTable("差距分析", ["岗位要求", "已有技能", "状态", "说明"], (data.plan.gaps || []).map((gap) => [typeof gap === "string" ? gap : gap.requirement || gap.name || gap.skill, typeof gap === "object" ? gap.matched_skill || gap.matchedSkill || gap.existing_skill || gap.existingSkill || gap.skill_match : "", jobEnumLabel(typeof gap === "object" ? gap.status || gap.priority : ""), typeof gap === "object" ? gap.note || gap.description || gap.reason : ""]), { className: "gap-analysis-table" }));
@@ -2557,22 +3231,45 @@
       if ($("jdImportBackdrop").parentNode !== $("jdPageImport")) $("jdPageImport").appendChild($("jdImportBackdrop"));
       if (!state.workflowChat.open) $("jdImportBackdrop").classList.remove("hidden");
       if (state.jdImport.sessionId !== String(state.currentSessionId || "")) {
+        clearJdImportPolling();
+        // Invalidate uploads, control actions, and polling owned by the
+        // previous session before loading this session's draft.  The old
+        // request may still finish, but its guards must leave this page alone.
+        ++state.jdImport.requestSerial;
+        state.jdImport.busy = false;
+        state.jdImport.pollInFlight = false;
+        state.jdImport.jobId = ""; state.jdImport.mode = ""; state.jdImport.searchQuery = ""; state.jdImport.searchPlatform = JD_SEARCH_PLATFORM; state.jdImport.status = ""; state.jdImport.statusCode = ""; state.jdImport.statusKind = ""; state.jdImport.result = null; state.jdImport.progress = null; state.jdImport.error = ""; state.jdImport.diagnostic = ""; state.jdImport.controlAction = "";
+        qsa("button, input, textarea, select", $("jdImportBackdrop")).forEach((el) => { el.disabled = false; });
+        $("jdImportSubmit").textContent = "交给 AI 整理 JD";
         if (state.jdImport.open) saveJdDraft();
         state.jdImport.sessionId = String(state.currentSessionId || "");
-        JD_FIELDS.forEach((id) => { $(id).value = jdDraft().fields[id] || (id === "jdPlatform" ? "boss" : ""); });
+        const rememberedSearch = readJdSearchContext(state.jdImport.sessionId);
+        const draft = jdDraft();
+        if (!String(draft.fields.jdQuery || "").trim() && rememberedSearch.query) draft.fields.jdQuery = rememberedSearch.query;
+        // Old drafts may contain a platform selector value.  The public-web
+        // flow deliberately ignores it and migrates the remembered query to
+        // the single web scope.
+        state.jdImport.searchQuery = rememberedSearch.query;
+        state.jdImport.searchPlatform = JD_SEARCH_PLATFORM;
+        JD_FIELDS.forEach((id) => { $(id).value = draft.fields[id] || ""; });
         setJdMode(jdDraft().mode); renderJdFiles();
       }
       if (!state.workflowChat.open) state.jdImport.open = true;
-    }
+      renderJdBackgroundStatus();
+    } else { $("jdBackgroundStatus")?.classList.add("hidden"); }
     const practiceChatOpen = state.workflowChat.open && state.workflowChat.scope === "practice";
-    const chatTitle = practiceChatOpen
+    const interviewChatOpen = state.workflowChat.open && state.workflowChat.scope === "interview";
+    const chatTitle = interviewChatOpen
+      ? "技能访谈 · 当前岗位"
+      : practiceChatOpen
       ? `Agent 实操 · ${state.practice.projectTitle || projectDisplayTitle(data.selected_project) || "当前项目"}`
-      : (step ? `${step.title} · 当前会话` : "求职辅导对话");
+      : (step ? `${step.title} · 当前会话` : "简历项目助手对话");
     setText($("workflowChatTitle"), chatTitle);
     const chatKicker = qs(".workflow-chat-header .inspect-kicker");
-    if (chatKicker) chatKicker.textContent = practiceChatOpen ? "当前练习项目 · 独立记录" : "当前会话";
+    if (chatKicker) chatKicker.textContent = interviewChatOpen ? "技能访谈 · 独立记录" : practiceChatOpen ? "当前练习项目 · 独立记录" : "当前会话";
     $("workflowChatBackdrop")?.setAttribute("aria-hidden", state.workflowChat.open ? "false" : "true");
     enhanceVoiceInputs($("workflowPage"));
+    syncInspectorToggle();
   }
   function pageTable(title, headers, rows, options = {}) {
     const card = document.createElement("section"); card.className = `job-card page-table-card${options.className ? ` ${options.className}` : ""}`;
@@ -2590,7 +3287,7 @@
     }); head.appendChild(row); table.appendChild(head);
     const body = document.createElement("tbody"); rows.forEach((values) => { const row = document.createElement("tr"); values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = value == null ? "—" : typeof value === "object" ? safeString(value) : String(value); row.appendChild(cell); }); body.appendChild(row); }); table.appendChild(body); card.appendChild(table); return card;
   }
-  async function sendPageAction(text, status, attachments = [], sessionId = state.currentSessionId, actionContext = null) {
+  async function sendPageAction(text, status, attachments = [], sessionId = state.currentSessionId, actionContext = null, { showPracticeCandidates = false } = {}) {
     if (state.loadingSession || state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) throw new Error("请先完成当前操作或点击“继续执行工具队列”。");
     if (sessionId && String(sessionId) !== String(state.currentSessionId)) throw new Error("会话已切换，输入已保留，请在原会话重试。");
     if (!state.currentSessionId) await createSession();
@@ -2600,41 +3297,186 @@
     const composed = textPaths.length ? `${text}\n\n已上传工作区附件，请使用 read_document 或文件读取工具读取相对路径：${textPaths.join("、")}` : text;
     const body = { text: composed }; if (imagePaths.length) body.attachments = imagePaths;
     if (actionContext && typeof actionContext === "object") body.workflow_action = actionContext;
-    const accepted = await enqueueAction("message", body, id, { optimisticText: composed });
+    if (showPracticeCandidates) status.textContent = "已提交，正在准备候选项目。完成后可在“Agent 实操”选择。";
+    const accepted = await enqueueAction("message", body, id, { optimisticText: composed, showPracticeCandidates });
     if (!accepted) throw new Error("发送失败，输入已保留。");
     if (String(state.currentSessionId) !== id) throw new Error("会话已切换，输入已保留，请在原会话重试。");
-    openWorkflowChatDialog();
-    status.textContent = "已提交；对话窗口已打开，回复和待确认操作会同步到本页。";
+    if (!showPracticeCandidates) {
+      openWorkflowChatDialog();
+      status.textContent = "已提交；对话窗口已打开，回复和待确认操作会同步到本页。";
+    }
+  }
+  function finishPracticeCandidates(session, succeeded) {
+    if (!session || String(session.id || "") !== String(state.currentSessionId || "")) return;
+    const status = $("planPageStatus");
+    if (!succeeded) {
+      setText(status, "项目准备失败。请查看错误信息后重试。");
+    } else if (session.pending || sessionTurnBlocked(session)) {
+      setText(status, "项目准备尚未完成。请处理当前待确认操作或恢复工具队列。");
+    } else if (!projectCandidates().length) {
+      setText(status, "本次未找到可展示的候选项目，可以调整筛选条件后重试。");
+    } else {
+      setText(status, "候选项目已就绪，可在“Agent 实操”选择。");
+      if (state.pageView && state.selectedStep === "plan" && !state.workflowChat.open) selectWorkflowStep("practice");
+    }
+  }
+  function profilePathPickerBridge(kind) {
+    const nativeApi = window.pywebview && window.pywebview.api;
+    if (!nativeApi) return null;
+    const method = kind === "folder" ? "pick_local_folder" : "pick_local_file";
+    const picker = nativeApi[method];
+    return typeof picker === "function" ? { api: nativeApi, picker } : null;
+  }
+  function profilePathPickerResult(payload) {
+    if (typeof payload === "string") {
+      const path = payload.trim();
+      return path ? { kind: "selected", path } : { kind: "cancelled" };
+    }
+    if (!payload || typeof payload !== "object") return { kind: "cancelled" };
+    const error = String(payload.error || payload.message || "").trim();
+    if (payload.ok === false || error) return { kind: "error", error: error || "文件或文件夹选择失败。" };
+    const path = String(payload.path || payload.selected_path || payload.source_path || payload.file || payload.folder || "").trim();
+    if (path && payload.selected !== false) return { kind: "selected", path };
+    if (payload.cancelled === true || payload.canceled === true || payload.selected === false || payload.ok === true) return { kind: "cancelled" };
+    return { kind: "cancelled" };
+  }
+  function setProfileLocalStatus(message, kind = "") {
+    const status = $("profileLocalStatus");
+    if (!status) return;
+    status.className = `page-form-hint profile-local-status${kind ? ` ${kind}` : ""}`;
+    setText(status, message);
+  }
+  function profileLocalAttachments(payload) {
+    const imported = Array.isArray(payload && payload.imported) ? payload.imported : [];
+    return imported.map((item) => ({
+      name: String(typeof item === "string" ? item : item && (item.name || item.path) || ""),
+      path: String(typeof item === "string" ? item : item && (item.path || item.workspace_path || item.workspacePath) || ""),
+      sourcePath: String(item && (item.source_path || item.sourcePath || item.original_path || item.originalPath) || ""),
+      mediaType: String(item && (item.media_type || item.mediaType) || "")
+    })).filter((item) => item.path);
+  }
+  async function importProfileLocalPath(path, sessionId, serial) {
+    const payload = await request("/imports/local", { method: "POST", body: { path } });
+    if (String(state.currentSessionId || "new") !== String(sessionId || "new") || profileLocalPickerSerial !== serial || profileTab !== "local_log") return false;
+    const imported = profileLocalAttachments(payload);
+    const skipped = Array.isArray(payload && payload.skipped) ? payload.skipped : [];
+    const summary = localImportSummary(payload, imported.length, skipped);
+    if (!imported.length) throw new Error(`${summary}。没有可读取的日志或笔记文件。`);
+    profileLocalImported = [...profileLocalImported, ...imported];
+    profileLocalFiles = [];
+    profileLocalPath = path;
+    renderProfileLocalFiles();
+    setProfileLocalStatus(`${summary}；已加入本地日志材料。`, "success");
+    return true;
+  }
+  function openProfileLocalBrowserPicker(kind) {
+    const input = $(kind === "folder" ? "profileLocalFolderPicker" : "profileLocalFilePicker");
+    if (!input) return false;
+    input.click();
+    setProfileLocalStatus("请选择文件或文件夹；选择后点击“整理并更新技能档案”。");
+    return true;
+  }
+  function handleProfileLocalBrowserFiles(files) {
+    const rawFiles = Array.from(files || []).filter(Boolean);
+    if (!rawFiles.length) { setProfileLocalStatus("已取消选择。"); return; }
+    const selection = profileLocalBrowserSelection(rawFiles);
+    const selected = selection.accepted;
+    profileLocalImported = [];
+    profileLocalPath = "";
+    profileLocalFiles = selected;
+    renderProfileLocalFiles();
+    const skippedText = selection.skipped.length ? `，已跳过 ${selection.skipped.length} 个不符合条件的文件` : "";
+    if (!selected.length) {
+      setProfileLocalStatus(`没有可读取的本地日志或笔记文件${skippedText}。`, "error");
+      return;
+    }
+    setProfileLocalStatus(`已选择 ${selected.length} 个本地日志或笔记文件${skippedText}；点击“整理并更新技能档案”后上传读取。`, "success");
+  }
+  async function pickProfileLocalPath(kind) {
+    if (profileLocalPickerBusy || pageSubmitting) return;
+    const bridge = profilePathPickerBridge(kind);
+    if (!bridge) {
+      openProfileLocalBrowserPicker(kind);
+      return;
+    }
+    const sessionId = String(state.currentSessionId || "new");
+    const serial = ++profileLocalPickerSerial;
+    profileLocalPickerBusy = true;
+    setProfileLocalStatus(`正在打开${kind === "folder" ? "文件夹" : "文件"}选择…`, "loading");
+    try {
+      const initialPath = String(profileLocalPath || "").trim();
+      const payload = await Promise.resolve(bridge.picker.call(bridge.api, initialPath));
+      if (serial !== profileLocalPickerSerial || String(state.currentSessionId || "new") !== sessionId || profileTab !== "local_log") return;
+      const result = profilePathPickerResult(payload);
+      if (result.kind === "error") { setProfileLocalStatus(result.error, "error"); return; }
+      if (result.kind !== "selected") { setProfileLocalStatus("已取消选择。", ""); return; }
+      profileLocalPath = result.path;
+      renderProfileLocalFiles();
+      await importProfileLocalPath(result.path, sessionId, serial);
+    } catch (error) {
+      if (serial === profileLocalPickerSerial && String(state.currentSessionId || "new") === sessionId) setProfileLocalStatus(error?.message || "选择或导入失败。", "error");
+    } finally {
+      if (serial === profileLocalPickerSerial) profileLocalPickerBusy = false;
+    }
   }
   async function submitProfilePage(event) {
     event.preventDefault(); if (pageSubmitting) return;
     let id = state.currentSessionId;
-    const tab = profileTab, files = [...profileFiles];
-    const source = $("profileSource").value;
-    const materialText = $("profileText").value, materialPath = $("profilePath").value.trim(), materialAnswer = $("profileAnswer").value.trim();
+    const tab = normalizeProfileTab(profileTab), source = profileSourceForTab(tab);
+    const inputMode = profileInputMode;
+    const files = [...profileFiles], resumeFiles = [...profileResumeFiles], localFiles = [...profileLocalFiles], localImported = profileLocalImported.map((item) => ({ ...item }));
+    const materialText = String($("profileText")?.value || "");
+    const localPath = String(profileLocalPath || $("profileLocalPath")?.value || "").trim();
     let text = "", attachments = [];
     const status = $("profileImportStatus");
+    if (tab === "interview") {
+      setText(status, "正在打开专用技能访谈窗口…");
+      const opened = await openInterviewWindow();
+      setText(status, opened ? "访谈已在专用窗口中打开。" : "无法打开访谈窗口，请检查浏览器是否拦截了弹窗。", opened ? "success" : "error");
+      return;
+    }
     pageSubmitting = true; $("profileImportSubmit").disabled = true;
     try {
       if (state.loadingSession || sessionTurnBlocked(state.currentSession) || state.currentSession?.pending) throw new Error("请先完成当前操作或点击“继续执行工具队列”。");
-      if (tab === "text" && !materialText.trim()) throw new Error("请填写技能材料。");
-      if (tab === "documents" && !files.length) throw new Error("请先选择文档。");
-      if (tab === "obsidian" && !materialPath) throw new Error("请填写本地路径。");
+      if (tab === "self_report" && inputMode === "text" && !materialText.trim()) throw new Error("请填写技能自述。");
+      if (tab === "self_report" && inputMode === "document" && !files.length) throw new Error("请先选择技能自述文档。");
+      if (tab === "resume" && !resumeFiles.length) throw new Error("请先选择简历。");
+      if (tab === "local_log" && !localFiles.length && !localImported.length) throw new Error("请先选择本地日志文件或文件夹。");
       if (!id) {
         id = await createSession();
         if (!id) throw new Error("无法创建岗位会话，请重试。");
         if (String(state.currentSessionId) !== String(id)) throw new Error("会话已切换，输入已保留，请在原会话重试。");
-        $("profileText").value = materialText; $("profilePath").value = materialPath; $("profileAnswer").value = materialAnswer; $("profileSource").value = source; profileFiles = files; setProfileTab(tab); renderProfileFiles();
+        $("profileText").value = materialText;
+        profileInputMode = inputMode;
+        profileFiles = files;
+        profileResumeFiles = resumeFiles;
+        profileLocalFiles = localFiles;
+        profileLocalImported = localImported;
+        profileLocalPath = localPath;
+        setProfileTab(tab);
+        setProfileInputMode(inputMode);
+        renderProfileFiles(); renderProfileResumeFiles(); renderProfileLocalFiles();
       }
-      if (tab === "text") text = materialText;
-      if (tab === "documents") { if (!files.length) throw new Error("请先选择文档。"); for (const file of files) attachments.push(await uploadOne(file)); text = "请读取本条消息附带的技能材料。"; }
-      if (tab === "obsidian") {
-        const path = materialPath; if (!path) throw new Error("请填写本地路径。");
-        const payload = await request("/imports/local", { method: "POST", body: { path } });
-        attachments = (payload.imported || []).map((item) => ({ path: typeof item === "string" ? item : item.path, name: typeof item === "string" ? item : item.path, mediaType: item.media_type || item.mediaType || "" })).filter((item) => item.path);
-        if (!attachments.length) throw new Error("没有导入可读取的材料，请检查路径和文件类型。"); text = "请读取本条消息附带的本地笔记 / Obsidian 材料。";
+      if (tab === "self_report" && inputMode === "text") text = materialText;
+      if (tab === "self_report" && inputMode === "document") {
+        for (const file of files) attachments.push(await uploadOne(file));
+        attachments = attachments.filter(Boolean);
+        if (!attachments.length) throw new Error("技能自述文档上传失败，请重试。");
+        text = "请读取本条消息附带的技能自述文档。";
       }
-      if (tab === "interview") text = materialAnswer || "请开始技能访谈，每次只问一个问题，了解我的项目经历、技能熟练度和事实证据。";
+      if (tab === "resume") {
+        for (const file of resumeFiles) attachments.push(await uploadOne(file));
+        attachments = attachments.filter(Boolean);
+        if (!attachments.length) throw new Error("简历上传失败，请重试。");
+        text = "请读取本条消息附带的简历。";
+      }
+      if (tab === "local_log") {
+        attachments = [...localImported];
+        for (const file of localFiles) attachments.push(await uploadOne(file));
+        attachments = attachments.filter(Boolean);
+        if (!attachments.length) throw new Error("没有可读取的本地日志文件，请检查选择内容。");
+        text = localPath ? `请读取本条消息附带的本地日志材料（来源路径：${localPath}）。` : "请读取本条消息附带的本地日志材料。";
+      }
       await sendPageAction(`本次只处理技能档案阶段。材料来源：${source}。请整理并保存技能、熟练程度和事实证据；缺乏证据的内容列入待澄清问题，不要推测，不要自动生成计划。\n${text}`, status, attachments, id);
     } catch (error) { status.textContent = error.message; }
     finally { pageSubmitting = false; renderWorkflowPage(); }
@@ -2685,8 +3527,8 @@
       ? "调用 search_projects 时启用 include_paper_implementations=true，优先寻找与当前岗位差距相关、同时有可核验论文和开源仓库证据的高影响力项目；先读取 README、引用文件和公开论文来源，再只使用真实论文/DOI、仓库链接以及可核验的公开引用或 star 等指标，并把论文依据保留为 paper_evidence。无法核验时明确标注未知，绝不编造影响力、引用数、star 数或项目结果。"
       : "调用 search_projects 时使用 include_paper_implementations=false；不额外优先论文或高影响力开源项目，但所有候选仍必须保留真实仓库链接并明确可核验依据，不能编造影响力或项目结果。";
     pageSubmitting = true;
+    let id = String(state.currentSessionId || "");
     try {
-      let id = String(state.currentSessionId || "");
       if (!id) {
         id = await createSession();
         if (!id) throw new Error("无法创建岗位会话，请重试。");
@@ -2702,10 +3544,12 @@
         renderPlanProjectResources();
       }
       rememberProjectFilter(id, { minStars: String(stars), include: includeKeywords, exclude: excludeKeywords, other: otherRequirements, paperProjects, rerank: rerankProjects });
-      await sendPageAction(`请基于当前已确认 JD 与技能档案生成差距分析、分阶段学习计划（含任务、检查点），并搜索真实 GitHub 复现项目。包含关键词：${includeKeywords || "不限"}；排除关键词：${excludeKeywords || "无"}；最低 star 数：${stars}；其他要求：${otherRequirements || "无"}。${rerankProjects ? "由你比较候选项目与我的差距并说明排序理由。" : "按搜索匹配度展示候选项目。"}${paperSearchText}\n${projectSourceText}\n保存本次项目筛选偏好（尤其是其他要求），后续重新搜索和计划调整继续遵守；等待我选择项目，不要自动开始实操。`, status, projectFiles, id, { step: "plan", summary: "生成差距分析、学习计划和项目候选", project_filter: projectFilterActionContext({ minStars: String(stars), include: includeKeywords, exclude: excludeKeywords, other: otherRequirements, paperProjects, rerank: rerankProjects }) });
+      const action = { step: "plan", summary: "生成差距分析、学习计划和项目候选", project_filter: projectFilterActionContext({ minStars: String(stars), include: includeKeywords, exclude: excludeKeywords, other: otherRequirements, paperProjects, rerank: rerankProjects }) };
+      const text = `请基于当前已确认 JD 与技能档案生成差距分析、分阶段学习计划（含任务、检查点），并搜索真实 GitHub 复现项目。包含关键词：${includeKeywords || "不限"}；排除关键词：${excludeKeywords || "无"}；最低 star 数：${stars}；其他要求：${otherRequirements || "无"}。${rerankProjects ? "由你比较候选项目与我的差距并说明排序理由。" : "按搜索匹配度展示候选项目。"}${paperSearchText}\n${projectSourceText}\n保存本次项目筛选偏好（尤其是其他要求），后续重新搜索和计划调整继续遵守。候选保存后提示我到“Agent 实操”页面点击选择，等待我操作；不要要求在对话中回复项目序号或自动开始实操。`;
+      await sendPageAction(text, status, projectFiles, id, action, { showPracticeCandidates: true });
       projectFilterDrafts.delete(id);
     }
-    catch (error) { status.textContent = error.message; }
+    catch (error) { if (!id || String(state.currentSessionId) === id) status.textContent = error.message; }
     finally { pageSubmitting = false; renderWorkflowPage(); }
   }
 
@@ -2832,7 +3676,19 @@
 
   function projectIdentity(project) {
     if (!project || typeof project !== "object") return "";
-    return String(project.project_key || project.projectKey || project.id || project.full_name || project.fullName || project.repository || project.name || project.html_url || project.url || "").trim();
+    return String(project.project_key || project.identity_key || project.projectKey || project.full_name || project.html_url || project.id || project.name || project.fullName || project.repository || project.url || "").trim();
+  }
+
+  function projectCandidates(data = workflowData()) {
+    const projects = new Map();
+    for (const rows of [data.repos, data.user_projects]) {
+      if (!Array.isArray(rows)) continue;
+      for (const project of rows) {
+        const key = projectIdentity(project);
+        if (key && !projects.has(key)) projects.set(key, project);
+      }
+    }
+    return [...projects.values()];
   }
 
   function projectSourceMeta(project) {
@@ -2990,19 +3846,10 @@
     return `${item.progress.length} 条记录${note ? ` · ${note}` : ""}`;
   }
 
-  function requestProjectSwitch(project) {
-    const id = projectIdentity(project);
-    if (!id || !state.currentSessionId) return;
-    const name = projectDisplayTitle(project);
-    const summary = `切换练习项目：${name}`;
-    const text = `${summary}。候选 project_key=${id}。请调用 select_project，并使用这个 project_key 恢复已有进度，返回当前项目状态。`;
-    selectWorkflowStep("practice");
-    sendTrustedWorkflowAction(text, "practice", summary, { project_key: id }, { openChat: false });
-  }
-
   function renderProjectHistory(root, data) {
     const entries = projectHistoryEntries(data);
     if (!entries.length) return;
+    const sessionId = String(state.currentSessionId || "");
     const card = document.createElement("section");
     card.className = "job-card project-history-card";
     const head = document.createElement("div");
@@ -3036,9 +3883,9 @@
       action.type = "button";
       action.className = item.isCurrent ? "project-history-current" : "job-card-action";
       action.textContent = item.isCurrent ? "当前" : "切换并继续";
-      action.disabled = item.isCurrent;
-       action.setAttribute("aria-label", item.isCurrent ? `当前项目 ${name.textContent}` : `切换到项目 ${name.textContent}`);
-      if (!item.isCurrent) action.addEventListener("click", () => requestProjectSwitch(item.project));
+      action.disabled = item.isCurrent || projectSelectionBlocked();
+      action.setAttribute("aria-label", item.isCurrent ? `当前项目 ${name.textContent}` : `切换到项目 ${name.textContent}`);
+      if (!item.isCurrent) action.addEventListener("click", () => selectPracticeProject(item.project, sessionId));
       row.appendChild(action);
       list.appendChild(row);
     });
@@ -3297,14 +4144,14 @@
 
   function closeJobEditor() {
     if (!state.jobEditor.open) return;
-    if ((state.voice.active || state.voice.stopping) && state.voice.target && $("jobEditBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target && $("jobEditBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
     state.jobEditor.serial += 1;
     state.jobEditor.open = false;
     state.jobEditor.value = null;
     state.jobEditor.sessionId = "";
     state.jobEditor.busy = false;
     $("jobEditBackdrop").classList.add("hidden");
-    if (!state.modelSettings.open && !state.newSession.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.newSession.open && !state.sessionEditor.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
     const previous = state.jobEditor.previousFocus;
     state.jobEditor.previousFocus = null;
     if (previous && typeof previous.focus === "function" && document.contains(previous)) previous.focus();
@@ -3422,6 +4269,7 @@
   }
 
   function canPrepareJobAction() {
+    if (state.loadingSession) return false;
     if (state.currentSession?.pending) { toast("请先批准或拒绝当前操作。", ""); return false; }
     if (sessionTurnBlocked(state.currentSession)) {
       toast(sessionHasQueue(state.currentSession) ? "上一轮工具队列待恢复，请先点击“继续执行工具队列”。" : "当前会话仍在运行，请等待完成。", "");
@@ -3495,15 +4343,29 @@
     });
   }
 
-  function startSelectedProject(repo) {
-    const projectKey = projectIdentity(repo);
-    if (!projectKey) return;
-    const name = projectDisplayTitle(repo);
-    if (!name) return;
-    const summary = `选用练习项目：${name}`;
-    const text = `${summary}。候选 project_key=${projectKey}。请调用 select_project 使用这个 project_key 记录当前项目，先给出今天的上手步骤，等待我按步骤实践。`;
-    selectWorkflowStep("practice");
-    sendTrustedWorkflowAction(text, "practice", summary, { project_key: projectKey }, { openChat: false });
+  function projectSelectionBlocked() {
+    return Boolean(pageSubmitting || state.loadingSession || state.currentSession?.pending || sessionTurnBlocked(state.currentSession));
+  }
+
+  async function selectPracticeProject(project, sessionId) {
+    const projectKey = projectIdentity(project);
+    if (!projectKey || !sessionId || String(state.currentSessionId || "") !== sessionId || projectSelectionBlocked()) return;
+    pageSubmitting = true;
+    renderAll();
+    try {
+      const payload = await request(`/sessions/${encodeURIComponent(sessionId)}/practice/select`, { method: "POST", body: { project_key: projectKey } });
+      if (String(state.currentSessionId || "") !== sessionId || state.loadingSession) return;
+      const session = unwrapSession(payload);
+      if (!session || String(session.id || "") !== sessionId) throw new Error("未收到选定项目的会话记录，请刷新后重试。");
+      state.currentSession = session;
+      if (state.pageView && state.selectedStep === "plan" && !state.workflowChat.open) selectWorkflowStep("practice");
+      await refreshSessions();
+    } catch (error) {
+      if (String(state.currentSessionId || "") === sessionId) toast(error.message || "选择项目失败，请重试。", "error");
+    } finally {
+      pageSubmitting = false;
+      renderAll();
+    }
   }
 
   function clarificationQuestionKey(question) {
@@ -3652,10 +4514,10 @@
 
   function closeClarificationModal({ restore = true } = {}) {
     if (!state.clarification.open) return;
-    if ((state.voice.active || state.voice.stopping) && state.voice.target && $("clarificationBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target && $("clarificationBackdrop").contains(state.voice.target)) stopVoiceInput({ cancel: true });
     state.clarification.open = false;
     $("clarificationBackdrop").classList.add("hidden");
-    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.sessionEditor.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
     const previous = state.clarification.previousFocus;
     state.clarification.previousFocus = null;
     if (restore) restoreSidebarAwareFocus(previous);
@@ -3737,7 +4599,214 @@
     }
   }
 
-  const JD_FIELDS = ["jdSourceUrl", "jdSourceText", "jdPlatform", "jdQuery", "jdImageNote"];
+  const JD_FIELDS = ["jdSourceUrl", "jdSourceText", "jdQuery", "jdImageNote"];
+
+  function jdSourceUrls(value) {
+    return [...new Set(String(value || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean))];
+  }
+
+  function jdFileBytes(file) {
+    const size = Number(file && file.size);
+    return Number.isFinite(size) && size >= 0 ? size : 0;
+  }
+
+  function jdFilesTotalBytes(files) {
+    return (Array.isArray(files) ? files : []).reduce((total, file) => total + jdFileBytes(file), 0);
+  }
+
+  function jdImportContextMatches(sessionId, serial = null) {
+    const id = String(sessionId || "");
+    return Boolean(id)
+      && String(state.currentSessionId || "") === id
+      && String(state.jdImport.sessionId || "") === id
+      && (serial === null || state.jdImport.requestSerial === serial);
+  }
+
+  function jdWebSearchUrl(query) {
+    const text = String(query == null ? "" : query).trim();
+    if (!text) return "";
+    // Keep the destination fixed to the generic public-web search target.
+    // User text is data only and must never be allowed to alter the host or
+    // path.
+    return `${JD_PUBLIC_WEB_SEARCH_TARGET.base}${encodeURIComponent(text)}`;
+  }
+
+  function readJdSearchContexts() {
+    try {
+      const raw = window.localStorage.getItem(JD_SEARCH_CONTEXT_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function readJdSearchContext(sessionId) {
+    const id = String(sessionId || "").trim();
+    if (!id) return { query: "", platform: JD_SEARCH_PLATFORM };
+    const value = readJdSearchContexts()[id];
+    if (!value || typeof value !== "object") return { query: "", platform: JD_SEARCH_PLATFORM };
+    const query = String(value.query || "").trim();
+    return query ? { query, platform: JD_SEARCH_PLATFORM } : { query: "", platform: JD_SEARCH_PLATFORM };
+  }
+
+  function rememberJdSearchContext(sessionId, query) {
+    const id = String(sessionId || "").trim();
+    const text = String(query || "").trim();
+    if (!id || !text) return;
+    try {
+      const contexts = readJdSearchContexts();
+      contexts[id] = { query: text.slice(0, 4096), platform: JD_SEARCH_PLATFORM };
+      const keys = Object.keys(contexts);
+      keys.slice(0, Math.max(0, keys.length - 24)).forEach((key) => { delete contexts[key]; });
+      window.localStorage.setItem(JD_SEARCH_CONTEXT_STORAGE_KEY, JSON.stringify(contexts));
+    } catch (_error) {
+      // The page remains usable when browser storage is disabled.
+    }
+  }
+
+  function jdImportSessionSearchMetadata(session = state.currentSession) {
+    const messages = Array.isArray(session?.messages) ? [...session.messages].reverse() : [];
+    for (const message of messages) {
+      const metadata = message && message.metadata && typeof message.metadata === "object" ? message.metadata : null;
+      if (!metadata || String(metadata.kind || "").trim().toLowerCase() !== "jd_import") continue;
+      if (String(metadata.mode || "").trim().toLowerCase() !== "search") continue;
+      return metadata;
+    }
+    const lastResult = session && session.last_result && typeof session.last_result === "object" ? session.last_result : null;
+    const metadata = lastResult && lastResult.metadata && typeof lastResult.metadata === "object" ? lastResult.metadata : null;
+    return metadata && String(metadata.mode || "").trim().toLowerCase() === "search" ? metadata : null;
+  }
+
+  function jdImportSearchDetails(result = null) {
+    const root = jdImportRecord(result);
+    const metadata = jdImportRecord(root.metadata);
+    const searchRecords = [
+      root.search,
+      root.search_result,
+      root.searchResult,
+      root.job_search,
+      root.jobSearch,
+      metadata.search,
+      metadata.search_result,
+      metadata.searchResult,
+      metadata.job_search,
+    ].filter((item) => item && typeof item === "object" && !Array.isArray(item));
+    const sessionMetadata = jdImportSessionSearchMetadata();
+    const records = [root, metadata, ...searchRecords, sessionMetadata].filter(Boolean);
+    const readText = (keys) => {
+      for (const record of records) {
+        for (const key of keys) {
+          const value = String(record?.[key] == null ? "" : record[key]).trim();
+          if (value) return value;
+        }
+      }
+      return "";
+    };
+    const currentId = String(state.currentSessionId || "");
+    const draft = currentId && String(state.jdImport.sessionId || "") === currentId
+      ? (state.jdImport.drafts.get(currentId) || {})
+      : {};
+    const draftFields = draft.fields && typeof draft.fields === "object" ? draft.fields : {};
+    const stored = readJdSearchContext(currentId);
+    const query = readText(["query", "search_query", "searchQuery", "job_query"])
+      || String(state.jdImport.sessionId === currentId ? state.jdImport.searchQuery : "").trim()
+      || String(draftFields.jdQuery || "").trim()
+      || stored.query;
+    let resultCount = null;
+    let sawResults = false;
+    for (const record of records) {
+      for (const key of ["results", "items", "rows", "jobs"]) {
+        if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+        sawResults = true;
+        const value = record[key];
+        if (Array.isArray(value)) resultCount = Math.max(Number(resultCount || 0), value.length);
+      }
+      for (const key of ["valid_count", "validCount", "result_count", "resultCount", "count", "total"]) {
+        const value = Number(record[key]);
+        if (Number.isFinite(value) && value >= 0) resultCount = Math.max(Number(resultCount || 0), Math.floor(value));
+      }
+    }
+    const explicitEmpty = records.some((record) => record.ok === false || record.empty === true || record.no_results === true || record.noResults === true);
+    const message = readText(["message", "reason", "error", "failure_reason", "failureReason"]);
+    const progress = jdImportProgress(result);
+    if (progress) resultCount = Math.max(Number(resultCount || 0), Number(progress.candidate_count || 0));
+    return {
+      query,
+      // Keep the API contract explicit for older services while making the
+      // UI and recovery flow independent of any one recruitment platform.
+      platform: JD_SEARCH_PLATFORM,
+      platformLabel: JD_PUBLIC_WEB_SEARCH_TARGET.label,
+      resultCount: resultCount == null ? 0 : resultCount,
+      readableCount: progress ? Number(progress.readable_count || 0) : 0,
+      failedCount: progress ? Number(progress.failed_count || 0) : 0,
+      progress,
+      sawResults,
+      explicitEmpty,
+      message,
+      sessionId: currentId,
+    };
+  }
+
+  function jdImportSearchFailure(result) {
+    if (!jdImportSearchMode(result)) return null;
+    const details = jdImportSearchDetails(result);
+    const sourceUrls = jdImportSourceUrls(result);
+    const samples = jdImportSourceCount(result);
+    const progress = details.progress || jdImportProgress(result);
+    const resultCount = Math.max(samples, Number(details.resultCount || 0), Number(progress?.candidate_count || 0));
+    const jd = jdImportRecord(jdImportRecord(result).jd);
+    const hasStructuredSampleCount = Object.prototype.hasOwnProperty.call(jd, "sample_count");
+    // A search payload with an explicit zero effective sample count is a
+    // failed/empty search even when the backend retained attempted URLs.
+    // Never render a blank JD card for that state.  If an older payload omits
+    // sample_count, retained public URLs remain useful evidence.
+    if ((hasStructuredSampleCount && samples > 0) || (!hasStructuredSampleCount && sourceUrls.length && Number(progress?.readable_count || 0) > 0)) return null;
+    const query = details.query;
+    const queryText = query ? `“${query}”` : "当前岗位";
+    const candidateText = resultCount > 0 ? `已找到 ${resultCount} 个候选公开来源，但没有读取到可核实的独立岗位原文` : "公开网页搜索没有返回可核实的岗位链接";
+    const failedText = Number(progress?.failed_count || 0) > 0 ? `（其中 ${Number(progress.failed_count)} 个来源读取失败）` : "";
+    return {
+      ...details,
+      query,
+      message: `${candidateText}${failedText}（检索词：${queryText}）。这里只查询公开网页，不会自动登录或读取登录页；搜索摘要不作为 JD 证据，这不表示没有符合条件的岗位。`,
+      nextStep: "请打开公开网页搜索查看结果，再带回多个岗位链接、正文或截图。",
+    };
+  }
+
+  function openJdWebSearch(failure) {
+    const sessionId = String(failure?.sessionId || "");
+    if (!sessionId || sessionId !== String(state.currentSessionId || "")) {
+      toast("会话已切换，请回到原会话打开公开网页搜索。", "error");
+      return false;
+    }
+    const url = jdWebSearchUrl(failure.query);
+    if (!url) {
+      toast("当前会话缺少岗位检索词，请回到公开网页搜索输入框重试。", "error");
+      return false;
+    }
+    // There is no generic native external-URL bridge in the packaged
+    // launcher.  Use the browser opener with the fixed, encoded URL instead
+    // of guessing an API method that may not exist in a particular runtime.
+    return openJdWebSearchBrowser(url);
+  }
+
+  function openJdWebSearchBrowser(url) {
+    if (!url || typeof window.open !== "function") {
+      toast("无法打开公开网页搜索，请复制岗位名称到浏览器中查看。", "error");
+      return false;
+    }
+    try {
+      // With noopener, browsers and pywebview are allowed to return null even
+      // when navigation succeeded.  Do not report that normal return value as
+      // a popup failure; only an actual exception is actionable here.
+      window.open(url, "_blank", "noopener,noreferrer");
+      return true;
+    } catch (_error) {
+      toast("无法打开公开网页搜索，请复制岗位名称到浏览器中查看。", "error");
+      return false;
+    }
+  }
 
   function jdDraft() {
     const key = state.jdImport.sessionId;
@@ -3748,6 +4817,11 @@
   function saveJdDraft() {
     if (!state.jdImport.open) return;
     JD_FIELDS.forEach((id) => { jdDraft().fields[id] = $(id).value; });
+    const id = String(state.jdImport.sessionId || "");
+    if (id && id === String(state.currentSessionId || "") && jdDraft().mode === "search") {
+      state.jdImport.searchQuery = String(jdDraft().fields.jdQuery || "").trim();
+      state.jdImport.searchPlatform = JD_SEARCH_PLATFORM;
+    }
   }
 
   function setJdMode(mode) {
@@ -3757,17 +4831,29 @@
     $("jdSourcePanel").classList.toggle("hidden", mode !== "source");
     $("jdSearchPanel").classList.toggle("hidden", mode !== "search");
     $("jdImagePanel").classList.toggle("hidden", mode !== "image");
+    const submit = $("jdImportSubmit");
+    if (submit && !state.jdImport.busy) submit.textContent = mode === "search" ? "搜索并汇总同类 JD" : "交给 AI 整理 JD";
   }
 
   function renderJdFiles() {
+    const draft = jdDraft();
+    const files = Array.isArray(draft.files) ? draft.files : [];
     const list = $("jdImageList"); list.replaceChildren();
-    jdDraft().files.forEach((file, index) => {
+    files.forEach((file, index) => {
       const row = document.createElement("div"); row.className = "jd-file-row";
-      const name = document.createElement("span"); name.textContent = file.name || "粘贴截图";
+      row.dataset.jdFileRow = String(index);
+      const meta = document.createElement("div"); meta.className = "jd-file-row-meta";
+      const name = document.createElement("span"); name.className = "jd-file-name"; name.textContent = file.name || "粘贴截图";
+      const size = document.createElement("span"); size.className = "jd-file-size"; size.textContent = formatBytes(jdFileBytes(file));
+      meta.append(name, size);
       const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "移除"; remove.disabled = state.jdImport.busy;
-      remove.addEventListener("click", () => { jdDraft().files.splice(index, 1); renderJdFiles(); });
-      row.append(name, remove); list.appendChild(row);
+      remove.setAttribute("aria-label", `移除岗位截图 ${file.name || index + 1}`);
+      remove.addEventListener("click", () => { jdDraft().files.splice(index, 1); saveJdDraft(); renderJdFiles(); });
+      row.append(meta, remove); list.appendChild(row);
     });
+    const total = jdFilesTotalBytes(files);
+    const summary = $("jdImageSummary");
+    if (summary) setText(summary, `已选 ${files.length}/${MAX_IMAGE_ATTACHMENTS} 张，${formatBytes(total)}/${MAX_IMAGE_TOTAL_BYTES / (1024 * 1024)} MiB；每张不超过 ${MAX_UPLOAD_BYTES / (1024 * 1024)} MiB。可连续选择或粘贴，图片会累积到当前会话。`);
   }
 
   async function openJdImport() {
@@ -3784,12 +4870,787 @@
   function addJdFiles(files) {
     if (state.jdImport.busy) return;
     const candidates = Array.from(files || []);
-    const valid = candidates.filter((file) => isSupportedImageAttachment({ name: file.name, mediaType: file.type }) && file.size <= MAX_UPLOAD_BYTES);
-    if (valid.length !== candidates.length) setText($("jdImportStatus"), "仅支持每张不超过 10 MiB 的 PNG、JPEG、GIF 或 WebP 图片。");
-    const available = Math.max(0, 10 - jdDraft().files.length);
-    jdDraft().files.push(...valid.slice(0, available));
-    if (valid.length > available) setText($("jdImportStatus"), "一次最多发送 10 张岗位截图，多出的图片未加入。请分批发送或移除后重新选择。");
+    if (!candidates.length) return;
+    const draft = jdDraft();
+    const existing = Array.isArray(draft.files) ? draft.files : (draft.files = []);
+    let total = jdFilesTotalBytes(existing);
+    const available = Math.max(0, MAX_IMAGE_ATTACHMENTS - existing.length);
+    const accepted = [];
+    const rejected = [];
+    candidates.forEach((file) => {
+      const candidate = { name: file && file.name, mediaType: file && file.type };
+      const size = jdFileBytes(file);
+      if (!isSupportedImageAttachment(candidate)) rejected.push(`${file?.name || "图片"} 格式不支持`);
+      else if (size > MAX_UPLOAD_BYTES) rejected.push(`${file?.name || "图片"} 超过 ${MAX_UPLOAD_BYTES / (1024 * 1024)} MiB`);
+      else if (accepted.length >= available) rejected.push(`最多 ${MAX_IMAGE_ATTACHMENTS} 张`);
+      else if (total + size > MAX_IMAGE_TOTAL_BYTES) rejected.push(`图片总大小不能超过 ${MAX_IMAGE_TOTAL_BYTES / (1024 * 1024)} MiB`);
+      else { accepted.push(file); total += size; }
+    });
+    existing.push(...accepted);
+    if (rejected.length) {
+      const detail = [...new Set(rejected)].slice(0, 3).join("；");
+      setText($("jdImportStatus"), `${detail}${rejected.length > 3 ? "；其余图片未加入" : "。"}`);
+    }
     renderJdFiles();
+  }
+
+  function setJdBackgroundStatus(message, kind = "") {
+    state.jdImport.status = String(message || "");
+    state.jdImport.statusCode = kind === "loading" ? "running" : kind === "error" ? "failed" : kind === "warning" ? "warning" : kind === "success" ? "completed" : "";
+    state.jdImport.statusKind = String(kind || "");
+    const status = $("jdImportStatus");
+    if (status) setText(status, state.jdImport.status);
+    renderJdBackgroundStatus();
+  }
+
+  function jdImportResult(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    if (typeof payload === "string") return { message: payload };
+    if (typeof source.result === "string") return { message: source.result };
+    const result = source.result && typeof source.result === "object" ? source.result : source;
+    const nested = result.result && typeof result.result === "object" ? result.result : result;
+    return nested && typeof nested === "object" ? nested : {};
+  }
+
+  function jdImportRecord(value) {
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  function jdImportProgress(result = null, payload = null, { includeLiveState = true } = {}) {
+    const roots = [result, payload, includeLiveState ? state.jdImport.progress : null].filter((item) => item && typeof item === "object" && !Array.isArray(item));
+    const records = [];
+    const seen = new Set();
+    const visit = (value, depth = 0) => {
+      if (!value || typeof value !== "object" || Array.isArray(value) || depth > 3 || seen.has(value)) return;
+      seen.add(value); records.push(value);
+      ["progress", "metadata", "search", "search_result", "searchResult", "job_search", "jobSearch", "diagnostics", "comparison", "data", "result", "jd"].forEach((key) => visit(value[key], depth + 1));
+    };
+    roots.forEach((value) => visit(value));
+    const number = (keys) => {
+      let count = null;
+      for (const record of records) for (const key of keys) {
+        const value = Number(record[key]);
+        if (Number.isFinite(value) && value >= 0) count = Math.max(count == null ? 0 : count, Math.floor(value));
+      }
+      return count;
+    };
+    const listCount = (keys) => {
+      let count = null;
+      for (const record of records) for (const key of keys) if (Array.isArray(record[key])) count = Math.max(count || 0, record[key].length);
+      return count;
+    };
+    const sampleCount = number(["sample_count", "sampleCount"]);
+    const progressRecords = [];
+    const addProgress = (record) => {
+      if (!record || typeof record !== "object" || Array.isArray(record)) return;
+      const phaseValue = String(record.phase || "").trim().toLowerCase();
+      if (["searching", "reading", "synthesizing", "completed", "insufficient", "failed"].includes(phaseValue)) progressRecords.push(record);
+    };
+    const visitProgress = (record, depth = 0) => {
+      if (!record || typeof record !== "object" || Array.isArray(record) || depth > 3) return;
+      addProgress(record.progress);
+      addProgress(record);
+      visitProgress(record.result, depth + 1);
+    };
+    roots.slice(0, 2).forEach((root) => visitProgress(root));
+    if (includeLiveState) addProgress(state.jdImport.progress);
+    const isStructuredProgress = (record) => record && typeof record === "object" && !Array.isArray(record)
+      && ["searching", "reading", "synthesizing", "completed", "insufficient", "failed"].includes(String(record.phase || "").trim().toLowerCase());
+    const payloadRecord = jdImportRecord(payload);
+    const resultRecord = jdImportRecord(result);
+    const progressSource = [
+      payloadRecord.progress,
+      jdImportRecord(payloadRecord.result).progress,
+      jdImportRecord(jdImportRecord(payloadRecord.result).result).progress,
+      resultRecord.progress,
+      includeLiveState ? state.jdImport.progress : null,
+      ...progressRecords,
+    ].find(isStructuredProgress) || {};
+    const phase = String(progressSource.phase || "").trim().toLowerCase();
+    const status = String(progressSource.status || "").trim().toLowerCase();
+    const message = typeof progressSource.message === "string" ? progressSource.message.trim().replace(/[\r\n]+/g, " ").slice(0, 240) : "";
+    const progressNumber = (keys) => {
+      for (const key of keys) {
+        const value = Number(progressSource[key]);
+        if (Number.isFinite(value) && value >= 0) return Math.floor(value);
+      }
+      return null;
+    };
+    const hasStructuredProgress = Boolean(phase);
+    const candidateCount = progressNumber(["candidate_count", "candidateCount", "found_candidates", "foundCandidates", "candidate_sources", "candidateSources"])
+      ?? (hasStructuredProgress ? 0 : Math.max(number(["candidate_count", "candidateCount", "found_candidates", "foundCandidates", "candidate_sources", "candidateSources"]) || 0, listCount(["candidates", "candidate_urls", "candidateUrls", "results", "items", "rows", "jobs", "urls"]) || 0));
+    const readableCount = progressNumber(["readable_count", "readableCount", "readable_sources", "readableSources", "readable_samples", "readableSamples", "source_evidence_count", "sourceEvidenceCount", "actual_jd_count", "actualJdCount"])
+      ?? (hasStructuredProgress ? null : number(["readable_count", "readableCount", "readable_sources", "readableSources", "readable_samples", "readableSamples", "source_evidence_count", "sourceEvidenceCount", "actual_jd_count", "actualJdCount"]));
+    const fetchedCount = progressNumber(["fetched_count", "fetchedCount", "fetched_sources", "fetchedSources", "readable_fetches", "readableFetches", "fetch_successes", "fetchSuccesses"])
+      ?? (hasStructuredProgress ? 0 : number(["fetched_count", "fetchedCount", "fetched_sources", "fetchedSources", "readable_fetches", "readableFetches", "fetch_successes", "fetchSuccesses"]));
+    const failedCount = progressNumber(["failed_count", "failedCount", "failed_sources", "failedSources", "failed_fetches", "failedFetches", "fetch_failures", "fetchFailures"])
+      ?? (hasStructuredProgress ? 0 : number(["failed_count", "failedCount", "failed_sources", "failedSources", "failed_fetches", "failedFetches", "fetch_failures", "fetchFailures"]));
+    const searchRounds = progressNumber(["search_rounds", "searchRounds"]) ?? (hasStructuredProgress ? 0 : number(["search_rounds", "searchRounds"]));
+    const maxSearchRounds = progressNumber(["max_search_rounds", "maxSearchRounds"]) ?? (hasStructuredProgress ? 3 : number(["max_search_rounds", "maxSearchRounds"]));
+    if (!candidateCount && readableCount == null && failedCount == null && !phase && !message) return null;
+    return {
+      phase,
+      status,
+      message,
+      search_rounds: searchRounds == null ? 0 : searchRounds,
+      max_search_rounds: maxSearchRounds == null ? 3 : maxSearchRounds,
+      candidate_count: candidateCount,
+      readable_count: readableCount == null ? (sampleCount == null ? 0 : sampleCount) : readableCount,
+      fetched_count: fetchedCount == null ? 0 : fetchedCount,
+      failed_count: failedCount == null ? 0 : failedCount,
+      found_candidates: candidateCount,
+      readable_sources: readableCount == null ? (sampleCount == null ? 0 : sampleCount) : readableCount,
+      fetched_sources: fetchedCount == null ? 0 : fetchedCount,
+      failed_sources: failedCount == null ? 0 : failedCount,
+      candidate_target_min: number(["candidate_target_min", "candidateTargetMin"]) || 15,
+      candidate_target_max: number(["candidate_target_max", "candidateTargetMax"]) || 20,
+      sample_target: number(["sample_target", "sampleTarget"]) || 5,
+      minimum_readable: number(["minimum_readable", "minimumReadable"]) || 3,
+    };
+  }
+
+  function jdImportProgressText(progress) {
+    if (!progress || typeof progress !== "object") return "";
+    const candidates = Math.max(0, Number(progress.candidate_count ?? progress.found_candidates ?? 0) || 0);
+    const readable = Math.max(0, Number(progress.readable_count ?? progress.readable_sources ?? 0) || 0);
+    const fetched = Math.max(0, Number(progress.fetched_count ?? progress.fetched_sources ?? 0) || 0);
+    const failed = Math.max(0, Number(progress.failed_count ?? progress.failed_sources ?? 0) || 0);
+    const phase = String(progress.phase || "").trim().toLowerCase();
+    const phaseLabel = ({
+      searching: "正在检索",
+      reading: "正在核验",
+      synthesizing: "正在整理卡片",
+      completed: "核验完成",
+      insufficient: "样本不足",
+      failed: "处理未完成",
+    })[phase] || "正在处理";
+    const rounds = Math.max(0, Number(progress.search_rounds || 0) || 0);
+    const maxRounds = Math.max(1, Number(progress.max_search_rounds || 3) || 3);
+    return `${phaseLabel} · 检索 ${rounds}/${maxRounds} · 候选公开来源 ${candidates} · 已读取页面 ${fetched} · 已读取独立 JD ${readable} · 读取失败 ${failed}`;
+  }
+
+  function jdImportFailureMessage(mode = state.jdImport.mode) {
+    return mode === "search"
+      ? "岗位搜索与核验未能完成，请检查网络后重试；本次输入已保留。"
+      : "JD 整理未能完成，请检查输入后重试；本次输入已保留。";
+  }
+
+  function jdImportFailureDiagnostic(value) {
+    let text = String(value || "").trim();
+    if (!text) return "";
+    text = text.replace(/https?:\/\/[^\s<>"']+/gi, "[来源链接已隐藏]");
+    text = text.replace(/(bearer\s+)\S+/gi, "$1[已隐藏凭据]");
+    text = text.replace(/((?:api[_-]?key|token|secret|password|credential|authorization)\s*[:=]\s*)[^,;\s]+/gi, "$1[已隐藏凭据]");
+    return text.slice(0, 1200);
+  }
+
+  function jdImportProgressCard(progress) {
+    if (!progress || typeof progress !== "object") return null;
+    const card = document.createElement("section");
+    card.className = "jd-search-progress";
+    card.setAttribute("role", "status");
+    card.setAttribute("aria-live", "polite");
+    const heading = document.createElement("strong");
+    heading.textContent = "公开岗位核验进度";
+    card.appendChild(heading);
+    const detail = document.createElement("p");
+    detail.textContent = jdImportProgressText(progress);
+    card.appendChild(detail);
+    const note = document.createElement("small");
+    note.textContent = "候选来源只来自公开网页；只有读取到独立岗位原文的来源才会计入可读 JD，搜索摘要不作为证据。";
+    card.appendChild(note);
+    return card;
+  }
+
+  function jdImportLoadingLabel(status = "", result = null) {
+    const progress = state.jdImport.progress || jdImportProgress(result);
+    const phase = String(progress?.phase || "").trim().toLowerCase();
+    const statusCode = String(status || state.jdImport.statusCode || "").trim().toLowerCase();
+    const fetchingPhase = [
+      "fetch", "fetching", "fetch_url", "reading", "read", "synth", "synthesizing",
+      "aggregate", "aggregating", "compare", "comparing", "structure", "structuring", "parse", "parsing"
+    ].some((value) => phase === value || phase.includes(value));
+    const hasFetchEvidence = Number(progress?.fetched_count || progress?.fetched_sources || 0) > 0
+      || Number(progress?.readable_count || progress?.readable_sources || 0) > 0
+      || Number(progress?.failed_count || progress?.failed_sources || 0) > 0;
+    // Search discovery and page reading are different user-visible phases:
+    // while the candidate pool is being found say "搜索中"; once a candidate
+    // is being opened or compared say "整理中".  Source/image imports always
+    // begin at the latter phase.
+    const isSearch = state.jdImport.mode === "search" || jdImportSearchMode(result);
+    const label = isSearch && !fetchingPhase && !hasFetchEvidence && phase !== "completed" && phase !== "insufficient"
+      ? "正在搜索中…"
+      : isSearch && !fetchingPhase && statusCode === "queued"
+        ? "正在搜索中…"
+        : "正在整理中…";
+    const progressText = jdImportProgressText(progress);
+    return progressText ? `${label} ${progressText}` : label;
+  }
+
+  function jdImportResultIsVisible() {
+    const kind = String(state.jdImport.statusKind || "").trim().toLowerCase();
+    if (!(["success", "warning"].includes(kind))) return false;
+    if (state.jdImport.jobId) return false;
+    const code = String(state.jdImport.statusCode || "").trim().toLowerCase();
+    if (jdImportInProgress(code) || ["failed", "error", "cancelled", "canceled"].includes(code)) return false;
+    // A pending approval is still actionable, but its model output is not a
+    // finished JD result. Keep the status/action controls while the payload is
+    // being resolved; never show a premature empty card for that state.
+    if (jdImportNeedsApproval(code, state.jdImport.result)) return false;
+    return true;
+  }
+
+  function jdImportList(value) {
+    if (Array.isArray(value)) return value;
+    if (value == null || value === "") return [];
+    return [value];
+  }
+
+  function jdImportText(value, fields = ["text", "summary", "description", "detail", "message"]) {
+    if (value == null) return "";
+    if (typeof value === "string" || typeof value === "number") return String(value).trim();
+    if (Array.isArray(value)) return value.map((item) => jdImportText(item, fields)).filter(Boolean).join("；");
+    if (typeof value !== "object") return String(value).trim();
+    for (const field of fields) {
+      if (value[field] == null) continue;
+      const text = jdImportText(value[field], fields);
+      if (text) return text;
+    }
+    return "";
+  }
+
+  function jdImportSourceUrls(result) {
+    const root = jdImportRecord(result);
+    const source = jdImportRecord(root.source);
+    const candidates = [
+      source.source_urls,
+      source.sourceUrls,
+      source.source_url,
+      source.sourceUrl,
+      source.urls,
+      source.links,
+      root.source_url,
+      root.sourceUrl,
+    ];
+    const urls = [];
+    const visit = (value) => {
+      if (value == null) return;
+      if (Array.isArray(value)) { value.forEach(visit); return; }
+      if (typeof value === "object") return;
+      const text = String(value).trim();
+      if (!text) return;
+      let parsed;
+      try { parsed = new URL(text); } catch (_) { return; }
+      if (!["https:", "http:"].includes(parsed.protocol) || !parsed.hostname) return;
+      const normalized = parsed.href;
+      if (!urls.includes(normalized)) urls.push(normalized);
+    };
+    candidates.forEach(visit);
+    return urls;
+  }
+
+  function jdImportEvidence(result) {
+    const root = jdImportRecord(result);
+    const source = jdImportRecord(root.source);
+    const values = [source.evidence];
+    const evidence = [];
+    values.forEach((value) => jdImportList(value).forEach((item) => {
+       const text = jdImportText(item, ["summary", "description", "evidence", "detail", "text", "message", "reason", "status"]);
+       const folded = text.toLowerCase();
+       const itemRecord = item && typeof item === "object" && !Array.isArray(item) ? item : {};
+       const sourceKind = String(itemRecord.kind || itemRecord.source_kind || itemRecord.sourceKind || "").toLowerCase();
+       const evidenceStatus = String(itemRecord.evidence_status || itemRecord.evidenceStatus || "").toLowerCase();
+       const leadOnly = itemRecord.lead_only === true || itemRecord.leadOnly === true;
+       const unreadable = itemRecord.readable === false || ["unverified", "unreadable", "failed"].includes(evidenceStatus);
+       const isSearchSnippet = leadOnly || unreadable || sourceKind.includes("snippet") || sourceKind.includes("search") || sourceKind.includes("index")
+         || folded.includes("search_index")
+         || folded.includes("搜索摘要")
+         || folded.includes("结果摘要")
+         || folded.includes("搜索结果摘要");
+       if (text && !isSearchSnippet && !evidence.includes(text)) evidence.push(text);
+    }));
+    return evidence;
+  }
+
+  function jdImportSourceCount(result) {
+    const root = jdImportRecord(result);
+    const jd = jdImportRecord(root.jd);
+    const sampleCount = Number(jd.sample_count);
+    if (Number.isFinite(sampleCount) && sampleCount >= 0) return Math.floor(sampleCount);
+    // A URL or an evidence note can represent a failed/partial fetch.  Only
+    // the structured sample_count is authoritative for effective source
+    // coverage; an absent count stays unknown and therefore incomplete.
+    return 0;
+  }
+
+  function jdImportComparisonComplete(result) {
+    if (jdImportDirectionMismatch(result)) return false;
+    const status = String(jdImportRecord(result).jd && jdImportRecord(result).jd.comparison_status || "").trim().toLowerCase();
+    return status === "compared" && jdImportSourceCount(result) >= 3;
+  }
+
+  function jdImportDirectionMismatch(result) {
+    const root = jdImportRecord(result);
+    const records = [
+      root,
+      jdImportRecord(root.jd),
+      jdImportRecord(root.comparison),
+      jdImportRecord(root.metadata),
+      jdImportRecord(root.progress),
+    ];
+    const explicitFalse = [
+      "same_target_direction", "sameTargetDirection", "same_role_direction", "sameRoleDirection",
+      "direction_match", "directionMatch", "comparable", "comparable_samples", "comparableSamples",
+    ];
+    const explicitMixed = [
+      "mixed_technical_direction", "mixedTechnicalDirection", "mixed_directions", "mixedDirections",
+      "direction_mismatch", "directionMismatch", "different_technical_direction", "differentTechnicalDirection",
+    ];
+    if (records.some((record) => explicitFalse.some((key) => record[key] === false))) return true;
+    if (records.some((record) => explicitMixed.some((key) => record[key] === true))) return true;
+    return records.some((record) => {
+      const status = String(
+        record.technical_direction_status
+          ?? record.technicalDirectionStatus
+          ?? record.direction_status
+          ?? record.directionStatus
+          ?? "",
+      ).trim().toLowerCase();
+      return ["mismatch", "incomparable", "uncertain"].includes(status);
+    });
+  }
+
+  function jdImportSearchMode(result) {
+    const root = jdImportRecord(result);
+    const metadata = jdImportRecord(root.metadata);
+    const jd = jdImportRecord(root.jd);
+    const explicitModes = [root.mode, metadata.mode, state.jdImport.mode]
+      .map((mode) => String(mode == null ? "" : mode).trim().toLowerCase())
+      .filter(Boolean);
+    if (explicitModes.length) return explicitModes[0] === "search";
+    const comparisonStatus = String(jd.comparison_status || "").trim().toLowerCase();
+    const sampleTarget = Number(jd.sample_target);
+    return ["compared", "insufficient_samples"].includes(comparisonStatus)
+      || (Number.isFinite(sampleTarget) && sampleTarget >= 3);
+  }
+
+  function jdImportCompletionState(status, result) {
+    const normalized = String(status || "").trim().toLowerCase();
+    if (!["completed", "succeeded", "success"].includes(normalized)) return null;
+    if (!jdImportSearchMode(result)) return { kind: "success", message: "JD 已整理并同步到本页。" };
+    const searchFailure = jdImportSearchFailure(result);
+    if (searchFailure) return { kind: "warning", message: searchFailure.message };
+    if (jdImportDirectionMismatch(result)) {
+      return { kind: "warning", message: "已读取的来源包含不同技术方向或同类性未确认；暂不形成共性要求，请核对来源后重试。" };
+    }
+    const progress = jdImportProgress(result);
+    const count = jdImportSourceCount(result);
+    const failed = Number(progress?.failed_count || 0);
+    const comparisonStatus = String(jdImportRecord(result.jd).comparison_status || "").trim().toLowerCase();
+    if (count < 3 || comparisonStatus !== "compared") {
+      const failures = failed ? `另有 ${failed} 个来源读取失败；` : "";
+      if (count < 3) {
+        const actual = count ? `目前只核实了 ${count} 份同类 JD` : "目前还没有核实到足够的同类 JD";
+        return { kind: "warning", message: `${actual}，${failures}少于最低 3 份；尚未完成共性汇总，请补充来源或稍后重试。` };
+      }
+      // Three or more readable samples can still disagree or fail the
+      // comparison guard. Do not describe that as a sample-count shortage;
+      // explain that the evidence was sufficient in volume but not in
+      // confirmed commonality.
+      const actual = `已核实 ${count} 份同类 JD`;
+      const reason = comparisonStatus === "insufficient_samples"
+        ? "样本之间尚未形成可靠共性"
+        : "比较状态尚未确认共性要求";
+      return { kind: "warning", message: `${actual}，${failures}${reason}；尚未完成共性汇总，请核对来源差异后再确认。` };
+    }
+    return { kind: "success", message: `已核实 ${count} 份同类 JD，已汇总共性要求并标出来源差异；请核对后确认。` };
+  }
+
+  function jdImportJobStatus(payload) {
+    const source = payload && typeof payload === "object" ? payload : {};
+    const result = source.result && typeof source.result === "object" ? source.result : {};
+    const topLevel = String(source.status == null ? "" : source.status).trim().toLowerCase();
+    const jobLevel = source.job && source.job.status != null ? String(source.job.status).trim().toLowerCase() : "";
+    const outer = topLevel || jobLevel;
+    const nested = String(result.status || "").trim().toLowerCase();
+    // GET /api/jobs/{id} exposes the WebService job lifecycle at the top
+    // level. The nested result is the engine/tool RunResult and may be
+    // `failed` or `paused` while the owning HTTP job is still `running`.
+    // Keep the outer active state authoritative so one failed tool attempt
+    // cannot turn an in-flight search into a terminal error. Once the outer
+    // job is terminal, retain a nested failed/paused result as the operation's
+    // terminal outcome so the user still gets an actionable failure message.
+    if (outer && jdImportInProgress(outer)) return outer;
+    if (outer && ["completed", "succeeded", "success"].includes(outer)) {
+      if (["failed", "error", "cancelled", "canceled", "paused", "uncertain", "pending", "pending_approval", "waiting_approval", "needs_approval", "needs-approval"].includes(nested)) return nested;
+      if (jdImportInProgress(nested)) return nested;
+      return outer;
+    }
+    if (outer) return outer;
+    return nested || "running";
+  }
+
+  function jdImportPending(result) {
+    const source = result && typeof result === "object" ? result : {};
+    const candidates = [source.pending, source.approval, source.execution?.pending];
+    const sessionPending = state.currentSession && state.currentSession.pending;
+    if (sessionPending && (!sessionPending.scope || sessionPending.scope === "jd-import" || sessionPending.metadata?.scope === "jd-import")) candidates.push(sessionPending);
+    return candidates.find((candidate) => candidate && typeof candidate === "object" && String(candidate.id || "").trim()) || null;
+  }
+
+  function jdImportNeedsApproval(status, result) {
+    const source = result && typeof result === "object" ? result : {};
+    return ["pending", "pending_approval", "waiting_approval", "needs_approval", "needs-approval", "paused", "uncertain"].includes(String(status || "").toLowerCase())
+      || Boolean(source.pending || source.requires_approval || source.approval_required || source.approval);
+  }
+
+  function jdImportInProgress(status) {
+    return ["queued", "running", "started", "in_progress", "processing"].includes(String(status || "").toLowerCase());
+  }
+
+  function jdImportActionLabel(action) {
+    return ({ approve: "批准并继续", reject: "拒绝", continue: "继续处理", resolve: "记录结果并继续" })[action] || "处理";
+  }
+
+  async function resolveJdImportAction(action, pending = null) {
+    const id = String(state.currentSessionId || "");
+    if (!id || state.jdImport.busy || state.loadingSession) return false;
+    const actionName = String(action || "").trim().toLowerCase();
+    if (!["approve", "reject", "continue", "resolve"].includes(actionName)) return false;
+    const approvalId = String(pending?.id || "").trim();
+    if (["approve", "reject", "resolve"].includes(actionName) && !approvalId) {
+      setJdBackgroundStatus("当前页面未收到可确认的操作标识，请刷新后重试。", "error");
+      return false;
+    }
+    const body = approvalId ? { id: approvalId } : {};
+    if (actionName === "resolve") body.note = String($("jdBackgroundResolveNote")?.value || "").trim();
+    state.jdImport.busy = true; state.jdImport.error = ""; state.jdImport.diagnostic = ""; state.jdImport.controlAction = actionName; const serial = ++state.jdImport.requestSerial;
+    clearJdImportPolling(); state.jdImport.jobId = "";
+    setJdBackgroundStatus(`正在${jdImportActionLabel(actionName)}…`, "loading");
+    try {
+      const payload = await request(`/sessions/${encodeURIComponent(id)}/${actionName}`, { method: "POST", body });
+      if (!jdImportContextMatches(id, serial)) return true;
+      const jobId = payload && (payload.job_id || payload.jobId || payload.job?.id);
+      const result = jdImportResult(payload);
+      if (Object.keys(result).length) state.jdImport.result = result;
+      state.jdImport.progress = jdImportProgress(result, payload);
+      state.jdImport.jobId = String(jobId || "");
+      const status = jdImportJobStatus(payload);
+      state.jdImport.statusCode = status;
+      if (jobId) {
+        state.jdImport.statusKind = "loading";
+        state.jdImport.status = `已提交${jdImportActionLabel(actionName)}，正在等待结果…`;
+        startJdImportPolling(jobId, id);
+      } else if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+        state.jdImport.statusKind = "error";
+        state.jdImport.error = jdImportFailureMessage();
+        state.jdImport.diagnostic = jdImportFailureDiagnostic(payload?.diagnostic || result.diagnostic || payload?.error || result.error || result.message);
+        state.jdImport.status = "当前页操作失败，输入仍保留。";
+        state.jdImport.controlAction = "";
+      } else if (jdImportNeedsApproval(status, result)) {
+        state.jdImport.statusKind = "warning";
+        state.jdImport.status = "操作仍需在当前页确认。";
+      } else {
+        const completion = jdImportCompletionState(status, result) || { kind: "success", message: "结果已同步到当前页。" };
+        state.jdImport.statusKind = completion.kind;
+        state.jdImport.status = `${jdImportActionLabel(actionName)}已完成。${completion.message}`;
+        state.jdImport.controlAction = "";
+        await refreshCurrentSession(id, { scroll: false, clearOptimistic: false });
+      }
+      renderJdBackgroundStatus();
+      return true;
+    } catch (error) {
+      if (jdImportContextMatches(id, serial)) {
+        state.jdImport.controlAction = "";
+        state.jdImport.statusKind = "error";
+        state.jdImport.statusCode = "failed";
+        state.jdImport.error = jdImportFailureMessage();
+        state.jdImport.diagnostic = jdImportFailureDiagnostic(error.message);
+        state.jdImport.status = "当前页操作失败，输入仍保留。";
+        renderJdBackgroundStatus();
+      }
+      return false;
+    } finally {
+      if (jdImportContextMatches(id, serial)) {
+        state.jdImport.busy = false;
+        renderJdBackgroundStatus();
+      }
+    }
+  }
+
+  function jdImportSourcesCard(result, { includeLiveProgress = true } = {}) {
+    const urls = jdImportSourceUrls(result);
+    const evidence = jdImportEvidence(result);
+    const root = jdImportRecord(result);
+    const jd = jdImportRecord(root.jd);
+    const progress = jdImportProgress(result, null, { includeLiveState: includeLiveProgress });
+    const hasSampleMetadata = ["sample_count", "sample_target", "comparison_status"].some((key) => Object.prototype.hasOwnProperty.call(jd, key))
+      || Boolean(progress && (progress.candidate_count || progress.readable_count || progress.fetched_count || progress.failed_count));
+    if (!urls.length && !evidence.length && !hasSampleMetadata) return null;
+    const card = document.createElement("section");
+    card.className = "jd-import-sources";
+    const details = document.createElement("details");
+    details.className = "jd-evidence-details";
+    details.dataset.jdEvidence = "sources";
+    const heading = document.createElement("summary");
+    heading.className = "job-subtitle";
+    const count = jdImportSourceCount(result);
+    const failed = Number(progress?.failed_count || 0);
+    heading.textContent = count
+      ? `支持来源与核验 · ${count} 份${failed ? `，另有 ${failed} 个失败` : ""}`
+      : urls.length || evidence.length
+        ? `来源尝试记录${failed ? ` · ${failed} 个读取失败` : ""}`
+        : "样本与比较记录";
+    details.appendChild(heading);
+    const target = Number(jd.sample_target);
+    const comparison = String(jd.comparison_status || "").trim();
+    if (count || Number.isFinite(target) || comparison) {
+      const meta = document.createElement("p");
+      meta.className = "jd-evidence-meta";
+      const targetText = Number.isFinite(target) && target > 0 ? `目标 ${Math.floor(target)} 份` : "目标样本数未提供";
+      const statusText = comparison ? `比较状态：${comparison === "compared" ? "已形成共性" : comparison === "insufficient_samples" ? "样本不足" : comparison}` : "比较状态未提供";
+      meta.textContent = `样本证据：已核实 ${count} 份 · ${targetText} · ${statusText}`;
+      details.appendChild(meta);
+    }
+    if (urls.length) {
+      const list = document.createElement("ul");
+      list.className = "job-list jd-source-list";
+      urls.forEach((url, index) => {
+        const row = document.createElement("li");
+        row.className = "job-list-item";
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+         link.textContent = `${count ? "来源" : "尝试来源"} ${index + 1} · ${url}`;
+        row.appendChild(link);
+        list.appendChild(row);
+      });
+      details.appendChild(list);
+    }
+    if (evidence.length) {
+      const list = document.createElement("ul");
+      list.className = "job-list jd-source-evidence";
+      evidence.slice(0, 12).forEach((item) => {
+        const row = document.createElement("li");
+        row.className = "job-list-item";
+        row.textContent = item;
+        list.appendChild(row);
+      });
+      details.appendChild(list);
+    }
+    card.appendChild(details);
+    return card;
+  }
+
+  function jdImportResultCard(jd, result, { includeLiveProgress = true } = {}) {
+    const source = jdImportRecord(jd);
+    const display = { ...source };
+    const card = jdObjectCard(display);
+    card.classList.add("jd-import-result-card");
+    appendJdCoverageNotice(card, result, display);
+    appendJdFields(card, display, result);
+    appendJdSummary(card, display, jdImportSearchMode(result) ? "共性汇总与来源差异" : "概况");
+    const sources = jdImportSourcesCard(result, { includeLiveProgress });
+    if (sources) card.appendChild(sources);
+    return card;
+  }
+
+  function jdPersistedResult(stateData) {
+    const data = stateData && typeof stateData === "object" ? stateData : {};
+    const jdRecord = jdImportRecord(data.jd);
+    if (!Object.keys(jdRecord).length) return null;
+    const rawSource = data.jd_source;
+    const source = typeof rawSource === "string" && rawSource.trim()
+      ? { kind: "text", evidence: [rawSource.trim()] }
+      : jdImportRecord(rawSource);
+    const comparison = jdImportRecord(data.jd_comparison);
+    const display = { ...jdRecord };
+    // The persisted projection carries comparison metadata both on the JD
+    // card and in jd_comparison. Keep the card renderer correct for legacy
+    // snapshots that only retained the latter.
+    if (display.sample_target == null && comparison.sample_target != null) display.sample_target = comparison.sample_target;
+    if (display.sample_count == null && comparison.sample_count != null) display.sample_count = comparison.sample_count;
+    if (!display.comparison_status && comparison.status) display.comparison_status = comparison.status;
+    const comparisonMode = String(comparison.mode || "").trim().toLowerCase();
+    const sourceKind = String(source.kind || source.source_kind || "").trim().toLowerCase();
+    const inferredSearch = comparisonMode === "search"
+      || (sourceKind === "public_source" && (Number(display.sample_target) >= 3 || ["compared", "insufficient_samples"].includes(String(display.comparison_status || "").trim().toLowerCase())));
+    const mode = comparisonMode || (inferredSearch ? "search" : "source");
+    return { jd: display, source, comparison, mode, metadata: { mode } };
+  }
+
+  function jdPersistedResultCard(stateData) {
+    const result = jdPersistedResult(stateData);
+    if (!result) return null;
+    return jdImportResultCard(result.jd, result, { includeLiveProgress: false });
+  }
+
+  function jdImportSearchFailureCard(failure) {
+    const card = document.createElement("section");
+    card.className = "jd-search-empty";
+    const heading = document.createElement("h3");
+    heading.textContent = "公开索引暂时没有可核实的岗位";
+    card.appendChild(heading);
+    const reason = document.createElement("p");
+    reason.textContent = failure.message;
+    card.appendChild(reason);
+    const nextStep = document.createElement("p");
+    nextStep.className = "jd-search-empty-next";
+    nextStep.textContent = failure.nextStep;
+    card.appendChild(nextStep);
+    const actions = document.createElement("div");
+    actions.className = "jd-status-actions";
+    if (failure.query && jdWebSearchUrl(failure.query)) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "action-button primary";
+      open.textContent = "打开公开网页搜索";
+      open.setAttribute("aria-label", `打开公开网页搜索：${failure.query}`);
+      open.addEventListener("click", () => { openJdWebSearch(failure); });
+      actions.appendChild(open);
+    }
+    const source = document.createElement("button");
+    source.type = "button";
+    source.className = "action-button secondary";
+    source.textContent = "改用链接 / 正文 / 截图";
+    source.addEventListener("click", () => {
+      if (String(state.currentSessionId || "") !== String(failure.sessionId || "")) {
+        toast("会话已切换，请在当前会话重新打开岗位导入。", "error");
+        return;
+      }
+      setJdMode("source");
+      $("jdSourceUrl")?.focus();
+    });
+    actions.appendChild(source);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function renderJdBackgroundStatus() {
+    const node = $("jdBackgroundStatus");
+    if (!node) return;
+    const id = String(state.currentSessionId || "");
+    const hasState = Boolean(state.jdImport.status || state.jdImport.jobId || state.jdImport.result || state.jdImport.error);
+    node.replaceChildren();
+    node.className = `jd-background-status${hasState ? "" : " hidden"}${state.jdImport.statusKind ? ` ${state.jdImport.statusKind}` : ""}`;
+    if (!hasState || (state.jdImport.sessionId && state.jdImport.sessionId !== id)) return;
+    node.appendChild(icon(state.jdImport.statusKind === "error" || state.jdImport.statusKind === "warning" ? "warning" : state.jdImport.statusKind === "success" ? "check" : "bot", "jd-status-icon"));
+    const body = document.createElement("div"); body.className = "jd-status-body";
+    const title = document.createElement("strong"); title.textContent = state.jdImport.mode === "search" ? "同类 JD 汇总任务" : state.jdImport.jobId ? "JD 整理任务" : "JD 整理状态"; body.appendChild(title);
+    const message = document.createElement("p"); message.textContent = state.jdImport.error || state.jdImport.status || "正在准备…"; body.appendChild(message);
+    const diagnosticText = String(state.jdImport.diagnostic || "").trim();
+    if (diagnosticText) {
+      const diagnostic = document.createElement("details"); diagnostic.className = "jd-status-diagnostics";
+      const summary = document.createElement("summary"); summary.textContent = "诊断信息"; diagnostic.appendChild(summary);
+      const detail = document.createElement("pre"); detail.textContent = diagnosticText.slice(0, 1200); diagnostic.appendChild(detail);
+      body.appendChild(diagnostic);
+    }
+    const result = state.jdImport.result && typeof state.jdImport.result === "object" ? state.jdImport.result : null;
+    const progress = state.jdImport.mode === "search" ? (state.jdImport.progress || jdImportProgress(result)) : null;
+    const progressCard = jdImportProgressCard(progress);
+    if (progressCard) body.appendChild(progressCard);
+    // A queued/running payload can already contain diagnostics, a partial JD,
+    // or an empty search record. Those are progress artifacts, not a terminal
+    // result. Do not turn them into a false "未搜到" card while the job is
+    // still searching/fetching. Conversely, a terminal failure must not render
+    // a stale or partial JD as if it succeeded.
+    const resultVisible = jdImportResultIsVisible();
+    const searchFailure = resultVisible && result && Object.keys(result).length ? jdImportSearchFailure(result) : null;
+    const jd = result && (result.jd || result.job_description || result.draft);
+    if (resultVisible && jd && !searchFailure) {
+      if (typeof jd === "object" && !Array.isArray(jd)) body.appendChild(jdImportResultCard(jd, result));
+      else { const resultText = document.createElement("p"); resultText.className = "jd-status-result"; resultText.textContent = String(jd); body.appendChild(resultText); }
+    }
+    if (resultVisible && searchFailure) body.appendChild(jdImportSearchFailureCard(searchFailure));
+    const reply = result && (result.message || result.reply || result.response || result.text || result.content);
+    if (resultVisible && reply && !jd && !searchFailure) {
+      const resultMessage = document.createElement("p"); resultMessage.className = "jd-status-result";
+      resultMessage.textContent = jdImportText(reply) || String(reply); body.appendChild(resultMessage);
+    }
+    node.appendChild(body);
+    // A warning can also mean that search found fewer than the requested
+    // three sources.  Derive approval actions from the actual payload so a
+    // coverage warning does not render a misleading "继续处理" button.
+    const status = String(state.jdImport.statusCode || jdImportJobStatus({ result }) || "").trim().toLowerCase();
+    const pending = jdImportPending(result);
+    if (!jdImportNeedsApproval(status, result)) return;
+    const actions = document.createElement("div"); actions.className = "jd-status-actions";
+    if (pending) {
+      const approve = document.createElement("button"); approve.type = "button"; approve.className = "action-button approve"; approve.dataset.jdAction = "approve"; approve.textContent = "批准并继续"; approve.disabled = state.jdImport.busy;
+      approve.addEventListener("click", () => { void resolveJdImportAction("approve", pending); }); actions.appendChild(approve);
+      const reject = document.createElement("button"); reject.type = "button"; reject.className = "action-button reject"; reject.dataset.jdAction = "reject"; reject.textContent = "拒绝"; reject.disabled = state.jdImport.busy;
+      reject.addEventListener("click", () => { void resolveJdImportAction("reject", pending); }); actions.appendChild(reject);
+    }
+    if (!pending || ["queued", "running", "paused", "uncertain"].includes(status)) {
+      const resume = document.createElement("button"); resume.type = "button"; resume.className = "action-button secondary"; resume.dataset.jdAction = "continue"; resume.textContent = "继续处理"; resume.disabled = state.jdImport.busy;
+      resume.addEventListener("click", () => { void resolveJdImportAction("continue", pending); }); actions.appendChild(resume);
+    }
+    if (actions.children.length) node.appendChild(actions);
+  }
+
+  function clearJdImportPolling() {
+    if (state.jdImport.pollTimer) { window.clearInterval(state.jdImport.pollTimer); state.jdImport.pollTimer = null; }
+  }
+
+  async function pollJdImport(jobId, sessionId = state.jdImport.sessionId, serial = state.jdImport.requestSerial) {
+    const id = String(sessionId || "");
+    if (!jobId || !id || serial !== state.jdImport.requestSerial || String(state.currentSessionId || "") !== id || state.jdImport.pollInFlight) return;
+    state.jdImport.pollInFlight = true;
+    try {
+      const payload = await request(`/jobs/${encodeURIComponent(jobId)}`);
+      if (serial !== state.jdImport.requestSerial || String(state.currentSessionId || "") !== id) return;
+      const status = jdImportJobStatus(payload);
+      const result = jdImportResult(payload);
+      if (Object.keys(result).length) state.jdImport.result = result;
+      state.jdImport.progress = jdImportProgress(result, payload);
+      state.jdImport.statusCode = status;
+      if (["completed", "succeeded", "success"].includes(status)) {
+        if (jdImportNeedsApproval(status, result)) {
+          state.jdImport.statusKind = "warning";
+          state.jdImport.status = "当前页还有待确认操作。";
+        } else {
+          const completion = jdImportCompletionState(status, result) || { kind: "success", message: "JD 已整理并同步到本页。" };
+          state.jdImport.statusKind = completion.kind;
+          state.jdImport.status = state.jdImport.controlAction && completion.kind === "success" ? `${jdImportActionLabel(state.jdImport.controlAction)}已完成。${completion.message}` : completion.message;
+          state.jdImport.controlAction = "";
+        }
+        state.jdImport.jobId = ""; clearJdImportPolling();
+        await refreshCurrentSession(id, { scroll: false, clearOptimistic: false });
+      } else if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+        state.jdImport.statusKind = "error";
+        state.jdImport.error = jdImportFailureMessage();
+        state.jdImport.diagnostic = jdImportFailureDiagnostic(payload.diagnostic || result.diagnostic || payload.error || result.error || result.message);
+        state.jdImport.status = state.jdImport.controlAction ? "当前页操作失败，输入仍保留。" : "JD 整理失败，输入仍保留在当前页。";
+        state.jdImport.controlAction = "";
+        state.jdImport.jobId = ""; clearJdImportPolling();
+      } else if (jdImportNeedsApproval(status, result)) {
+        state.jdImport.statusKind = "warning";
+        state.jdImport.status = "当前页还有待确认操作。";
+        state.jdImport.jobId = ""; clearJdImportPolling();
+      } else {
+        state.jdImport.statusKind = "loading";
+        state.jdImport.status = jdImportLoadingLabel(status, result);
+      }
+      renderJdBackgroundStatus(); renderWorkflowPage();
+    } catch (error) {
+      if (serial === state.jdImport.requestSerial) {
+        state.jdImport.statusKind = "error";
+        state.jdImport.statusCode = "failed";
+        state.jdImport.error = jdImportFailureMessage();
+        state.jdImport.diagnostic = jdImportFailureDiagnostic(error.message);
+        renderJdBackgroundStatus();
+      }
+    } finally { state.jdImport.pollInFlight = false; }
+  }
+
+  function startJdImportPolling(jobId, sessionId = state.jdImport.sessionId) {
+    clearJdImportPolling();
+    const id = String(sessionId || "");
+    if (!jobId || !id) return;
+    const serial = state.jdImport.requestSerial;
+    void pollJdImport(String(jobId), id, serial);
+    state.jdImport.pollTimer = window.setInterval(() => { void pollJdImport(String(jobId), id, serial); }, 1000);
   }
 
   async function submitJdImport(kind) {
@@ -3799,45 +5660,177 @@
       const pendingDraft = jdDraft();
       const captured = { fields: { ...pendingDraft.fields }, files: [...pendingDraft.files], mode: pendingDraft.mode };
       const createdId = await createSession();
-      if (!createdId || String(state.currentSessionId) !== String(createdId)) { setText($("jdImportStatus"), "会话已变化，输入已保留，请在原会话重试。"); return; }
+      if (!createdId || String(state.currentSessionId) !== String(createdId)) { setJdBackgroundStatus("会话已变化，输入已保留，请在原会话重试。", "error"); return; }
       state.jdImport.sessionId = String(createdId); state.jdImport.drafts.set(String(createdId), captured);
-      JD_FIELDS.forEach((id) => { $(id).value = captured.fields[id] || (id === "jdPlatform" ? "boss" : ""); });
+      JD_FIELDS.forEach((id) => { $(id).value = captured.fields[id] || ""; });
       setJdMode(captured.mode); renderJdFiles();
     }
     const id = state.jdImport.sessionId;
-    if (state.loadingSession || String(state.currentSessionId) !== id) { setText($("jdImportStatus"), "会话已切换，请关闭后在目标会话重新打开。"); return; }
-    if (state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) { setText($("jdImportStatus"), "请先处理当前待确认操作、等待运行完成或点击“继续执行工具队列”。"); return; }
-    saveJdDraft(); const draft = jdDraft(); const fields = draft.fields; let text = "";
-    if (kind === "search") {
-      if (!fields.jdQuery.trim()) { setText($("jdImportStatus"), "请填写岗位名称或方向。"); return; }
-      text = `请在当前求职会话中调用 search_jobs 搜索真实招聘岗位，平台 platform=${fields.jdPlatform}，查询 query=${fields.jdQuery.trim()}。请展示真实来源链接，整理岗位 JD 供我核对，不要编造搜索结果或岗位要求。`;
-    } else if (kind === "source") {
-      const url = fields.jdSourceUrl.trim(), body = fields.jdSourceText.trim();
-      if (!url && !body) { setText($("jdImportStatus"), "请提供来源链接或岗位正文。"); return; }
-      if (url) { try { if (new URL(url).protocol !== "https:") throw new Error(); } catch (_) { setText($("jdImportStatus"), "请输入有效的 HTTPS 来源链接。"); return; } }
-      text = `请在当前求职会话中解析下面的真实岗位来源，整理 JD 并展示摘要供我核对。可访问链接时读取真实内容；无法访问且正文不足时请说明需要补充，不要编造。\n来源链接：${url || "未提供"}\n岗位正文：\n${body || "未提供"}`;
-    } else {
-      if (!draft.files.length) { setText($("jdImportStatus"), "请先选择或粘贴岗位截图。"); return; }
-      text = `请阅读本条消息附带的真实岗位截图，识别并整理岗位 JD 供我核对；看不清的字段请标为待确认，不要猜测。\n${fields.jdImageNote.trim()}`;
+    if (state.loadingSession || String(state.currentSessionId) !== id) { setJdBackgroundStatus("会话已切换，请在目标会话重新打开。", "error"); return; }
+    if (state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) { setJdBackgroundStatus("请先处理当前待确认操作、等待运行完成或点击“继续执行工具队列”。", "warning"); return; }
+    saveJdDraft(); const draft = jdDraft(); const fields = draft.fields;
+    if (kind === "search" && !fields.jdQuery.trim()) { setJdBackgroundStatus("请填写一个目标岗位名称。", "error"); return; }
+    if (kind === "search" && fields.jdQuery.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length > 1) {
+      setJdBackgroundStatus("请只填写一个目标岗位名称；多家公司同类 JD 会由 AI 自动搜索。", "error");
+      return;
     }
-    text += "\n\n本次只处理当前岗位 JD 阶段：用 set_jd 保存待核对的 JD 草稿，保留真实来源链接或用户提供的正文/截图出处；不要推测缺失字段。展示识别摘要和待确认项后等待我确认，不要自动进入技能档案、计划或项目阶段。";
-    state.jdImport.busy = true;
+    if (kind === "source") {
+      const sourceUrls = jdSourceUrls(fields.jdSourceUrl), body = fields.jdSourceText.trim();
+      if (!sourceUrls.length && !body) { setJdBackgroundStatus("请提供来源链接或岗位正文。", "error"); return; }
+      if (sourceUrls.length > MAX_SOURCE_URLS) { setJdBackgroundStatus(`一次最多提供 ${MAX_SOURCE_URLS} 个岗位来源链接，请删除多余行。`, "error"); return; }
+      const invalidUrl = sourceUrls.find((url) => {
+        try { return new URL(url).protocol !== "https:"; } catch (_) { return true; }
+      });
+      if (invalidUrl) { setJdBackgroundStatus(`请输入有效的 HTTPS 来源链接：${invalidUrl}`, "error"); return; }
+    }
+    if (kind === "image" && !draft.files.length) { setJdBackgroundStatus("请先选择或粘贴岗位截图。", "error"); return; }
+    state.jdImport.busy = true; state.jdImport.mode = kind; state.jdImport.error = ""; state.jdImport.diagnostic = ""; state.jdImport.result = null; state.jdImport.progress = null; state.jdImport.jobId = "";
+    if (kind === "search") {
+      state.jdImport.searchQuery = fields.jdQuery.trim();
+      state.jdImport.searchPlatform = JD_SEARCH_PLATFORM;
+      rememberJdSearchContext(id, state.jdImport.searchQuery);
+    }
+    const serial = ++state.jdImport.requestSerial;
     qsa("button, input, textarea, select", $("jdImportBackdrop")).forEach((el) => { el.disabled = true; });
     $("jdImportSubmit").textContent = "正在提交…";
-    setText($("jdImportStatus"), kind === "image" ? "正在上传截图并发送…" : "正在提交…");
+    setJdBackgroundStatus(kind === "image" ? "正在上传截图并提交后台任务…" : "正在提交后台整理任务…", "loading");
     try {
       const attachments = [];
-      if (kind === "image") for (const file of draft.files) attachments.push(await uploadOne(file));
-      if (String(state.currentSessionId) !== id || state.loadingSession || state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) throw new Error("会话状态已变化，输入已保留，请稍后重试。");
-      const body = { text }; if (attachments.length) body.attachments = attachments.map((item) => item.path);
-      const accepted = await enqueueAction("message", body, id, { optimisticText: text });
-      if (!accepted) throw new Error("发送失败，输入已保留，请重试。");
-      if (kind === "search") $("jdQuery").value = "";
-      else if (kind === "source") { $("jdSourceUrl").value = ""; $("jdSourceText").value = ""; }
-      else { draft.files = []; $("jdImageNote").value = ""; }
-       saveJdDraft(); state.jdImport.busy = false; openWorkflowChatDialog(); setText($("jdImportStatus"), "已提交；对话窗口已打开，结果会同步到本页。");
-    } catch (error) { setText($("jdImportStatus"), error.message || "导入失败，输入已保留。"); }
-    finally { state.jdImport.busy = false; qsa("button, input, textarea, select", $("jdImportBackdrop")).forEach((el) => { el.disabled = false; }); $("jdImportSubmit").textContent = "交给 AI 整理 JD"; renderJdFiles(); }
+      if (kind === "image") {
+        if (jdFilesTotalBytes(draft.files) > MAX_IMAGE_TOTAL_BYTES) throw new Error(`岗位截图总大小不能超过 ${MAX_IMAGE_TOTAL_BYTES / (1024 * 1024)} MiB。`);
+        for (const file of draft.files) {
+          if (!jdImportContextMatches(id, serial)) return;
+          attachments.push(await uploadOne(file));
+        }
+      }
+      if (!jdImportContextMatches(id, serial) || state.loadingSession || state.currentSession?.pending || sessionTurnBlocked(state.currentSession)) throw new Error("会话状态已变化，输入已保留，请稍后重试。");
+      const payload = await request(`/sessions/${encodeURIComponent(id)}/jd/import`, { method: "POST", body: {
+        mode: kind === "image" ? "image" : kind,
+        source_urls: jdSourceUrls(fields.jdSourceUrl),
+        // Preserve the first URL in the scalar field for clients that only
+        // display or consume source_url; source_urls is the multi-link contract.
+        source_url: jdSourceUrls(fields.jdSourceUrl)[0] || "",
+        source_text: fields.jdSourceText.trim(), platform: JD_SEARCH_PLATFORM, query: fields.jdQuery.trim(), image_note: fields.jdImageNote.trim(),
+        attachments: attachments.map((item) => item.path).filter(Boolean)
+      } });
+      if (!jdImportContextMatches(id, serial)) return;
+      const jobId = payload && (payload.job_id || payload.jobId || (payload.job && payload.job.id));
+      const result = jdImportResult(payload);
+      if (Object.keys(result).length) state.jdImport.result = result;
+      state.jdImport.progress = jdImportProgress(result, payload);
+      state.jdImport.jobId = String(jobId || "");
+      const immediateStatus = jdImportJobStatus(payload);
+      state.jdImport.statusCode = immediateStatus;
+      const immediateError = payload?.error || result.error;
+      if (["failed", "error", "cancelled", "canceled"].includes(immediateStatus) || immediateError) {
+        state.jdImport.statusKind = "error";
+        state.jdImport.error = jdImportFailureMessage(kind);
+        state.jdImport.diagnostic = jdImportFailureDiagnostic(payload?.diagnostic || result.diagnostic || immediateError || result.message);
+        state.jdImport.status = "JD 整理失败，输入仍保留在当前页。";
+      } else if (jdImportNeedsApproval(immediateStatus, result)) {
+        state.jdImport.statusKind = "warning";
+        state.jdImport.status = "JD 已整理，待确认操作可直接在当前页处理。";
+      } else if (jdImportInProgress(immediateStatus)) {
+        state.jdImport.statusKind = "loading";
+        state.jdImport.status = jdImportLoadingLabel(immediateStatus, result);
+      } else {
+        const completion = jdImportCompletionState(immediateStatus, result);
+        state.jdImport.statusKind = jobId ? "loading" : completion?.kind || "success";
+        state.jdImport.status = jobId ? jdImportLoadingLabel(immediateStatus, result) : completion?.message || "JD 已整理并同步到本页。";
+      }
+      // Keep the submitted fields and attachments until the job reaches a
+      // terminal success. A model/search failure must leave the exact input
+      // available for correction and retry.
+      saveJdDraft();
+      const failedImmediately = ["failed", "error", "cancelled", "canceled"].includes(immediateStatus) || Boolean(immediateError);
+      if (jobId && !failedImmediately && !jdImportNeedsApproval(immediateStatus, result)) startJdImportPolling(jobId, id);
+      renderJdBackgroundStatus();
+    } catch (error) {
+      if (jdImportContextMatches(id, serial)) {
+        state.jdImport.statusKind = "error"; state.jdImport.statusCode = "failed"; state.jdImport.error = jdImportFailureMessage(kind); state.jdImport.diagnostic = jdImportFailureDiagnostic(error.message); setText($("jdImportStatus"), state.jdImport.error); renderJdBackgroundStatus();
+      }
+    }
+    finally {
+      if (jdImportContextMatches(id, serial)) {
+        state.jdImport.busy = false; qsa("button, input, textarea, select", $("jdImportBackdrop")).forEach((el) => { el.disabled = false; }); $("jdImportSubmit").textContent = kind === "search" ? "搜索并汇总同类 JD" : "交给 AI 整理 JD"; renderJdFiles(); renderJdBackgroundStatus();
+      }
+    }
+  }
+
+  function renderProjectCandidates(root, data) {
+    const candidates = projectCandidates(data);
+    if (!candidates.length) return;
+    const sessionId = String(state.currentSessionId || "");
+    const activeKey = selectedProjectKey(data);
+    const blocked = projectSelectionBlocked();
+    const card = document.createElement("section");
+    card.className = "job-card";
+    const heading = document.createElement("h3");
+    heading.textContent = `候选练习项目 · ${candidates.length}`;
+    card.appendChild(heading);
+    for (const repo of candidates) {
+      const row = document.createElement("div");
+      row.className = "job-repo";
+      const info = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = projectDisplayTitle(repo);
+      info.appendChild(name);
+      const repoUrl = projectUrl(repo);
+      if (repoUrl) {
+        const host = new URL(repoUrl).hostname.toLowerCase();
+        const link = document.createElement("a");
+        link.href = repoUrl;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = host === "github.com" || host.endsWith(".github.com") ? "查看 GitHub 仓库 ↗" : "查看公开项目链接 ↗";
+        info.appendChild(link);
+      }
+      if (repo.paper_url) {
+        try {
+          const url = new URL(String(repo.paper_url).trim());
+          if (["https:", "http:"].includes(url.protocol) && url.hostname) {
+            const link = document.createElement("a");
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "查看论文来源 ↗";
+            info.appendChild(link);
+          }
+        } catch (_) { /* candidate URLs are untrusted display data */ }
+      }
+      const stars = projectStars(repo);
+      const meta = document.createElement("span");
+      meta.textContent = [repo.language || projectSourceLabel(repo), stars == null ? "" : `${stars} 星标`].filter(Boolean).join(" · ");
+      if (meta.textContent) info.appendChild(meta);
+      if (repo.paper_candidate) {
+        const paper = document.createElement("p");
+        paper.className = "repo-detail";
+        paper.textContent = `论文线索：${repo.paper_verified ? "已提供可核验证据" : "待核验，影响力未知"}${repo.paper_title ? ` · ${repo.paper_title}` : ""}`;
+        info.appendChild(paper);
+      }
+      for (const key of ["description", "reason", "match_score"]) {
+        if (key === "match_score" && (projectIsLocalOnly(repo) || repo.user_provided === true)) continue;
+        if (repo[key] == null || !String(repo[key]).trim()) continue;
+        const score = Number(repo[key]);
+        const value = key === "match_score" && Number.isFinite(score) ? `${Math.round(score <= 1 ? score * 100 : score)}%` : repo[key];
+        const prefix = key === "match_score" ? "匹配分：" : key === "reason" ? "推荐理由：" : "";
+        const detail = document.createElement("p");
+        detail.className = "repo-detail";
+        detail.textContent = `${prefix}${value}`;
+        info.appendChild(detail);
+      }
+      const current = projectIdentity(repo) === activeKey;
+      const use = document.createElement("button");
+      use.type = "button";
+      use.className = "job-card-action";
+      use.textContent = current ? "已选项目" : "选择项目";
+      use.setAttribute("aria-label", `${use.textContent} ${name.textContent}`);
+      use.disabled = current || blocked;
+      use.addEventListener("click", () => selectPracticeProject(repo, sessionId));
+      row.append(info, use);
+      card.appendChild(row);
+    }
+    root.appendChild(card);
   }
 
   function renderJobPane(root) {
@@ -3847,16 +5840,11 @@
     renderStepIntro(root, stateData);
     const title = document.createElement("div"); title.className = "inspect-section-title"; title.textContent = "求职资料与进度"; root.appendChild(title);
     if (!stateData) { const empty = document.createElement("div"); empty.className = "inspect-empty"; empty.textContent = "在对话中提供 JD、已有技能或简历材料后，相关资料会显示在这里。"; root.appendChild(empty); return; }
+    if (step === "practice" && !selectedProjectKey(stateData)) renderProjectCandidates(root, stateData);
     if (["plan", "practice"].includes(step)) renderProjectHistory(root, stateData);
     if (step === "jd" && stateData.jd) {
-      const jdCard = jdObjectCard(stateData.jd);
-      appendJobList(jdCard, "硬性要求", stateData.jd.hard_requirements, (item) => jobItemText(item, ["requirement", "name", "text", "title"]), { listTag: "ul", listClass: "jd-requirement-list", limit: null });
-      appendJobList(jdCard, "技能标签", stateData.jd.skill_tags, (item) => jobItemText(item, ["name", "skill", "tag", "text"]), { listClass: "job-chip-list", itemClass: "job-chip", limit: null });
-      appendJobList(jdCard, "工作职责", stateData.jd.responsibilities, (item) => jobItemText(item, ["responsibility", "name", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list", limit: null });
-      appendJobList(jdCard, "加分项", stateData.jd.nice_to_haves, (item) => jobItemText(item, ["requirement", "name", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list", limit: null });
-      appendJobList(jdCard, "待确认字段", stateData.jd.uncertain_fields, (item) => jobItemText(item, ["field", "name", "key", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list jd-uncertain-list", limit: null });
-      appendJdSummary(jdCard, stateData.jd);
-      root.appendChild(jdCard);
+      const jdCard = jdPersistedResultCard(stateData);
+      if (jdCard) root.appendChild(jdCard);
     }
     if (step === "profile" && stateData.profile) {
       const profileCard = jobObjectCard("已有技能", stateData.profile, ["summary"], "profile");
@@ -3950,10 +5938,7 @@
       else selectedProject.stargazers_count = selectedStars;
       root.appendChild(jobObjectCard("已选练习项目", selectedProject, ["full_name", "language", "stargazers_count", "html_url"]));
     }
-    if (step === "plan" && Array.isArray(stateData.repos) && stateData.repos.length) {
-      const card = document.createElement("section"); card.className = "job-card"; const h = document.createElement("h3"); h.textContent = `候选练习项目 · ${stateData.repos.length}`; card.appendChild(h);
-      stateData.repos.slice(0, 8).forEach((repo) => { const row = document.createElement("div"); row.className = "job-repo"; const info = document.createElement("div"); const strong = document.createElement("strong"); strong.textContent = projectDisplayTitle(repo); info.appendChild(strong); const repoUrl = projectUrl(repo); if (repoUrl) { const link = document.createElement("a"); link.href = repoUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; let repoHost = ""; try { repoHost = new URL(repoUrl).hostname.toLowerCase(); } catch (_) {} link.textContent = repoHost === "github.com" || repoHost.endsWith(".github.com") ? "查看 GitHub 仓库 ↗" : "查看公开项目链接 ↗"; info.appendChild(link); } const paperUrl = String(repo.paper_url || "").trim(); if (paperUrl) { try { const parsedPaper = new URL(paperUrl); if (["https:", "http:"].includes(parsedPaper.protocol) && parsedPaper.hostname) { const paperLink = document.createElement("a"); paperLink.href = parsedPaper.href; paperLink.target = "_blank"; paperLink.rel = "noopener noreferrer"; paperLink.textContent = "查看论文来源 ↗"; info.appendChild(paperLink); } } catch (_) {} } const stars = projectStars(repo); const span = document.createElement("span"); span.textContent = [repo.language || projectSourceLabel(repo), stars == null ? "" : `${stars} 星标`].filter(Boolean).join(" · "); if (span.textContent) info.appendChild(span); if (repo.paper_candidate) { const paper = document.createElement("p"); paper.className = "repo-detail"; paper.textContent = `论文线索：${repo.paper_verified ? "已提供可核验证据" : "待核验，影响力未知"}${repo.paper_title ? ` · ${repo.paper_title}` : ""}`; info.appendChild(paper); } for (const key of ["description", "reason", "match_score"]) { if (key === "match_score" && (projectIsLocalOnly(repo) || repo.user_provided === true)) continue; if (repo[key] != null && String(repo[key]).trim() !== "") { const detail = document.createElement("p"); detail.className = "repo-detail"; detail.textContent = `${key === "match_score" ? "匹配分：" : key === "reason" ? "推荐理由：" : ""}${key === "match_score" && Number.isFinite(Number(repo[key])) ? `${Math.round(Number(repo[key]) <= 1 ? Number(repo[key]) * 100 : Number(repo[key]))}%` : repo[key]}`; info.appendChild(detail); } } row.appendChild(info); const use = document.createElement("button"); use.type = "button"; use.className = "job-card-action"; use.textContent = "选用并开始实践"; use.addEventListener("click", () => startSelectedProject(repo)); row.appendChild(use); card.appendChild(row); }); root.appendChild(card);
-    }
+    if (step === "plan" || (step === "practice" && selectedProjectKey(stateData))) renderProjectCandidates(root, stateData);
     if (step === "practice" && Array.isArray(stateData.progress) && stateData.progress.length) {
       const card = document.createElement("section"); card.className = "job-card"; const h = document.createElement("h3"); h.textContent = "练习进度"; card.appendChild(h);
       stateData.progress.slice(-8).forEach((entry) => {
@@ -4016,6 +6001,7 @@
   function jdObjectCard(value) {
     const card = document.createElement("section");
     card.className = "job-card jd-card";
+    card.dataset.jdCard = "structured";
     const head = document.createElement("div");
     head.className = "job-card-head";
     const h = document.createElement("h3");
@@ -4067,18 +6053,56 @@
     return card;
   }
 
-  function appendJdSummary(card, value) {
+  function jdImportCoverageNotice(result, display) {
+    if (!jdImportSearchMode(result) || jdImportComparisonComplete(result)) return "";
+    const count = jdImportSourceCount(result);
+    const countText = count > 0 ? `仅核实 ${count} 份同类 JD` : "尚未核实到足够的同类 JD";
+    const mismatch = jdImportDirectionMismatch(result)
+      ? "来源方向或层级未完全确认；"
+      : "";
+    return `${countText}，以下内容仅作有限证据，尚未形成共性要求。${mismatch}`;
+  }
+
+  function appendJdCoverageNotice(card, result, display) {
+    const text = jdImportCoverageNotice(result, display);
+    if (!text) return;
+    const notice = document.createElement("p");
+    notice.className = "jd-coverage-notice";
+    notice.setAttribute("role", "note");
+    notice.textContent = text;
+    card.appendChild(notice);
+  }
+
+  function appendJdSummary(card, value, label = "概况") {
     const summary = String(value && (value.raw_summary || value.summary) || "").trim();
     if (summary) {
-      const summaryTitle = document.createElement("div");
-      summaryTitle.className = "job-subtitle";
-      summaryTitle.textContent = "概况";
-      card.appendChild(summaryTitle);
+      const details = document.createElement("details");
+      details.className = "jd-analysis-details";
+      details.dataset.jdAnalysis = "raw-summary";
+      const summaryTitle = document.createElement("summary");
+      summaryTitle.textContent = `${label}（展开查看）`;
+      details.appendChild(summaryTitle);
       const summaryNode = document.createElement("p");
       summaryNode.className = "jd-summary";
       summaryNode.textContent = summary;
-      card.appendChild(summaryNode);
+      details.appendChild(summaryNode);
+      card.appendChild(details);
     }
+  }
+
+  function appendJdFields(card, display, result = null) {
+    const isSearch = result && jdImportSearchMode(result);
+    const isCompared = !isSearch || jdImportComparisonComplete(result);
+    const labels = !isSearch
+      ? { hard: "硬性要求", skills: "技能标签", responsibilities: "工作职责", nice: "加分项" }
+      : isCompared
+        ? { hard: "共性硬性要求", skills: "共性技能标签", responsibilities: "共性工作职责", nice: "共性加分项" }
+        : { hard: "已读取样本要求（尚未形成共性）", skills: "样本技能标签（尚未形成共性）", responsibilities: "样本工作职责（尚未形成共性）", nice: "样本加分项（尚未形成共性）" };
+    appendJobList(card, labels.hard, display.hard_requirements, (item) => jobItemText(item, ["requirement", "name", "text", "title"]), { listTag: "ul", listClass: "jd-requirement-list", limit: null });
+    appendJobList(card, labels.skills, display.skill_tags, (item) => jobItemText(item, ["name", "skill", "tag", "text"]), { listClass: "job-chip-list", itemClass: "job-chip", limit: null });
+    appendJobList(card, labels.responsibilities, display.responsibilities, (item) => jobItemText(item, ["responsibility", "name", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list", limit: null });
+    appendJobList(card, labels.nice, display.nice_to_haves, (item) => jobItemText(item, ["requirement", "name", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list", limit: null });
+    appendJobList(card, "待确认字段", display.uncertain_fields, (item) => jobItemText(item, ["field", "name", "key", "text", "title"]), { listTag: "ul", listClass: "jd-detail-list jd-uncertain-list", limit: null });
   }
 
   function appendJobList(card, label, items, formatter, { listTag = "div", listClass = "", itemClass = "job-list-item", limit = 12 } = {}) {
@@ -4103,6 +6127,217 @@
     return left ? `${left}/${name}` : String(name || ".");
   }
 
+  function workspacePathKey(value) {
+    return String(value || "").trim().replace(/[\\/]+$/, "").toLowerCase();
+  }
+
+  function setWorkspaceSwitchStatus(message, kind = "") {
+    const status = $("workspaceSwitchStatus");
+    if (!status) return;
+    status.className = `model-settings-status${kind ? ` ${kind}` : ""}`;
+    setText(status, message);
+  }
+
+  function syncWorkspaceSwitchControls() {
+    const submit = $("workspaceSwitchSubmit");
+    if (submit) submit.disabled = Boolean(state.workspaceSwitch.busy || state.workspaceSwitch.pickerBusy || !state.workspaceSwitch.canSwitch);
+    const input = $("workspaceSwitchPath");
+    if (input) input.disabled = Boolean(state.workspaceSwitch.busy || state.workspaceSwitch.pickerBusy);
+    const picker = $("workspacePickerButton");
+    if (picker) picker.disabled = Boolean(state.workspaceSwitch.busy || state.workspaceSwitch.pickerBusy || !state.workspaceSwitch.canSwitch);
+  }
+
+  function workspacePickerBridge() {
+    const nativeApi = window.pywebview && window.pywebview.api;
+    const picker = nativeApi && nativeApi.pick_workspace_folder;
+    return typeof picker === "function" ? { api: nativeApi, picker } : null;
+  }
+
+  function workspacePickerResult(payload) {
+    if (typeof payload === "string") {
+      const path = payload.trim();
+      return path ? { kind: "selected", path } : { kind: "cancelled" };
+    }
+    if (!payload || typeof payload !== "object") return { kind: "cancelled" };
+    const error = String(payload.error || payload.message || "").trim();
+    if (payload.ok === false || error) return { kind: "error", error: error || "系统文件夹选择失败。" };
+    const path = String(payload.path || payload.workspace || payload.workspace_path || payload.selected_path || payload.folder || "").trim();
+    if (path && payload.selected !== false) return { kind: "selected", path };
+    if (payload.cancelled === true || payload.canceled === true || payload.selected === false || payload.ok === true) return { kind: "cancelled" };
+    return { kind: "cancelled" };
+  }
+
+  async function pickWorkspaceFolder() {
+    if (state.workspaceSwitch.busy || state.workspaceSwitch.pickerBusy || !state.workspaceSwitch.canSwitch) return;
+    const bridge = workspacePickerBridge();
+    const input = $("workspaceSwitchPath");
+    if (!bridge) {
+      setWorkspaceSwitchStatus("当前运行环境不支持系统文件夹选择，请手动输入绝对路径。", "");
+      input?.focus();
+      return;
+    }
+    const requestSerial = ++state.workspaceSwitch.pickerRequestSerial;
+    state.workspaceSwitch.pickerBusy = true;
+    syncWorkspaceSwitchControls();
+    setWorkspaceSwitchStatus("正在打开系统文件夹选择…", "loading");
+    try {
+      const payload = await Promise.resolve(bridge.picker.call(bridge.api, String(input?.value || "").trim()));
+      if (!state.workspaceSwitch.open || state.workspaceSwitch.pickerRequestSerial !== requestSerial) return;
+      const result = workspacePickerResult(payload);
+      if (result.kind === "error") {
+        setWorkspaceSwitchStatus(result.error, "error");
+        input?.focus();
+        return;
+      }
+      if (result.kind !== "selected") {
+        setWorkspaceSwitchStatus("已取消选择；也可以手动输入绝对路径。", "");
+        return;
+      }
+      if (input) input.value = result.path;
+      setWorkspaceSwitchStatus("已选择文件夹，请点击“切换并刷新”确认。", "success");
+      input?.focus();
+    } catch (error) {
+      if (!state.workspaceSwitch.open || state.workspaceSwitch.pickerRequestSerial !== requestSerial) return;
+      setWorkspaceSwitchStatus(error?.message || "系统文件夹选择失败，请手动输入绝对路径。", "error");
+      input?.focus();
+    } finally {
+      if (state.workspaceSwitch.pickerRequestSerial === requestSerial) {
+        state.workspaceSwitch.pickerBusy = false;
+        syncWorkspaceSwitchControls();
+      }
+    }
+  }
+
+  async function loadWorkspaceSwitchInfo() {
+    try {
+      const payload = await request("/workspace");
+      if (!state.workspaceSwitch.open) return payload;
+      state.workspaceSwitch.canSwitch = payload?.can_switch !== false;
+      state.workspaceSwitch.blockedReason = String(payload?.blocked_reason || "").trim();
+      const current = String(payload?.workspace || state.info?.workspace || "").trim();
+      if (current) {
+        const input = $("workspaceSwitchPath");
+        if (input && !String(input.value || "").trim()) input.value = current;
+      }
+      if (!state.workspaceSwitch.pickerBusy) {
+        if (state.workspaceSwitch.canSwitch) setWorkspaceSwitchStatus("可以切换工作区。", "success");
+        else setWorkspaceSwitchStatus(state.workspaceSwitch.blockedReason || "当前有未完成操作，完成后才能切换。", "error");
+      }
+      syncWorkspaceSwitchControls();
+      return payload;
+    } catch (error) {
+      if (state.workspaceSwitch.open) {
+        state.workspaceSwitch.canSwitch = false;
+        state.workspaceSwitch.blockedReason = error.message || "无法检查工作区状态";
+        setWorkspaceSwitchStatus(state.workspaceSwitch.blockedReason, "error");
+        syncWorkspaceSwitchControls();
+      }
+      return null;
+    }
+  }
+
+  function openWorkspaceSwitch() {
+    if (state.workspaceSwitch.busy || state.newSession.open || state.modelSettings.open) return;
+    const localImportBackdrop = $("localImportBackdrop");
+    if (localImportBackdrop && !localImportBackdrop.classList.contains("hidden")) return;
+    const backdrop = $("workspaceSwitchBackdrop");
+    const input = $("workspaceSwitchPath");
+    if (!backdrop || !input) return;
+    state.workspaceSwitch.pickerRequestSerial += 1;
+    state.workspaceSwitch.open = true;
+    state.workspaceSwitch.pickerBusy = false;
+    state.workspaceSwitch.previousFocus = document.activeElement;
+    state.workspaceSwitch.canSwitch = true;
+    state.workspaceSwitch.blockedReason = "";
+    input.value = String(state.info?.workspace || "");
+    setWorkspaceSwitchStatus("正在检查当前工作区状态…", "loading");
+    backdrop.classList.remove("hidden");
+    backdrop.setAttribute("aria-hidden", "false");
+    $("workspaceSwitchButton")?.setAttribute("aria-expanded", "true");
+    document.body.classList.add("modal-open");
+    syncWorkspaceSwitchControls();
+    input.focus();
+    void loadWorkspaceSwitchInfo();
+  }
+
+  function closeWorkspaceSwitch({ restore = true } = {}) {
+    const backdrop = $("workspaceSwitchBackdrop");
+    if (backdrop) {
+      backdrop.classList.add("hidden");
+      backdrop.setAttribute("aria-hidden", "true");
+    }
+    $("workspaceSwitchButton")?.setAttribute("aria-expanded", "false");
+    state.workspaceSwitch.pickerRequestSerial += 1;
+    state.workspaceSwitch.open = false;
+    state.workspaceSwitch.busy = false;
+    state.workspaceSwitch.pickerBusy = false;
+    state.workspaceSwitch.canSwitch = true;
+    state.workspaceSwitch.blockedReason = "";
+    syncWorkspaceSwitchControls();
+    const localImportBackdrop = $("localImportBackdrop");
+    const localImportOpen = localImportBackdrop && !localImportBackdrop.classList.contains("hidden");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.sessionEditor.open && !state.clarification.open && !state.jdImport.open && !state.workflowChat.open && !localImportOpen) document.body.classList.remove("modal-open");
+    const previous = state.workspaceSwitch.previousFocus;
+    state.workspaceSwitch.previousFocus = null;
+    if (restore) restoreSidebarAwareFocus(previous);
+  }
+
+  async function submitWorkspaceSwitch(event) {
+    event.preventDefault();
+    if (state.workspaceSwitch.busy || state.workspaceSwitch.pickerBusy) return;
+    const input = $("workspaceSwitchPath");
+    const requested = String(input?.value || "").trim();
+    if (!requested) {
+      setWorkspaceSwitchStatus("请填写目标工作区的绝对路径。", "error");
+      input?.focus();
+      return;
+    }
+    const current = String(state.info?.workspace || "").trim();
+    if (current && workspacePathKey(requested) === workspacePathKey(current)) {
+      setWorkspaceSwitchStatus("目标路径与当前工作区相同，请输入另一个目录。", "error");
+      input?.focus();
+      return;
+    }
+    if (!state.workspaceSwitch.canSwitch) {
+      setWorkspaceSwitchStatus(state.workspaceSwitch.blockedReason || "当前有未完成操作，完成后才能切换。", "error");
+      return;
+    }
+    state.workspaceSwitch.busy = true;
+    syncWorkspaceSwitchControls();
+    setWorkspaceSwitchStatus("正在切换工作区；原工作区数据不会移动…", "loading");
+    try {
+      const payload = await request("/workspace", { method: "POST", body: { path: requested } });
+      const nextToken = String(payload?.token || "").trim();
+      if (!nextToken) throw new Error("服务未返回新的工作区授权，工作区状态可能已改变；请刷新页面确认。");
+      state.token = nextToken;
+      const tokenPersisted = persistTokenForReload(nextToken);
+      try { window.localStorage.removeItem(SESSION_STORAGE_KEY); } catch (_error) { /* optional */ }
+      setWorkspaceSwitchStatus("已切换工作区，正在刷新会话列表…", "success");
+      closeWorkspaceSwitch({ restore: false });
+      if (tokenPersisted && typeof window.location?.reload === "function") {
+        window.location.reload();
+        return;
+      }
+      // Keep the in-memory token when neither browser storage nor the URL
+      // fragment can survive a reload.
+      state.info = null;
+      state.sessions = [];
+      state.currentSessionId = null;
+      state.currentSession = null;
+      state.filePath = ".";
+      state.fileEntries = [];
+      state.fileError = "";
+      state.lastResultSeen.clear();
+      clearPolling();
+      renderAll();
+      await Promise.allSettled([refreshInfo(), refreshSessions(), loadFiles(".")]);
+    } catch (error) {
+      state.workspaceSwitch.busy = false;
+      syncWorkspaceSwitchControls();
+      setWorkspaceSwitchStatus(error.message || "切换工作区失败，原工作区仍在使用。", "error");
+    }
+  }
+
   function openLocalImport(target = "composer") {
     if (state.newSession.open || state.modelSettings.open) return;
     state.localImportTarget = target === "planProject" ? "planProject" : "composer";
@@ -4122,7 +6357,7 @@
     $("localImportBackdrop").classList.add("hidden");
     state.localImportTarget = "composer";
     state.localImportSessionId = "new";
-    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.sessionEditor.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
   }
 
   const LOCAL_IMPORT_REASON_LABELS = {
@@ -4327,8 +6562,6 @@
     if ($("modelApiMode")) $("modelApiMode").value = "chat_completions";
     if ($("modelBaseUrl")) $("modelBaseUrl").value = "";
     if ($("modelName")) $("modelName").value = "";
-    if ($("modelChoice")) { $("modelChoice").replaceChildren(); $("modelChoiceField").classList.add("hidden"); }
-    if ($("modelProfileList")) $("modelProfileList").replaceChildren();
     updateModelKeyControls(state.modelSettings.hasApiKey);
     setModelSettingsStatus("");
   }
@@ -4354,11 +6587,11 @@
     const displayName = String($("modelProfileName") && $("modelProfileName").value || "").trim();
     const identity = { api_mode: draft.api_mode, base_url: draft.base_url, model: draft.model };
     if (displayName) draft.display_name = displayName;
-    // A profile id is safe only while the connection identity remains the
-    // active profile's identity. Changing endpoint/model creates a new
-    // profile so the old profile keeps its key and route.
-    if (state.modelSettings.currentProfileId && !state.modelSettings.newProfile
-      && sameModelIdentity(identity, state.modelSettings.loadedIdentity)) {
+    // An existing profile keeps its durable identity while its endpoint or
+    // model fields are edited. The backend validates key/identity changes;
+    // omitting profile_id here would silently create a new profile instead of
+    // updating the selected one.
+    if (state.modelSettings.currentProfileId && !state.modelSettings.newProfile) {
       draft.profile_id = state.modelSettings.currentProfileId;
     }
     if (apiKey.length) draft.api_key = apiKey;
@@ -4402,9 +6635,9 @@
     if (serial !== state.modelSettings.requestSerial) return;
     state.modelSettings.busyAction = action || "";
     qsa("#modelSettingsForm input, #modelSettingsForm select, #modelSettingsForm button").forEach((control) => {
-      control.disabled = control.id === "modelSettingsCancel" ? action === "saving" : Boolean(action);
+      control.disabled = control.id === "modelEditorCancel" ? action === "saving" : Boolean(action);
     });
-    const closeButton = $("modelSettingsClose");
+    const closeButton = $("modelEditorClose");
     if (closeButton) closeButton.disabled = action === "saving";
     const testButton = $("modelTestButton");
     const saveButton = $("modelSaveButton");
@@ -4417,79 +6650,224 @@
     return payload && typeof payload === "object" ? payload : {};
   }
 
-  function setGitHubStatus(message, kind = "") {
-    const node = $("githubTokenStatus");
+  function setModelManagerStatus(message, kind = "") {
+    const node = $("modelSettingsManagerStatus");
     if (!node) return;
     node.className = `model-settings-status${kind ? ` ${kind}` : ""}`;
     setText(node, message);
+    node.setAttribute("aria-busy", kind === "loading" ? "true" : "false");
   }
 
-  function updateGitHubTokenControls(hasToken) {
-    state.github.hasToken = Boolean(hasToken);
-    const input = $("githubToken");
-    const hint = $("githubTokenHint");
-    const clearLabel = $("githubClearTokenLabel");
-    const clear = $("githubClearToken");
-    if (input) input.placeholder = hasToken ? "已保存 GitHub Token；留空则保留" : "未保存；请输入 GitHub Token（可留空）";
-    if (hint) setText(hint, hasToken ? "检测到已保存 Token；用于读取你有权限的私有仓库并提高公开仓库搜索额度；不会发给模型。留空会保留，勾选下方选项才会清除。" : "用于读取你有权限的私有仓库并提高公开仓库搜索额度；不会发给模型。");
-    if (clearLabel) clearLabel.classList.toggle("hidden", !hasToken);
-    if (clear) clear.checked = false;
+  function setGitHubManagerStatus(message, kind = "") {
+    const node = $("githubManagerStatus");
+    if (!node) return;
+    node.className = `model-settings-status${kind ? ` ${kind}` : ""}`;
+    setText(node, message);
+    node.setAttribute("aria-busy", kind === "loading" ? "true" : "false");
   }
 
-  async function loadGitHubToken() {
-    setGitHubStatus("正在读取 GitHub Token 状态…", "loading");
+  function setGitHubEditorStatus(message, kind = "") {
+    const node = $("githubProfileStatus");
+    if (!node) return;
+    node.className = `model-settings-status${kind ? ` ${kind}` : ""}`;
+    setText(node, message);
+    node.setAttribute("aria-busy", kind === "loading" ? "true" : "false");
+  }
+
+  function githubCatalogPayload(payload) {
+    if (payload && payload.catalog && typeof payload.catalog === "object") return payload.catalog;
+    return payload && typeof payload === "object" ? payload : {};
+  }
+
+  function githubHasToken(value) {
+    return value === true || value === 1 || value === "1" || String(value || "").toLowerCase() === "true";
+  }
+
+  function renderGitHubProfiles(payload) {
+    const catalog = githubCatalogPayload(payload);
+    const profiles = Array.isArray(catalog.profiles) ? catalog.profiles.map((item) => ({
+      profileId: String(item && (item.profile_id || item.profileId) || "").trim(),
+      displayName: String(item && (item.display_name || item.displayName) || "").trim(),
+      hasToken: githubHasToken(item && (item.has_token ?? item.hasToken))
+    })).filter((item) => item.profileId && item.displayName) : [];
+    state.github.profiles = profiles;
+    state.github.activeProfileId = String(catalog.active_profile_id || catalog.activeProfileId || "").trim();
+    state.github.hasToken = githubHasToken(catalog.has_token ?? catalog.hasToken);
+    const choice = $("githubProfileChoice");
+    if (choice) {
+      choice.replaceChildren();
+      if (!profiles.length) {
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "尚无 GitHub Token 配置 · 请新建";
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        choice.appendChild(placeholder);
+      } else {
+        profiles.forEach((profile) => {
+          const option = document.createElement("option");
+          option.value = profile.profileId;
+          option.textContent = profile.displayName;
+          if (profile.hasToken) option.dataset.hasToken = "true";
+          choice.appendChild(option);
+        });
+        if (profiles.some((profile) => profile.profileId === state.github.activeProfileId)) choice.value = state.github.activeProfileId;
+        else choice.selectedIndex = -1;
+      }
+      choice.disabled = !profiles.length || Boolean(state.github.busy || state.modelSettings.managerBusy);
+    }
+    const canManage = Boolean(state.github.activeProfileId && profiles.some((profile) => profile.profileId === state.github.activeProfileId));
+    if ($("githubEditProfileButton")) $("githubEditProfileButton").disabled = !canManage || state.github.busy || state.modelSettings.managerBusy;
+    if ($("githubDeleteProfileButton")) $("githubDeleteProfileButton").disabled = !canManage || state.github.busy || state.modelSettings.managerBusy;
+  }
+
+  function setGitHubEditorBusy(busy) {
+    qsa("#githubProfileForm input, #githubProfileForm button").forEach((control) => { control.disabled = Boolean(busy); });
+    const save = $("githubProfileSave");
+    if (save) save.textContent = busy ? "保存中…" : "保存并应用";
+    const close = $("githubProfileEditorClose");
+    if (close) close.disabled = Boolean(busy);
+  }
+
+  async function loadGitHubProfiles(serial = ++state.github.requestSerial) {
+    setGitHubManagerStatus("正在读取 GitHub Token 配置…", "loading");
     try {
-      const payload = await request("/settings/github-token");
-      const value = payload && (payload.has_token ?? payload.hasToken);
-      updateGitHubTokenControls(value === true || value === 1 || value === "1" || String(value || "").toLowerCase() === "true");
-      setGitHubStatus("");
+      const payload = await request("/settings/github-profiles");
+      if (serial !== state.github.requestSerial || !state.modelSettings.open) return;
+      renderGitHubProfiles(payload);
+      setGitHubManagerStatus("");
     } catch (error) {
-      updateGitHubTokenControls(false);
-      setGitHubStatus(error.status === 404 ? "当前服务暂不支持 GitHub Token 设置。" : "无法读取 Token 状态。", error.status === 404 ? "" : "error");
+      if (serial !== state.github.requestSerial || !state.modelSettings.open) return;
+      renderGitHubProfiles({ profiles: [], active_profile_id: "", has_token: false });
+      setGitHubManagerStatus(error.status === 404 ? "当前服务暂不支持多 Token 配置。" : `无法读取 Token 配置：${error.message || "请稍后重试"}`, error.status === 404 ? "" : "error");
     }
   }
 
-  async function saveGitHubToken() {
-    if (state.github.busy) return;
-    const input = $("githubToken");
-    const clear = $("githubClearToken");
-    const token = String(input && input.value || "").trim();
-    if (clear && clear.checked && token) {
-      setGitHubStatus("已勾选清除 Token，请清空输入框或取消勾选。", "error");
-      return;
-    }
-    if (!token && !(clear && clear.checked)) {
-      setGitHubStatus(state.github.hasToken ? "未输入新 Token，现有设置保持不变。" : "请输入 GitHub Token，或勾选清除 Token。", state.github.hasToken ? "" : "error");
-      return;
-    }
+  async function selectGitHubProfile(profileId) {
+    const id = String(profileId || "").trim();
+    if (!id || state.github.busy || !state.modelSettings.open) return;
+    const choice = $("githubProfileChoice");
+    const previous = state.github.activeProfileId;
     state.github.busy = true;
-    if (input) input.disabled = true;
-    if (clear) clear.disabled = true;
-    $("githubTokenSave").disabled = true;
-    setGitHubStatus("正在保存 GitHub Token…", "loading");
+    if (choice) choice.disabled = true;
+    setGitHubManagerStatus("正在应用 GitHub Token 配置…", "loading");
+    const serial = ++state.github.requestSerial;
     try {
-      const payload = await request("/settings/github-token", {
-        method: "POST",
-        // The agreed browser contract names the flag clear_token; keep the
-        // short clear alias while the service rollout is mixed so both
-        // versions of the endpoint handle the same user action.
-        body: {
-          ...(token ? { token } : {}),
-          ...(clear && clear.checked ? { clear_token: true, clear: true } : {})
-        }
-      });
-      const hasToken = payload && (payload.has_token ?? payload.hasToken);
-      updateGitHubTokenControls(hasToken === true || hasToken === 1 || hasToken === "1" || String(hasToken || "").toLowerCase() === "true");
-      if (input) input.value = "";
-      setGitHubStatus("GitHub Token 已保存。", "success");
-      toast("GitHub Token 设置已更新。", "success");
+      const payload = await request("/settings/github-profiles/select", { method: "POST", body: { profile_id: id } });
+      if (serial !== state.github.requestSerial || !state.modelSettings.open) return;
+      renderGitHubProfiles(payload);
+      setGitHubManagerStatus("GitHub Token 配置已应用。", "success");
+      toast("GitHub Token 配置已切换。", "success");
     } catch (error) {
-      setGitHubStatus(error.status === 404 ? "当前服务暂不支持 GitHub Token 设置。" : `保存失败：${error.message || "无法保存 Token"}`, "error");
+      if (choice) choice.value = previous;
+      setGitHubManagerStatus(`切换失败：${error.message || "无法应用 Token 配置"}`, "error");
     } finally {
+      if (serial === state.github.requestSerial) {
+        state.github.busy = false;
+        if (choice) choice.disabled = !state.github.profiles.length;
+      }
+    }
+  }
+
+  function openGitHubProfileEditor({ profileId = "" } = {}) {
+    if (!state.modelSettings.open || state.github.busy || state.github.editorOpen) return;
+    const id = String(profileId || "").trim();
+    const profile = id ? state.github.profiles.find((item) => item.profileId === id) : null;
+    if (id && !profile) return;
+    state.github.editorOpen = true;
+    state.github.editorProfileId = id;
+    state.github.editorHasToken = Boolean(profile?.hasToken);
+    state.modelSettings.view = "github";
+    $("modelSettingsBackdrop").classList.add("hidden");
+    $("githubProfileEditorBackdrop").classList.remove("hidden");
+    const form = $("githubProfileForm");
+    if (form) form.reset();
+    if ($("githubProfileName")) $("githubProfileName").value = profile?.displayName || "";
+    if ($("githubProfileToken")) $("githubProfileToken").value = "";
+    setText($("githubProfileEditorTitle"), id ? "编辑 GitHub Token" : "新建 GitHub Token");
+    setText($("githubProfileTokenHint"), id ? "留空会保留已保存 Token；输入新 Token 才会替换。Token 不会显示或预填。" : "只用于 GitHub API 请求，不会发给模型，也不会写入浏览器存储。");
+    setGitHubEditorStatus("");
+    $("githubProfileName")?.focus();
+  }
+
+  function closeGitHubProfileEditor({ returnToManager = true } = {}) {
+    if (!state.github.editorOpen) return;
+    if (state.github.busy) {
+      setGitHubEditorStatus("正在保存 GitHub Token，请稍候…", "loading");
+      return;
+    }
+    state.github.editorOpen = false;
+    state.github.editorProfileId = "";
+    state.github.editorHasToken = false;
+    state.modelSettings.view = returnToManager ? "manager" : "";
+    ++state.github.requestSerial;
+    if ($("githubProfileToken")) $("githubProfileToken").value = "";
+    if ($("githubProfileName")) $("githubProfileName").value = "";
+    setGitHubEditorStatus("");
+    $("githubProfileEditorBackdrop").classList.add("hidden");
+    if (returnToManager && state.modelSettings.open) {
+      $("modelSettingsBackdrop").classList.remove("hidden");
+      void loadGitHubProfiles();
+      $("githubProfileChoice")?.focus();
+    }
+  }
+
+  async function saveGitHubProfile(event) {
+    if (event) event.preventDefault();
+    if (state.github.busy) return;
+    const name = String($("githubProfileName")?.value || "").trim();
+    const token = String($("githubProfileToken")?.value || "").trim();
+    if (!name) { setGitHubEditorStatus("请填写 Token 名称。", "error"); $("githubProfileName")?.focus(); return; }
+    if (!token && !state.github.editorProfileId) { setGitHubEditorStatus("请填写 GitHub Token。", "error"); $("githubProfileToken")?.focus(); return; }
+    const editing = Boolean(state.github.editorProfileId);
+    state.github.busy = true;
+    const serial = ++state.github.requestSerial;
+    setGitHubEditorBusy(true);
+    setGitHubEditorStatus("正在保存并应用 GitHub Token…", "loading");
+    try {
+      const body = { display_name: name, token };
+      if (state.github.editorProfileId) body.profile_id = state.github.editorProfileId;
+      const payload = await request("/settings/github-profiles", { method: editing ? "PATCH" : "POST", body });
+      if (serial !== state.github.requestSerial || !state.modelSettings.open) return;
+      renderGitHubProfiles(payload);
+      if ($("githubProfileToken")) $("githubProfileToken").value = "";
       state.github.busy = false;
-      if (input) input.disabled = false;
-      if (clear) clear.disabled = false;
-      $("githubTokenSave").disabled = false;
+      setGitHubEditorBusy(false);
+      closeGitHubProfileEditor();
+      setGitHubManagerStatus(`Token 配置“${name}”已保存并应用。`, "success");
+      toast(editing ? "GitHub Token 配置已更新。" : "GitHub Token 配置已保存。", "success");
+    } catch (error) {
+      if (serial === state.github.requestSerial) setGitHubEditorStatus(`保存失败：${error.message || "无法保存 Token 配置"}`, "error");
+    } finally {
+      if (serial === state.github.requestSerial) {
+        state.github.busy = false;
+        setGitHubEditorBusy(false);
+      }
+    }
+  }
+
+  async function deleteGitHubProfile() {
+    const id = String(state.github.activeProfileId || "").trim();
+    const profile = state.github.profiles.find((item) => item.profileId === id);
+    if (!id || !profile || state.github.busy || state.modelSettings.managerBusy) return;
+    const confirmed = typeof window.confirm === "function"
+      ? window.confirm(`确定移除 GitHub Token 配置“${profile.displayName}”吗？这只会移除本地保存的配置，不会删除 GitHub 账号或仓库。`)
+      : false;
+    if (!confirmed) return;
+    state.github.busy = true;
+    const serial = ++state.github.requestSerial;
+    setGitHubManagerStatus("正在移除 GitHub Token 配置…", "loading");
+    setModelManagerBusy(true);
+    try {
+      const payload = await request(`/settings/github-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (serial !== state.github.requestSerial || !state.modelSettings.open) return;
+      renderGitHubProfiles(payload);
+      setGitHubManagerStatus("GitHub Token 配置已移除。", "success");
+      toast("GitHub Token 配置已移除。", "success");
+    } catch (error) {
+      if (serial === state.github.requestSerial) setGitHubManagerStatus(`移除失败：${error.message || "无法移除 Token 配置"}`, "error");
+    } finally {
+      if (serial === state.github.requestSerial) { state.github.busy = false; setModelManagerBusy(false); }
     }
   }
 
@@ -4519,45 +6897,205 @@
     };
   }
 
-  function renderModelProfileList(options, currentProfileId) {
-    const list = $("modelProfileList");
-    if (!list) return;
-    list.replaceChildren();
-    const profiles = options.filter((item) => item.profileId);
-    list.classList.toggle("hidden", profiles.length === 0);
-    profiles.forEach((profile) => {
-      const row = document.createElement("div");
-      row.className = `model-profile-row${profile.profileId === currentProfileId ? " current" : ""}`;
-      const summary = document.createElement("div");
-      summary.className = "model-profile-summary";
-      const name = document.createElement("strong");
-      name.className = "model-profile-name";
-      name.textContent = profile.displayName || profile.model;
-      const detail = document.createElement("span");
-      detail.className = "model-profile-detail";
-      detail.textContent = `${profile.model}${profile.baseUrl ? ` · ${profile.baseUrl}` : ""}`;
-      summary.append(name, detail);
-      row.appendChild(summary);
-      if (profile.profileId === currentProfileId) {
-        const current = document.createElement("span");
-        current.className = "model-profile-current";
-        current.textContent = "当前";
-        row.appendChild(current);
-      } else {
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.className = "action-button secondary model-profile-delete";
-        remove.textContent = "删除";
-        remove.setAttribute("aria-label", `删除模型配置 ${profile.displayName || profile.model}`);
-        remove.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          void deleteModelProfile(profile.profileId, profile.displayName || profile.model);
-        });
-        row.appendChild(remove);
-      }
-      list.appendChild(row);
+  function collectModelSettingsCatalog(rawSettings, rawOptions) {
+    const settings = modelSettingsPayload(rawSettings);
+    const optionPayload = rawOptions && typeof rawOptions === "object" ? rawOptions : {};
+    const declaredOptions = Array.isArray(settings.options)
+      ? settings.options
+      : Array.isArray(settings.models)
+        ? settings.models
+        : Array.isArray(optionPayload.options) ? optionPayload.options : [];
+    const savedOptions = Array.isArray(optionPayload.saved_profiles)
+      ? optionPayload.saved_profiles
+      : Array.isArray(optionPayload.profiles) ? optionPayload.profiles : [];
+    const declared = declaredOptions.map(normalizeModelOption).filter(Boolean);
+    const saved = savedOptions.map(normalizeModelOption).filter(Boolean);
+    const savedIdentities = new Set(saved.map((item) => `${item.apiMode}|${normalizedModelBaseUrl(item.baseUrl)}|${item.model}`));
+    const filteredDeclared = declared.filter((item) => (
+      !(item.provider === "gui" && savedIdentities.has(`${item.apiMode}|${normalizedModelBaseUrl(item.baseUrl)}|${item.model}`))
+    ));
+    const seen = new Set();
+    const options = [...filteredDeclared, ...saved].filter((item) => {
+      if (!item) return false;
+      const key = item.profileId ? `profile:${item.profileId}` : `declared:${item.provider}:${item.model}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
+    const current = (settings.current && typeof settings.current === "object" ? settings.current : null)
+      || (optionPayload.current && typeof optionPayload.current === "object" ? optionPayload.current : null)
+      || {};
+    const currentProfileId = String(optionPayload.current_profile_id || settings.current_profile_id || "").trim();
+    const currentProfile = options.find((item) => item.profileId === currentProfileId) || null;
+    return {
+      settings,
+      optionPayload,
+      options,
+      currentProfileId: currentProfile ? currentProfile.profileId : "",
+      currentProfileName: String((currentProfile && currentProfile.displayName) || settings.display_name || ""),
+      currentProvider: String(current.provider || settings.provider || "").trim(),
+      currentModel: String(current.model || settings.model || "").trim()
+    };
+  }
+
+  function setModelManagerBusy(busy) {
+    state.modelSettings.managerBusy = Boolean(busy);
+    qsa("#modelProfileChoice, #modelEditProfileButton, #modelDeleteProfileButton, #modelNewProfileButton, #githubProfileChoice, #githubEditProfileButton, #githubDeleteProfileButton, #githubNewProfileButton").forEach((control) => {
+      if (control) control.disabled = Boolean(busy);
+    });
+    if (!busy) {
+      const modelProfiles = state.modelSettings.profileOptions.filter((item) => item && item.profileId);
+      if ($("modelProfileChoice")) $("modelProfileChoice").disabled = !modelProfiles.length;
+      if ($("modelEditProfileButton")) $("modelEditProfileButton").disabled = !state.modelSettings.currentProfileId;
+      if ($("modelDeleteProfileButton")) $("modelDeleteProfileButton").disabled = !state.modelSettings.currentProfileId;
+      if ($("githubProfileChoice")) $("githubProfileChoice").disabled = !state.github.profiles.length || state.github.busy;
+      const canManageGithub = Boolean(state.github.activeProfileId && state.github.profiles.some((profile) => profile.profileId === state.github.activeProfileId));
+      if ($("githubEditProfileButton")) $("githubEditProfileButton").disabled = !canManageGithub || state.github.busy;
+      if ($("githubDeleteProfileButton")) $("githubDeleteProfileButton").disabled = !canManageGithub || state.github.busy;
+    }
+  }
+
+  function renderModelManagerProfiles(catalog) {
+    const profiles = catalog.options.filter((item) => item && item.profileId);
+    state.modelSettings.profileOptions = catalog.options;
+    state.modelSettings.currentProfileId = catalog.currentProfileId;
+    state.modelSettings.currentProfileName = catalog.currentProfileName;
+    const choice = $("modelProfileChoice");
+    if (choice) {
+      choice.replaceChildren();
+      if (!profiles.length) {
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "尚无已保存 API 配置 · 请新建";
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        choice.appendChild(placeholder);
+      } else {
+        profiles.forEach((profile) => {
+          const option = document.createElement("option");
+          option.value = profile.profileId;
+          option.textContent = profile.displayName || profile.model;
+          option.dataset.model = profile.model;
+          choice.appendChild(option);
+        });
+        if (catalog.currentProfileId) choice.value = catalog.currentProfileId;
+        else choice.selectedIndex = -1;
+      }
+      choice.disabled = !profiles.length || state.modelSettings.managerBusy;
+    }
+    const edit = $("modelEditProfileButton");
+    if (edit) edit.disabled = !catalog.currentProfileId || state.modelSettings.managerBusy;
+    const remove = $("modelDeleteProfileButton");
+    if (remove) remove.disabled = !catalog.currentProfileId || state.modelSettings.managerBusy;
+  }
+
+  async function loadModelCatalog(serial = ++state.modelSettings.managerSerial) {
+    setModelManagerBusy(true);
+    setModelManagerStatus("正在读取 API 配置…", "loading");
+    try {
+      const [rawSettings, rawOptions] = await Promise.all([
+        request(MODEL_SETTINGS_PATH),
+        request(`${MODEL_SETTINGS_PATH}/options`).catch(() => null)
+      ]);
+      if (serial !== state.modelSettings.managerSerial || !state.modelSettings.open || state.modelSettings.view !== "manager") return;
+      const catalog = collectModelSettingsCatalog(rawSettings, rawOptions);
+      renderModelManagerProfiles(catalog);
+      setModelManagerStatus("");
+    } catch (error) {
+      if (serial !== state.modelSettings.managerSerial || !state.modelSettings.open || state.modelSettings.view !== "manager") return;
+      renderModelManagerProfiles({ options: [], currentProfileId: "", currentProfileName: "" });
+      setModelManagerStatus(`无法读取 API 配置：${error.message || "请稍后重试"}`, "error");
+    } finally {
+      if (serial === state.modelSettings.managerSerial) setModelManagerBusy(false);
+    }
+  }
+
+  async function selectManagedModel(profileId) {
+    const id = String(profileId || "").trim();
+    if (!id || state.modelSettings.managerBusy || !state.modelSettings.open || state.modelSettings.view !== "manager") return;
+    const choice = $("modelProfileChoice");
+    const previous = state.modelSettings.currentProfileId;
+    const serial = ++state.modelSettings.managerSerial;
+    setModelManagerBusy(true);
+    setModelManagerStatus("正在应用 API 配置…", "loading");
+    try {
+      await request(`${MODEL_SETTINGS_PATH}/select`, { method: "POST", body: { profile_id: id } });
+      if (serial !== state.modelSettings.managerSerial || !state.modelSettings.open) return;
+      await refreshInfo();
+      await loadModelCatalog();
+      setModelManagerStatus("API 配置已应用到所有会话。", "success");
+      toast("API 配置已切换。", "success");
+    } catch (error) {
+      if (choice) choice.value = previous;
+      if (serial === state.modelSettings.managerSerial) setModelManagerStatus(`切换失败：${error.message || "无法应用 API 配置"}`, "error");
+    } finally {
+      if (serial === state.modelSettings.managerSerial) setModelManagerBusy(false);
+    }
+  }
+
+  async function deleteManagedModel() {
+    const id = String(state.modelSettings.currentProfileId || "").trim();
+    const profile = state.modelSettings.profileOptions.find((item) => item && item.profileId === id);
+    if (!id || !profile || state.modelSettings.managerBusy || !state.modelSettings.open) return;
+    const name = profile.displayName || profile.model || id;
+    const confirmed = typeof window.confirm === "function"
+      ? window.confirm(`确定移除 API 配置“${name}”吗？这只会移除本地保存的连接配置，不会删除服务商账户。`)
+      : false;
+    if (!confirmed) return;
+    const serial = ++state.modelSettings.managerSerial;
+    setModelManagerBusy(true);
+    setModelManagerStatus("正在移除 API 配置…", "loading");
+    try {
+      await request(`${MODEL_SETTINGS_PATH}/delete`, { method: "POST", body: { profile_id: id, confirm: true } });
+      if (serial !== state.modelSettings.managerSerial || !state.modelSettings.open) return;
+      await refreshInfo();
+      await loadModelCatalog();
+      setModelManagerStatus("API 配置已移除。", "success");
+      toast("API 配置已移除。", "success");
+    } catch (error) {
+      if (serial === state.modelSettings.managerSerial) setModelManagerStatus(`移除失败：${error.message || "无法移除 API 配置"}`, "error");
+    } finally {
+      if (serial === state.modelSettings.managerSerial) setModelManagerBusy(false);
+    }
+  }
+
+  function openModelEditor({ newProfile = false } = {}) {
+    if (!state.modelSettings.open || state.modelSettings.managerBusy || state.modelSettings.editorOpen || state.github.editorOpen) return;
+    state.modelSettings.editorOpen = true;
+    state.modelSettings.view = "api";
+    $("modelSettingsBackdrop").classList.add("hidden");
+    $("modelEditorBackdrop").classList.remove("hidden");
+    setText($("modelEditorTitle"), newProfile ? "新建 API 配置" : "编辑 API 配置");
+    resetModelSettingsForm();
+    const serial = ++state.modelSettings.requestSerial;
+    if (newProfile) {
+      startNewModelProfile();
+      $("modelProfileName")?.focus();
+    } else {
+      loadModelSettings(serial);
+      $("modelEditorClose")?.focus();
+    }
+  }
+
+  function closeModelEditor({ returnToManager = true, refreshManager = true } = {}) {
+    if (!state.modelSettings.editorOpen) return;
+    if (state.modelSettings.busyAction === "saving") {
+      setModelSettingsStatus("正在保存模型设置，请稍候…", "loading");
+      return;
+    }
+    state.modelSettings.editorOpen = false;
+    state.modelSettings.view = returnToManager ? "manager" : "";
+    ++state.modelSettings.requestSerial;
+    setModelSettingsBusy("");
+    if ($("modelApiKey")) $("modelApiKey").value = "";
+    if ($("modelClearKey")) $("modelClearKey").checked = false;
+    $("modelEditorBackdrop").classList.add("hidden");
+    if (returnToManager && state.modelSettings.open) {
+      setText($("modelEditorTitle"), "编辑 API 配置");
+      $("modelSettingsBackdrop").classList.remove("hidden");
+      if (refreshManager) void loadModelCatalog();
+      $("modelProfileChoice")?.focus();
+    }
   }
 
   async function loadModelSettings(serial) {
@@ -4570,7 +7108,7 @@
       ]);
       const settings = modelSettingsPayload(rawSettings);
       const optionPayload = rawOptions && typeof rawOptions === "object" ? rawOptions : {};
-      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.open) return;
+      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.editorOpen) return;
       const mode = String(settings.api_mode || "chat_completions");
       $("modelApiMode").value = ["chat_completions", "anthropic_messages"].includes(mode) ? mode : "chat_completions";
       $("modelBaseUrl").value = String(settings.base_url || "");
@@ -4606,13 +7144,8 @@
           return true;
         });
       state.modelSettings.profileOptions = options;
-      const current = (settings.current && typeof settings.current === "object" ? settings.current : null)
-        || (optionPayload.current && typeof optionPayload.current === "object" ? optionPayload.current : null)
-        || {};
       const currentProfileId = String(optionPayload.current_profile_id || settings.current_profile_id || "").trim();
       const currentProfile = options.find((item) => item.profileId === currentProfileId) || null;
-      const currentProvider = String(current.provider || settings.provider || "").trim();
-      const currentModel = String(current.model || settings.model || "").trim();
       const selectedProfileId = currentProfile ? currentProfile.profileId : "";
       state.modelSettings.currentProfileId = selectedProfileId;
       state.modelSettings.currentProfileName = String((currentProfile && currentProfile.displayName) || settings.display_name || "");
@@ -4623,93 +7156,14 @@
         model: $("modelName").value
       };
       if ($("modelProfileName")) $("modelProfileName").value = state.modelSettings.currentProfileName;
-      const choiceField = $("modelChoiceField");
-      const choice = $("modelChoice");
-      if (choiceField && choice) {
-        choice.replaceChildren();
-        options.forEach((option) => {
-          const item = document.createElement("option");
-          item.value = option.value;
-          item.textContent = option.text;
-          if (option.profileId) item.dataset.profileId = option.profileId;
-          if (option.provider) item.dataset.provider = option.provider;
-          item.dataset.model = option.model;
-          if (option.apiMode) item.dataset.apiMode = option.apiMode;
-          if (option.baseUrl) item.dataset.baseUrl = option.baseUrl;
-          if (option.hasApiKey != null) item.dataset.hasApiKey = option.hasApiKey ? "true" : "false";
-          if (option.displayName) item.dataset.displayName = option.displayName;
-          choice.appendChild(item);
-        });
-        choiceField.classList.toggle("hidden", choice.childElementCount === 0);
-        const currentOption = selectedProfileId
-          ? Array.from(choice.options).find((item) => item.dataset.profileId === selectedProfileId)
-          : Array.from(choice.options).find((item) => currentProvider && item.dataset.provider === currentProvider && item.dataset.model === currentModel)
-            || Array.from(choice.options).find((item) => item.dataset.model === currentModel || item.value === currentModel);
-        if (currentOption) choice.value = currentOption.value;
-      }
-      renderModelProfileList(options, selectedProfileId);
-      await loadGitHubToken();
       setModelSettingsStatus(savedModelSettingsWarning(state.info && state.info.settings_error), state.info && state.info.settings_error ? "error" : "");
     } catch (error) {
-      if (serial === state.modelSettings.requestSerial && state.modelSettings.open) {
+      if (serial === state.modelSettings.requestSerial && state.modelSettings.editorOpen) {
         setModelSettingsStatus(`无法读取当前模型设置：${modelSettingsMessage(error.message || "服务暂不可用")}`, "error");
       }
     } finally {
       setModelSettingsBusy("", serial);
-      if (serial === state.modelSettings.requestSerial && state.modelSettings.open) $("modelApiMode").focus();
-    }
-  }
-
-  async function selectConfiguredModel(option) {
-    const profileId = String(option && option.dataset && option.dataset.profileId || "").trim();
-    const provider = String(option && option.dataset && option.dataset.provider || "").trim();
-    const model = String(option && option.dataset && option.dataset.model || option && option.value || "").trim();
-    if (!profileId && (!provider || !model)) {
-      $("modelName").value = model;
-      if (option && option.dataset && ["chat_completions", "anthropic_messages"].includes(option.dataset.apiMode || "")) $("modelApiMode").value = option.dataset.apiMode;
-      if (option && option.dataset && option.dataset.baseUrl) $("modelBaseUrl").value = option.dataset.baseUrl;
-      setModelSettingsStatus("已填入模型连接字段；修改后点击“保存并应用”。");
-      return;
-    }
-    if (state.modelSettings.busyAction) return;
-    const serial = ++state.modelSettings.requestSerial;
-    setModelSettingsBusy("selecting", serial);
-    setModelSettingsStatus("正在切换已配置模型…", "loading");
-    try {
-      const payload = await request(`${MODEL_SETTINGS_PATH}/select`, {
-        method: "POST",
-        body: profileId ? { profile_id: profileId } : { provider, model }
-      });
-      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.open) return;
-      const current = payload && payload.current && typeof payload.current === "object" ? payload.current : {};
-      const apiMode = String(option.dataset.apiMode || current.api_mode || "chat_completions");
-      const baseUrl = String(option.dataset.baseUrl || current.base_url || $("modelBaseUrl").value || "");
-      $("modelApiMode").value = ["chat_completions", "anthropic_messages"].includes(apiMode) ? apiMode : "chat_completions";
-      $("modelBaseUrl").value = baseUrl;
-      $("modelName").value = String(current.model || model);
-      $("modelApiKey").value = "";
-      const hasApiKey = current.has_api_key != null ? modelHasApiKey(current.has_api_key) : modelHasApiKey(option.dataset.hasApiKey);
-      updateModelKeyControls(hasApiKey);
-      state.modelSettings.currentProfileId = profileId;
-      state.modelSettings.currentProfileName = String(option.dataset.displayName || "");
-      state.modelSettings.newProfile = false;
-      state.modelSettings.loadedIdentity = { api_mode: $("modelApiMode").value, base_url: baseUrl, model: $("modelName").value };
-      if ($("modelProfileName")) $("modelProfileName").value = state.modelSettings.currentProfileName;
-      renderModelProfileList(state.modelSettings.profileOptions, profileId);
-      const label = profileId
-        ? `配置“${state.modelSettings.currentProfileName || model}”`
-        : `${provider} · ${model}`;
-      setModelSettingsStatus(`已切换到 ${label}。${profileId ? "已恢复该配置的密钥和连接字段。" : "已切回配置文件中的 Provider 路由。"}`, "success");
-      await refreshInfo();
-    } catch (error) {
-      if (serial === state.modelSettings.requestSerial && state.modelSettings.open) {
-        const message = error.status === 404 || error.status === 405
-          ? "当前服务暂不支持已配置模型即时切换，请编辑连接字段后保存。"
-          : `切换失败：${error.message || "无法应用已配置模型"}`;
-        setModelSettingsStatus(message, "error");
-      }
-    } finally {
-      setModelSettingsBusy("", serial);
+      if (serial === state.modelSettings.requestSerial && state.modelSettings.editorOpen) $("modelApiMode").focus();
     }
   }
 
@@ -4725,67 +7179,50 @@
     if ($("modelName")) $("modelName").value = "";
     if ($("modelApiKey")) $("modelApiKey").value = "";
     if ($("modelClearKey")) $("modelClearKey").checked = false;
-    if ($("modelChoice")) $("modelChoice").selectedIndex = -1;
     updateModelKeyControls(false);
     setModelSettingsStatus("新建配置草稿已清空；已有配置不会被删除。填写连接字段后保存即可。", "success");
     $("modelProfileName")?.focus();
   }
 
-  async function deleteModelProfile(profileId, displayName) {
-    const id = String(profileId || "").trim();
-    if (!id || id === state.modelSettings.currentProfileId) {
-      toast("当前正在使用的配置不能删除。", "error");
-      return;
-    }
-    if (state.modelSettings.busyAction) return;
-    if (!window.confirm(`确定删除模型配置“${displayName || id}”吗？此操作不会影响当前正在使用的配置。`)) return;
-    const serial = ++state.modelSettings.requestSerial;
-    setModelSettingsBusy("deleting", serial);
-    setModelSettingsStatus("正在删除模型配置…", "loading");
-    try {
-      await request(`${MODEL_SETTINGS_PATH}/delete`, {
-        method: "POST",
-        body: { profile_id: id, confirm: true }
-      });
-      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.open) return;
-      setModelSettingsStatus("模型配置已删除。", "success");
-      await loadModelSettings(serial);
-      await refreshGlobalModels();
-      toast("模型配置已删除。", "success");
-    } catch (error) {
-      if (serial === state.modelSettings.requestSerial && state.modelSettings.open) setModelSettingsStatus(`删除失败：${error.message || "无法删除模型配置"}`, "error");
-    } finally {
-      setModelSettingsBusy("", serial);
-    }
-  }
-
   function openModelSettings() {
-    if (state.modelSettings.open || state.modelSettings.busyAction) return;
+    if (state.modelSettings.open || state.modelSettings.busyAction || state.modelSettings.managerBusy) return;
     state.modelSettings.open = true;
+    state.modelSettings.view = "manager";
+    state.modelSettings.editorOpen = false;
+    state.github.editorOpen = false;
     state.modelSettings.previousFocus = document.activeElement;
-    resetModelSettingsForm();
     $("modelSettingsBackdrop").classList.remove("hidden");
+    $("modelEditorBackdrop").classList.add("hidden");
+    $("githubProfileEditorBackdrop").classList.add("hidden");
     document.body.classList.add("modal-open");
-    const serial = ++state.modelSettings.requestSerial;
-    loadModelSettings(serial);
+    ++state.modelSettings.managerSerial;
+    void loadModelCatalog(state.modelSettings.managerSerial);
+    void loadGitHubProfiles();
     $("modelSettingsClose").focus();
   }
 
   function closeModelSettings() {
     if (!state.modelSettings.open) return;
-    if (state.modelSettings.busyAction === "saving") {
-      setModelSettingsStatus("正在保存模型设置，请稍候…", "loading");
-      return;
-    }
+    if (state.github.editorOpen) { closeGitHubProfileEditor(); return; }
+    if (state.modelSettings.editorOpen) { closeModelEditor(); return; }
     state.modelSettings.open = false;
+    state.modelSettings.view = "";
     ++state.modelSettings.requestSerial;
+    ++state.modelSettings.managerSerial;
+    ++state.github.requestSerial;
     setModelSettingsBusy("");
-    // Clear the secret as soon as the dialog closes. It is never put in
-    // localStorage/sessionStorage and is not included in any diagnostic text.
+    setModelManagerBusy(false);
+    state.github.busy = false;
     if ($("modelApiKey")) $("modelApiKey").value = "";
     if ($("modelClearKey")) $("modelClearKey").checked = false;
+    if ($("githubProfileToken")) $("githubProfileToken").value = "";
+    if ($("githubProfileName")) $("githubProfileName").value = "";
     $("modelSettingsBackdrop").classList.add("hidden");
-    if (!state.workflowChat.open && !state.newSession.open && !state.jobEditor.open && !state.clarification.open) document.body.classList.remove("modal-open");
+    $("modelEditorBackdrop").classList.add("hidden");
+    $("githubProfileEditorBackdrop").classList.add("hidden");
+    state.modelSettings.editorOpen = false;
+    state.github.editorOpen = false;
+    if (!state.workflowChat.open && !state.newSession.open && !state.jobEditor.open && !state.sessionEditor.open && !state.clarification.open) document.body.classList.remove("modal-open");
     const previousFocus = state.modelSettings.previousFocus;
     state.modelSettings.previousFocus = null;
     restoreSidebarAwareFocus(previousFocus);
@@ -4793,7 +7230,7 @@
 
   function trapModelSettingsFocus(event) {
     if (event.key !== "Tab") return;
-    const backdrop = state.clarification.open ? $("clarificationBackdrop") : state.newSession.open ? $("newSessionBackdrop") : state.modelSettings.open ? $("modelSettingsBackdrop") : state.workflowChat.open ? $("workflowChatBackdrop") : null;
+    const backdrop = state.clarification.open ? $("clarificationBackdrop") : state.newSession.open ? $("newSessionBackdrop") : state.github.editorOpen ? $("githubProfileEditorBackdrop") : state.modelSettings.editorOpen ? $("modelEditorBackdrop") : state.modelSettings.open ? $("modelSettingsBackdrop") : state.workflowChat.open ? $("workflowChatBackdrop") : null;
     if (!backdrop) return;
     const dialog = backdrop.querySelector('[role="dialog"]');
     const focusable = qsa("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])", dialog).filter((node) => node.offsetParent !== null);
@@ -4813,12 +7250,12 @@
     setModelSettingsStatus("正在测试连接…", "loading");
     try {
       const payload = await request(`${MODEL_SETTINGS_PATH}/test`, { method: "POST", body: draft });
-      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.open) return;
+      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.editorOpen) return;
       const message = modelTestMessage(payload, draft.api_key);
       if (payload && payload.ok === true) setModelSettingsStatus(message || "连接成功。", "success");
       else setModelSettingsStatus(`测试失败：${message || "服务未确认连接成功。"}`, "error");
     } catch (error) {
-      if (serial === state.modelSettings.requestSerial && state.modelSettings.open) setModelSettingsStatus(`测试失败：${modelSettingsMessage(error.message || "无法连接服务", draft.api_key)}`, "error");
+      if (serial === state.modelSettings.requestSerial && state.modelSettings.editorOpen) setModelSettingsStatus(`测试失败：${modelSettingsMessage(error.message || "无法连接服务", draft.api_key)}`, "error");
     } finally {
       setModelSettingsBusy("", serial);
     }
@@ -4834,20 +7271,21 @@
     setModelSettingsStatus("正在保存并应用模型设置…", "loading");
     try {
       const payload = await request(MODEL_SETTINGS_PATH, { method: "POST", body: draft });
-      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.open) return;
+      if (serial !== state.modelSettings.requestSerial || !state.modelSettings.editorOpen) return;
       const keyWasSent = Boolean(draft.api_key);
       updateModelKeyControls(draft.clear_api_key ? false : (keyWasSent || state.modelSettings.hasApiKey));
       $("modelApiKey").value = "";
-      // Re-read the catalog so a newly created profile gets its server
-      // assigned id and the non-current delete controls stay accurate.
-      await loadModelSettings(serial);
-      setModelSettingsStatus("模型设置已保存；所有岗位会话的后续消息将使用当前配置。", "success");
       // /info is the source of truth for the header badge. Refresh it after
       // saving so demo/unconfigured/configured state cannot become stale.
       await refreshInfo();
-      toast(modelSettingsMessage((payload && payload.message) || "模型设置已保存；所有岗位会话的后续消息将使用当前配置。", draft.api_key), "success");
+      const message = modelSettingsMessage((payload && payload.message) || "模型设置已保存；所有岗位会话的后续消息将使用当前配置。", draft.api_key);
+      setModelSettingsBusy("", serial);
+      closeModelEditor({ refreshManager: false });
+      await loadModelCatalog();
+      setModelManagerStatus(message, "success");
+      toast(message, "success");
     } catch (error) {
-      if (serial === state.modelSettings.requestSerial && state.modelSettings.open) setModelSettingsStatus(`保存失败：${modelSettingsMessage(error.message || "无法保存模型设置", draft.api_key)}`, "error");
+      if (serial === state.modelSettings.requestSerial && state.modelSettings.editorOpen) setModelSettingsStatus(`保存失败：${modelSettingsMessage(error.message || "无法保存模型设置", draft.api_key)}`, "error");
     } finally {
       setModelSettingsBusy("", serial);
     }
@@ -4884,7 +7322,7 @@
         else select.selectedIndex = -1;
         // A YAML/provider route may be active without a saved GUI profile. Do
         // not invent a selected profile or silently select the first saved one.
-        setText($("globalModelStatus"), globalModelCurrent ? "所有会话共用" : "当前使用未保存配置；可在设置中保存并命名");
+        setText($("globalModelStatus"), globalModelCurrent ? "已选择 API 配置" : "当前使用未保存配置；可在设置中保存并命名");
         select.disabled = false;
       } else {
         const placeholder = document.createElement("option");
@@ -4971,10 +7409,103 @@
     if (!state.newSession.open || state.newSession.busy) return;
     state.newSession.open = false;
     $("newSessionBackdrop").classList.add("hidden");
-    if (!state.modelSettings.open && !state.jobEditor.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.sessionEditor.open && !state.clarification.open && !state.workflowChat.open) document.body.classList.remove("modal-open");
     const previous = state.newSession.previousFocus;
     state.newSession.previousFocus = null;
     restoreSidebarAwareFocus(previous);
+  }
+
+  function mergeSessionSummary(summary) {
+    if (!summary || !summary.id) return null;
+    const id = String(summary.id);
+    const currentIndex = state.sessions.findIndex((row) => String(row.id) === id);
+    if (currentIndex >= 0) state.sessions[currentIndex] = { ...state.sessions[currentIndex], ...summary };
+    else state.sessions.push(summary);
+    if (String(state.currentSessionId || "") === id && state.currentSession) {
+      state.currentSession = { ...state.currentSession, ...summary };
+    }
+    return summary;
+  }
+
+  function openRenameSession(id) {
+    const target = String(id || "");
+    const summary = state.sessions.find((row) => String(row.id) === target)
+      || (state.currentSession && String(state.currentSession.id) === target ? state.currentSession : null);
+    if (!target || !summary || state.sessionEditor.busy) return;
+    state.sessionEditor.open = true;
+    state.sessionEditor.sessionId = target;
+    state.sessionEditor.previousFocus = document.activeElement;
+    const input = $("sessionRenameInput");
+    if (input) input.value = String(summary.custom_title || (summary.title_source === "custom" ? summary.title : "") || "");
+    setText($("sessionRenameStatus"), "");
+    $("sessionRenameBackdrop").classList.remove("hidden");
+    document.body.classList.add("modal-open");
+    input?.focus();
+    input?.select?.();
+  }
+
+  function closeRenameSession({ restore = true } = {}) {
+    if (!state.sessionEditor.open || state.sessionEditor.busy) return;
+    state.sessionEditor.open = false;
+    state.sessionEditor.sessionId = "";
+    $("sessionRenameBackdrop").classList.add("hidden");
+    const localImportBackdrop = $("localImportBackdrop");
+    const localImportOpen = localImportBackdrop && !localImportBackdrop.classList.contains("hidden");
+    if (!state.modelSettings.open && !state.jobEditor.open && !state.newSession.open && !state.clarification.open && !state.jdImport.open && !state.workflowChat.open && !state.workspaceSwitch.open && !localImportOpen) document.body.classList.remove("modal-open");
+    const previous = state.sessionEditor.previousFocus;
+    state.sessionEditor.previousFocus = null;
+    if (restore) restoreSidebarAwareFocus(previous);
+  }
+
+  async function saveSessionRename(event) {
+    event.preventDefault();
+    if (state.sessionEditor.busy) return;
+    const id = String(state.sessionEditor.sessionId || "");
+    if (!id) return;
+    const input = $("sessionRenameInput");
+    const title = String(input?.value || "").trim();
+    if (new TextEncoder().encode(title).length > 256) {
+      setText($("sessionRenameStatus"), "名称不能超过 256 字节。请缩短后重试。");
+      input?.focus();
+      return;
+    }
+    state.sessionEditor.busy = true;
+    if (input) input.disabled = true;
+    $("sessionRenameSave").disabled = true;
+    setText($("sessionRenameStatus"), "正在保存…");
+    try {
+      const summary = await request(`/sessions/${encodeURIComponent(id)}`, { method: "PATCH", body: { title: title || null } });
+      mergeSessionSummary(summary);
+      closeRenameSession();
+      renderAll();
+      toast(title ? "会话名称已保存。" : "已恢复自动岗位名称。", "success");
+    } catch (error) {
+      setText($("sessionRenameStatus"), error.message || "保存名称失败");
+      toast(error.message || "保存名称失败", "error");
+    } finally {
+      state.sessionEditor.busy = false;
+      if (input) input.disabled = false;
+      if ($("sessionRenameSave")) $("sessionRenameSave").disabled = false;
+    }
+  }
+
+  async function toggleSessionPinned(id) {
+    const target = String(id || "");
+    const summary = state.sessions.find((row) => String(row.id) === target);
+    if (!target || !summary || state.sessionEditor.busy) return;
+    const nextPinned = !Boolean(summary.pinned);
+    const action = qsa("[data-session-pin]").find((node) => String(node.dataset.sessionPin || "") === target);
+    if (action) action.disabled = true;
+    try {
+      const updated = await request(`/sessions/${encodeURIComponent(target)}`, { method: "PATCH", body: { pinned: nextPinned } });
+      mergeSessionSummary(updated);
+      renderAll();
+      toast(nextPinned ? "会话已置顶。" : "会话已取消置顶。", "success");
+    } catch (error) {
+      toast(error.message || "更新置顶状态失败", "error");
+    } finally {
+      if (action) action.disabled = false;
+    }
   }
 
   async function createSession(sourceId = "") {
@@ -5020,6 +7551,7 @@
 
   async function selectSession(id, { restore = false } = {}) {
     const target = String(id || ""); if (!target) return;
+    if (state.sessionEditor.open && state.sessionEditor.sessionId !== target) closeRenameSession({ restore: false });
     if (state.jobEditor.open && state.jobEditor.sessionId !== target) closeJobEditor();
     captureComposerDraft(state.workflowChat.scope);
     closeClarificationModal({ restore: false });
@@ -5027,7 +7559,9 @@
     clearPolling();
     clearCommandRuntime();
     stopVoiceInput({ cancel: true });
-    state.currentSessionId = target; state.currentSession = null; state.loadingSession = true; state.optimisticMessage = null; state.practice.optimisticMessage = null; state.practice.sessionId = target; state.practice.projectKey = ""; state.practice.projectTitle = ""; state.practice.threadId = ""; state.practice.messages = []; state.practice.events = []; state.practice.loaded = false; state.practice.loading = false; state.practice.error = ""; state.practice.startPending = false; state.workflowChat.scope = "main"; state.workflowChat.practiceProjectKey = ""; state.uploadedAttachment = null; state.uploadedAttachments = []; persistCurrentSession();
+    state.currentSessionId = target; state.currentSession = null; state.loadingSession = true; state.optimisticMessage = null; state.practice.optimisticMessage = null; state.practice.sessionId = target; state.practice.projectKey = ""; state.practice.projectTitle = ""; state.practice.threadId = ""; state.practice.messages = []; state.practice.events = []; state.practice.loaded = false; state.practice.loading = false; state.practice.error = ""; state.practice.startPending = false; state.workflowChat.scope = "main"; state.workflowChat.practiceProjectKey = ""; state.uploadedAttachment = null; state.uploadedAttachments = [];
+    restoreComposerDraft("main", target, "");
+    persistCurrentSession();
     renderAll();
     const serial = ++state.sessionRequestSerial;
     try {
@@ -5062,6 +7596,7 @@
   async function deleteSession(id) {
     const target = String(id || "");
     if (!target) return;
+    if (state.sessionEditor.open && state.sessionEditor.sessionId === target) closeRenameSession({ restore: false });
     const summary = state.sessions.find((row) => String(row.id) === target);
     if (!window.confirm(`确定删除会话“${sessionTitle(summary || { title: target })}”吗？此操作会移除会话记录。`)) return;
     try {
@@ -5361,9 +7896,15 @@
         }
       }
       const session = await refreshCurrentSession(id, { scroll: Boolean(terminalPayload), clearOptimistic: !job });
+      if (terminalPayload && job?.showPracticeCandidates) {
+        finishPracticeCandidates(session, terminalPayload.status === "completed" && !["failed", "error", "cancelled"].includes(terminalPayload.result?.status));
+      }
       await refreshCommandRuntime();
       if (terminalPayload && state.practice.sessionId === id && state.practice.threadId && state.workflowChat.scope === "practice") {
         try { await refreshPracticeThread(id, state.practice.threadId); } catch (_error) { /* the scoped panel reports its own read error */ }
+      }
+      if (terminalPayload && state.interview.sessionId === id && state.interview.threadId && state.workflowChat.scope === "interview") {
+        try { await refreshInterviewThread(id, state.interview.threadId); } catch (_error) { /* the scoped panel reports its own read error */ }
       }
       if (terminalPayload) {
         const clarificationOutcome = finishClarificationJob(id, terminalPayload, session);
@@ -5392,8 +7933,9 @@
     }
   }
 
-  async function enqueueAction(path, body, targetId = state.currentSessionId, { optimisticText = "", restoreText = "", restoreAttachment = null, restoreAttachments = null, clarificationContext = null, scope = "main", projectKey = "" } = {}) {
-    const id = String(targetId || ""); if (!id || String(state.currentSessionId) !== id) return false;
+  async function enqueueAction(path, body, targetId = state.currentSessionId, { optimisticText = "", restoreText = "", restoreAttachment = null, restoreAttachments = null, clarificationContext = null, scope = "main", projectKey = "", showPracticeCandidates = false } = {}) {
+    const id = String(targetId || "");
+    if (!id || String(state.currentSessionId) !== id || state.loadingSession || !state.currentSession || String(state.currentSession.id || "") !== id) return false;
     const recoveryPath = new Set(["approve", "reject", "continue", "resolve"]).has(String(path || ""));
     const recoveryEntry = !clarificationContext && recoveryPath ? clarificationJobFor(id) : null;
     const operationClarification = clarificationContext || recoveryEntry;
@@ -5414,7 +7956,8 @@
         baseUserCount: visibleUserCount(baseline)
       };
     }
-    if (state.currentSession) state.currentSession.busy = true;
+    if (scope === "interview") state.interview.busy = true;
+    else if (state.currentSession) state.currentSession.busy = true;
     renderAll();
     try {
       const payload = await request(`/sessions/${encodeURIComponent(id)}/${path}`, { method: "POST", body });
@@ -5425,7 +7968,11 @@
       // the job association before checking the visible session so the
       // result can still be observed when they return.
       if (jobId) {
-        state.jobs.set(id, { id: String(jobId) });
+        state.jobs.set(id, { id: String(jobId), showPracticeCandidates });
+        if (scope === "interview" && String(state.currentSessionId) === id) {
+          state.interview.jobId = String(jobId);
+          state.interview.busy = true;
+        }
         if (operationClarification) {
           const entry = state.clarification.jobs.get(id);
           if (entry && (!operationClarification.token || entry.token === operationClarification.token)) {
@@ -5441,14 +7988,20 @@
       const session = unwrapSession(payload);
       if (session && session.id) { state.currentSession = session; renderAll(); }
       if (jobId) {
-        if (state.currentSession) state.currentSession.busy = true;
+        if (scope === "interview") state.interview.busy = true;
+        else if (state.currentSession) state.currentSession.busy = true;
         renderAll(); startPolling(id);
       } else {
         if (scope === "practice") state.practice.optimisticMessage = null;
+        else if (scope === "interview") state.interview.busy = false;
         else state.optimisticMessage = null;
         const latest = await refreshCurrentSession(id, { scroll: true });
+        if (showPracticeCandidates && latest && !latest.busy) finishPracticeCandidates(latest, true);
         if (scope === "practice" && state.practice.threadId) {
           try { await refreshPracticeThread(id, state.practice.threadId); } catch (_error) { /* scoped panel keeps the error */ }
+        }
+        if (scope === "interview" && state.interview.threadId) {
+          try { await refreshInterviewThread(id, state.interview.threadId); } catch (_error) { /* scoped panel keeps the error */ }
         }
         if (latest && latest.busy) startPolling(id);
         await refreshSessions();
@@ -5477,6 +8030,11 @@
       }
       if (String(state.currentSessionId) === id) {
         if (scope === "practice") state.practice.optimisticMessage = null;
+        else if (scope === "interview") {
+          state.interview.busy = false;
+          state.interview.jobId = "";
+          state.interview.error = error.message || "访谈操作失败，请重试。";
+        }
         else state.optimisticMessage = null;
         if (state.currentSession) state.currentSession.busy = false;
         if (restoreText) { $("composerInput").value = restoreText; resizeComposer(); }
@@ -5497,7 +8055,21 @@
 
   async function sendMessage() {
     const input = $("composerInput");
-    if ((state.voice.active || state.voice.stopping) && state.voice.target === input) stopVoiceInput({ cancel: true });
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target === input) stopVoiceInput({ cancel: true });
+    if (state.loadingSession) return;
+    if (state.workflowChat.open && state.workflowChat.scope === "interview") {
+      const draftSessionId = String(state.currentSessionId || "");
+      const threadId = String(state.interview.threadId || "");
+      const text = String(input.value || "").trim();
+      if (!text || !draftSessionId || !threadId) return;
+      input.value = ""; resizeComposer();
+      clearComposerDraft("interview", draftSessionId, threadId);
+      const accepted = await sendInterviewMessage(text);
+      if (!accepted && String(state.currentSessionId || "") === draftSessionId && state.workflowChat.open && state.workflowChat.scope === "interview") {
+        input.value = text; resizeComposer(); captureComposerDraft("interview", draftSessionId, threadId); renderAll();
+      }
+      return;
+    }
     if (state.workflowChat.open && state.workflowChat.scope === "practice") {
       if (!state.currentSessionId) return;
       if (state.currentSession && state.currentSession.pending && !practiceApprovalMatches(state.currentSession)) {
@@ -5607,18 +8179,29 @@
   }
 
   async function approveOrReject(kind) {
-    const session = state.currentSession; const pending = session && session.pending; if (!pending || !pending.id) return;
-    await enqueueAction(kind, { id: String(pending.id) }, state.currentSessionId);
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
+    const session = state.currentSession;
+    const pending = interviewScope ? state.interview.pending : session && session.pending;
+    if (!pending || !pending.id) return;
+    await enqueueAction(kind, { id: String(pending.id) }, state.currentSessionId, interviewScope ? { scope: "interview" } : {});
   }
 
-  async function continueSession() { await enqueueAction("continue", {}, state.currentSessionId); }
+  async function continueSession() {
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
+    await enqueueAction("continue", {}, state.currentSessionId, interviewScope ? { scope: "interview" } : {});
+  }
 
   async function resolveUncertain() {
-    const session = state.currentSession; const id = approvalIdFor(session); if (!id) return;
+    const interviewScope = state.workflowChat.open && state.workflowChat.scope === "interview";
+    const session = state.currentSession;
+    const id = interviewScope
+      ? String(state.interview.pending?.id || state.interview.execution?.approval_id || state.interview.execution?.call_id || "")
+      : approvalIdFor(session);
+    if (!id) return;
     const note = String($("resolveNote") && $("resolveNote").value || "").trim();
     const target = String(state.currentSessionId);
     state.followUpJobs.set(target, "continue");
-    const resolved = await enqueueAction("resolve", { id, note }, target);
+    const resolved = await enqueueAction("resolve", { id, note }, target, interviewScope ? { scope: "interview" } : {});
     if (resolved && !state.jobs.has(target)) {
       state.followUpJobs.delete(target);
       await continueSession();
@@ -5627,6 +8210,92 @@
 
   function resizeComposer() {
     const input = $("composerInput"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
+  }
+
+  const VOICE_MAX_AUDIO_BYTES = 8 * 1024 * 1024;
+  const VOICE_DEFAULT_MAX_DURATION_SECONDS = 120;
+  const VOICE_STATUS_TIMEOUT_MS = 10000;
+  const VOICE_STOP_TIMEOUT_MS = 1200;
+  const VOICE_TRANSCRIBE_TIMEOUT_MS = 300000;
+  const VOICE_STATUS_PATH = "/speech/status";
+  const VOICE_TRANSCRIBE_PATH = "/speech/transcribe";
+
+  function normalizeVoiceStatus(payload) {
+    const available = payload && typeof payload.available === "boolean" ? payload.available : false;
+    const mode = String(payload && payload.mode || "offline").toLowerCase() === "offline" ? "offline" : "offline";
+    const maxDurationSeconds = Math.min(
+      VOICE_DEFAULT_MAX_DURATION_SECONDS,
+      Math.max(1, Number(payload && payload.max_duration_seconds) || VOICE_DEFAULT_MAX_DURATION_SECONDS),
+    );
+    let message = String(payload && payload.message || "").trim();
+    if (!message) message = available ? "本机离线语音已就绪。" : "本机离线语音不可用，请确认语音组件已安装。";
+    return { available, mode, message, maxDurationSeconds };
+  }
+
+  function voiceStatusMessage() {
+    const status = state.voice.status || {};
+    if (status.available === false) return status.message || "本机离线语音不可用，请确认语音组件已安装。";
+    if (status.available === null) return status.message || "正在检查本机离线语音…";
+    return status.message || "本机离线语音已就绪。";
+  }
+
+  async function loadVoiceStatus() {
+    if (state.voice.statusRequest) return state.voice.statusRequest;
+    const Controller = typeof window.AbortController === "function" ? window.AbortController : (typeof AbortController === "function" ? AbortController : null);
+    const controller = Controller ? new Controller() : null;
+    let timeoutId = null;
+    let timedOut = false;
+    state.voice.statusAbortController = controller;
+    const statusRequest = request(VOICE_STATUS_PATH, { signal: controller ? controller.signal : undefined });
+    const timeout = new Promise((_resolve, reject) => {
+      timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        if (controller) {
+          try { controller.abort(); } catch (_error) { /* already aborted */ }
+        }
+        const error = new Error("speech_status_timeout");
+        error.name = "TimeoutError";
+        reject(error);
+      }, VOICE_STATUS_TIMEOUT_MS);
+    });
+    const pending = Promise.race([statusRequest, timeout]).then((payload) => {
+      if (state.voice.statusRequest !== pending) return state.voice.status;
+      state.voice.status = normalizeVoiceStatus(payload);
+      return state.voice.status;
+    }).catch((error) => {
+      if (state.voice.statusRequest !== pending) return state.voice.status;
+      if (controller && controller.signal.aborted && !timedOut) return state.voice.status;
+      state.voice.status = {
+        available: false,
+        mode: "offline",
+        message: error && error.name === "TimeoutError" ? "检查本机离线语音超时，点击语音按钮可重试。" : "本机离线语音不可用，请确认语音组件已安装。",
+        maxDurationSeconds: VOICE_DEFAULT_MAX_DURATION_SECONDS
+      };
+      return state.voice.status;
+    }).finally(() => {
+      if (state.voice.statusRequest === pending) state.voice.statusRequest = null;
+      if (state.voice.statusAbortController === controller) state.voice.statusAbortController = null;
+      if (state.voice.statusTimeoutId === timeoutId) state.voice.statusTimeoutId = null;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      updateVoiceUi();
+    });
+    state.voice.statusRequest = pending;
+    state.voice.statusTimeoutId = timeoutId;
+    updateVoiceUi();
+    return pending;
+  }
+
+  function cancelVoiceStatusRequest() {
+    const controller = state.voice.statusAbortController;
+    state.voice.statusRequest = null;
+    state.voice.statusAbortController = null;
+    if (state.voice.statusTimeoutId !== null) {
+      window.clearTimeout(state.voice.statusTimeoutId);
+      state.voice.statusTimeoutId = null;
+    }
+    if (controller) {
+      try { controller.abort(); } catch (_error) { /* already aborted */ }
+    }
   }
 
   function voiceTargetLabel(input) {
@@ -5638,22 +8307,41 @@
   }
 
   function updateVoiceUi() {
-    const activeTargetId = state.voice.active && state.voice.target ? state.voice.target.id : "";
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target && !voiceInputEligible(state.voice.target)) {
+      stopVoiceInput({ cancel: true });
+      return;
+    }
+    const activeTargetId = (state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target ? state.voice.target.id : "";
+    const available = state.voice.status && state.voice.status.available;
     qsa("[data-voice-input-button]").forEach((button) => {
-      const active = Boolean(activeTargetId && button.dataset.voiceTarget === activeTargetId);
-      button.classList.toggle("recording", active);
-      button.setAttribute("aria-pressed", active ? "true" : "false");
+      const target = $(button.dataset.voiceTarget);
+      button.disabled = !voiceInputEligible(target);
+      const active = Boolean(activeTargetId && button.dataset.voiceTarget === activeTargetId && state.voice.active);
+      const recognizing = Boolean(activeTargetId && button.dataset.voiceTarget === activeTargetId && state.voice.stopping);
+      const preparing = Boolean(activeTargetId && button.dataset.voiceTarget === activeTargetId && state.voice.starting && !state.voice.stopping);
+      const unavailable = available === false;
       const idleLabel = button.id === "voiceButton" ? "语音输入" : "语音填写";
       const label = button.querySelector("[data-voice-button-label]") || (button.id === "voiceButton" ? $("voiceButtonLabel") : null);
-      if (label) setText(label, active ? "停止语音" : idleLabel);
-      else if (button.id !== "voiceButton") setText(button, active ? "停止语音" : idleLabel);
-      button.setAttribute("aria-label", active ? "停止语音输入" : `${idleLabel}（中文）`);
-      button.title = active ? "停止语音" : `${idleLabel}（中文）`;
+      const labelText = preparing ? "正在准备录音" : active ? "录音中，点击结束并转文字" : recognizing ? "正在识别" : unavailable ? "离线语音不可用" : idleLabel;
+      button.classList.toggle("recording", active);
+      button.classList.toggle("recognizing", recognizing);
+      button.classList.toggle("unavailable", unavailable);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+      button.setAttribute("aria-label", preparing ? "正在准备录音" : active ? "录音中，点击结束并转文字" : recognizing ? "正在识别" : unavailable ? "离线语音不可用" : idleLabel + "（中文）");
+      button.title = labelText;
+      if (label) setText(label, labelText);
+      else if (button.id !== "voiceButton") setText(button, labelText);
       const level = qsa("[data-voice-level]").find((node) => node.dataset.voiceTarget === button.dataset.voiceTarget);
       if (level) {
-        level.classList.toggle("hidden", !active);
-        level.setAttribute("aria-hidden", active ? "false" : "true");
+        level.classList.add("hidden");
+        level.setAttribute("aria-hidden", "true");
       }
+    });
+    qsa("[data-voice-status]").forEach((node) => {
+      const isTarget = activeTargetId && node.dataset.voiceTarget && node.dataset.voiceTarget === activeTargetId;
+      const show = available === false || (isTarget && (state.voice.active || state.voice.stopping || state.voice.starting));
+      node.classList.toggle("hidden", !show);
+      node.textContent = state.voice.starting && isTarget && !state.voice.stopping ? "正在准备录音" : state.voice.stopping && isTarget ? "正在识别" : state.voice.active && isTarget ? "录音中，点击结束并转文字" : voiceStatusMessage();
     });
   }
 
@@ -5671,8 +8359,6 @@
     });
   }
 
-  const VOICE_STOP_TIMEOUT_MS = 1200;
-
   function voiceSessionOwned(session) {
     return Boolean(session && state.voice.session === session && state.voice.generation === session.ticket);
   }
@@ -5680,6 +8366,7 @@
   function voiceSessionCurrent(session, { allowStopping = true } = {}) {
     if (!voiceSessionOwned(session)) return false;
     if (state.voice.target !== session.input) return false;
+    if (!voiceInputEligible(session.input)) return false;
     if (typeof document.contains === "function" && !document.contains(session.input)) return false;
     if (!allowStopping && !state.voice.active) return false;
     if (!state.voice.active && !state.voice.stopping) return false;
@@ -5691,11 +8378,6 @@
     meter.closed = true;
     if (state.voice.meter === meter) state.voice.meter = null;
     if (meter.frame && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(meter.frame);
-    if (meter.stream && typeof meter.stream.getTracks === "function") {
-      meter.stream.getTracks().forEach((track) => {
-        try { track.stop(); } catch (_error) { /* already stopped */ }
-      });
-    }
     if (meter.context && typeof meter.context.close === "function") {
       try {
         const closing = meter.context.close();
@@ -5704,45 +8386,201 @@
     }
   }
 
+  function stopVoiceStream(session = state.voice.session) {
+    if (!session || session.streamStopped) return;
+    session.streamStopped = true;
+    const stream = session.stream || state.voice.stream;
+    if (stream && typeof stream.getTracks === "function") {
+      stream.getTracks().forEach((track) => {
+        try { track.stop(); } catch (_error) { /* already stopped */ }
+      });
+    }
+    if (state.voice.stream === stream) state.voice.stream = null;
+  }
+
   function releaseVoice({ ticket = null, abort = false } = {}) {
     const session = state.voice.session;
     if (ticket !== null && (!session || session.ticket !== ticket)) return false;
     state.voice.generation += 1;
     state.voice.active = false;
     state.voice.stopping = false;
+    state.voice.starting = false;
     state.voice.target = null;
     if (session && session.stopTimer) {
       window.clearTimeout(session.stopTimer);
       session.stopTimer = null;
     }
-    const recognition = session?.recognition || state.voice.recognition;
     if (session && session.inputListener && session.input && typeof session.input.removeEventListener === "function") {
       session.input.removeEventListener("input", session.inputListener);
     }
-    state.voice.recognition = null;
-    state.voice.session = null;
-    if (recognition) {
-      recognition.onresult = null;
-      recognition.onend = null;
-      recognition.onerror = null;
-      if (abort) {
-        try {
-          if (typeof recognition.abort === "function") recognition.abort();
-          else if (typeof recognition.stop === "function") recognition.stop();
-        } catch (_error) { /* already stopped */ }
+    const recorder = session && session.recorder;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      if (abort && recorder.state === "recording" && typeof recorder.stop === "function") {
+        try { recorder.stop(); } catch (_error) { /* already stopped */ }
       }
     }
+    if (abort && state.voice.transcribeAbortController) {
+      try { state.voice.transcribeAbortController.abort(); } catch (_error) { /* already aborted */ }
+    }
+    state.voice.transcribeAbortController = null;
     stopVoiceMeter();
+    stopVoiceStream(session);
+    state.voice.recorder = null;
+    state.voice.stream = null;
+    state.voice.session = null;
     state.voice.latestText = "";
     setVoiceVolume(0);
     updateVoiceUi();
     return true;
   }
 
-  function stopVoiceInput({ cancel = false } = {}) {
+  function voiceMediaRecorderConstructor() {
+    if (typeof window.MediaRecorder === "function") return window.MediaRecorder;
+    if (typeof MediaRecorder === "function") return MediaRecorder;
+    return null;
+  }
+
+  function voiceRecorderMimeType(Recorder) {
+    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+    if (!Recorder || typeof Recorder.isTypeSupported !== "function") return "";
+    return candidates.find((candidate) => {
+      try { return Recorder.isTypeSupported(candidate); } catch (_error) { return false; }
+    }) || "";
+  }
+
+  async function voiceBlobToBase64(blob) {
+    if (!blob || typeof blob.arrayBuffer !== "function") throw new Error("audio_data_unavailable");
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const encode = typeof window.btoa === "function" ? window.btoa.bind(window) : (typeof btoa === "function" ? btoa : null);
+    if (!encode) throw new Error("base64_unavailable");
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length))));
+    }
+    return encode(binary);
+  }
+
+  function finishVoiceRecording(session) {
+    if (!voiceSessionCurrent(session) || session.finishing) return;
+    session.finishing = true;
+    if (session.stopTimer) {
+      window.clearTimeout(session.stopTimer);
+      session.stopTimer = null;
+    }
+    state.voice.active = false;
+    state.voice.stopping = true;
+    stopVoiceStream(session);
+    state.voice.recorder = null;
+    updateVoiceUi();
+    if (session.tooLarge || session.bytes > VOICE_MAX_AUDIO_BYTES) {
+      releaseVoice({ ticket: session.ticket, abort: false });
+      toast("录音超过 8 MiB 上限，请缩短录音后重试。", "error");
+      return;
+    }
+    if (!session.chunks.length || session.bytes <= 0) {
+      releaseVoice({ ticket: session.ticket, abort: false });
+      toast("没有录到可识别的声音，请重试。", "error");
+      return;
+    }
+    let blob;
+    try {
+      const mimeType = session.mimeType || "audio/webm";
+      blob = new Blob(session.chunks, { type: mimeType });
+    } catch (_error) {
+      releaseVoice({ ticket: session.ticket, abort: false });
+      toast("录音数据不可用，请重试。", "error");
+      return;
+    }
+    void transcribeVoiceSession(session, blob);
+  }
+
+  async function transcribeVoiceSession(session, blob) {
+    if (!voiceSessionCurrent(session)) return;
+    const Controller = typeof window.AbortController === "function" ? window.AbortController : (typeof AbortController === "function" ? AbortController : null);
+    const controller = Controller ? new Controller() : null;
+    state.voice.transcribeAbortController = controller;
+    let timeoutId = null;
+    updateVoiceUi();
+    try {
+      const audioBase64 = await voiceBlobToBase64(blob);
+      if (!voiceSessionCurrent(session)) return;
+      const pendingRequest = request(VOICE_TRANSCRIBE_PATH, {
+        method: "POST",
+        body: { audio_base64: audioBase64, mime_type: session.mimeType || blob.type || "audio/webm" },
+        signal: controller ? controller.signal : undefined
+      });
+      const timeout = new Promise((_resolve, reject) => {
+        timeoutId = window.setTimeout(() => {
+          if (controller) {
+            try { controller.abort(); } catch (_error) { /* already aborted */ }
+          }
+          const error = new Error("speech_transcription_timeout");
+          error.name = "TimeoutError";
+          reject(error);
+        }, VOICE_TRANSCRIBE_TIMEOUT_MS);
+      });
+      const payload = await Promise.race([pendingRequest, timeout]);
+      if (!voiceSessionCurrent(session)) return;
+      const text = String(payload && payload.text || "");
+      if (text.trim()) {
+        if (String(session.input.value || "") !== session.renderedText) {
+          releaseVoice({ ticket: session.ticket, abort: false });
+          return;
+        }
+        const nextText = session.baseText + text;
+        session.programmaticInput = true;
+        try {
+          session.input.value = nextText;
+          session.input.dispatchEvent(new Event("input", { bubbles: true }));
+        } finally {
+          session.programmaticInput = false;
+        }
+        session.renderedText = nextText;
+        state.voice.latestText = nextText;
+        if (session.input.id === "composerInput") resizeComposer();
+      } else {
+        releaseVoice({ ticket: session.ticket, abort: false });
+        toast("没有识别到有效语音，请重新录音。", "");
+        return;
+      }
+      releaseVoice({ ticket: session.ticket, abort: false });
+    } catch (error) {
+      if (!voiceSessionCurrent(session)) return;
+      const status = Number(error && error.status || 0);
+      releaseVoice({ ticket: session.ticket, abort: false });
+      if (error && error.name === "AbortError") return;
+      if (error && error.name === "TimeoutError") {
+        toast("语音识别超时，请重新录音后重试。", "error");
+      } else if (status === 409) {
+        toast("当前已有语音识别任务，请稍后重试。", "error");
+      } else if (error instanceof ApiError) {
+        toast("语音识别失败：" + error.message, "error");
+      } else {
+        toast("语音识别失败，请稍后重试。", "error");
+      }
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (state.voice.transcribeAbortController === controller) state.voice.transcribeAbortController = null;
+    }
+  }
+
+  function stopVoiceInput({ cancel = false, reason = "" } = {}) {
     const session = state.voice.session;
     if (!session) {
-      releaseVoice();
+      if (state.voice.starting) {
+        state.voice.generation += 1;
+        state.voice.starting = false;
+        state.voice.target = null;
+        cancelVoiceStatusRequest();
+        updateVoiceUi();
+      } else {
+        releaseVoice();
+      }
       return;
     }
     if (cancel) {
@@ -5750,103 +8588,57 @@
       return;
     }
     if (state.voice.stopping) return;
-    state.voice.active = false;
-    state.voice.stopping = true;
-    stopVoiceMeter();
-    updateVoiceUi();
-    const finish = () => releaseVoice({ ticket: session.ticket, abort: true });
-    session.stopTimer = window.setTimeout(finish, VOICE_STOP_TIMEOUT_MS);
-    const recognition = session.recognition;
-    if (!recognition || typeof recognition.stop !== "function") {
-      finish();
+    if (!session.recorder) {
+      releaseVoice({ ticket: session.ticket, abort: true });
       return;
     }
+    if (session.stopTimer) {
+      window.clearTimeout(session.stopTimer);
+      session.stopTimer = null;
+    }
+    state.voice.active = false;
+    state.voice.stopping = true;
+    updateVoiceUi();
+    if (reason === "timeout") toast("录音已达到 120 秒上限，正在识别。", "", 2600);
+    const finish = () => finishVoiceRecording(session);
+    session.stopTimer = window.setTimeout(() => {
+      if (voiceSessionOwned(session) && !session.finishing) {
+        finish();
+      }
+    }, VOICE_STOP_TIMEOUT_MS);
     try {
-      recognition.stop();
+      if (session.recorder.state === "recording" && typeof session.recorder.stop === "function") session.recorder.stop();
+      else finish();
     } catch (_error) {
       finish();
     }
+    stopVoiceStream(session);
   }
 
-  function startVoiceMeter(ticket) {
-    const session = state.voice.session;
-    if (!session || session.ticket !== ticket) return;
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
-      toast("当前环境无法显示麦克风音量；语音识别仍可继续。", "", 3600);
-      return;
-    }
-    void navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-      if (!voiceSessionCurrent(session, { allowStopping: false })) {
-        if (stream && typeof stream.getTracks === "function") stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-      let context = null;
-      try {
-        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextCtor) throw new Error("audio_context_unavailable");
-        if (typeof window.requestAnimationFrame !== "function") throw new Error("animation_frame_unavailable");
-        context = new AudioContextCtor();
-        const source = context.createMediaStreamSource(stream);
-        const analyser = context.createAnalyser();
-        analyser.fftSize = 512;
-        analyser.smoothingTimeConstant = 0.55;
-        source.connect(analyser);
-        const data = new Uint8Array(analyser.frequencyBinCount);
-        const meter = { stream, context, frame: 0, closed: false };
-        state.voice.meter = meter;
-        const tick = () => {
-          if (!voiceSessionCurrent(session, { allowStopping: false }) || state.voice.meter !== meter) {
-            stopVoiceMeter(meter);
-            return;
-          }
-          analyser.getByteFrequencyData(data);
-          const mean = data.reduce((sum, value) => sum + value, 0) / data.length;
-          setVoiceVolume(Math.min(100, Math.max(0, (mean - 4) * 2.4)));
-          meter.frame = window.requestAnimationFrame(tick);
-        };
-        tick();
-      } catch (_error) {
-        stopVoiceMeter({ stream, context, frame: 0, closed: false });
-        if (voiceSessionCurrent(session, { allowStopping: false })) toast("麦克风音量检测初始化失败，语音识别仍可继续。", "", 3600);
-      }
-    }).catch(() => {
-      if (voiceSessionCurrent(session, { allowStopping: false })) toast("无法获取麦克风权限，已关闭音量显示。", "", 3600);
-    });
-  }
-
-  function toggleVoiceInput(targetInput = $("composerInput")) {
-    const input = targetInput && targetInput.nodeType === 1 ? targetInput : $("composerInput");
-    if (!input) return;
-    if (state.voice.active || state.voice.stopping) {
-      const sameTarget = state.voice.target === input;
-      if (sameTarget && state.voice.active) {
-        stopVoiceInput();
-        return;
-      }
-      releaseVoice({ ticket: state.voice.session?.ticket, abort: true });
-    }
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) {
-      toast("当前浏览器不支持网页语音识别。可使用 Windows 系统听写（Win+H）后粘贴文字，页面不会伪装成已录音。", "error", 5200);
-      return;
-    }
+  async function startVoiceRecording(input, status) {
     const ticket = ++state.voice.generation;
     const session = {
       ticket,
       input,
       sessionId: String(state.currentSessionId || ""),
       baseText: String(input.value || ""),
-      finalResults: new Map(),
-      interimResults: new Map(),
-      stopTimer: null,
-      recognition: null,
       renderedText: String(input.value || ""),
-      programmaticInput: false,
-      inputListener: null
+      inputListener: null,
+      stream: null,
+      streamStopped: false,
+      recorder: null,
+      chunks: [],
+      bytes: 0,
+      mimeType: "",
+      stopTimer: null,
+      finishing: false,
+      tooLarge: false,
+      programmaticInput: false
     };
     state.voice.session = session;
     state.voice.active = true;
     state.voice.stopping = false;
+    state.voice.starting = true;
     state.voice.target = input;
     state.voice.latestText = session.baseText;
     session.inputListener = () => {
@@ -5856,99 +8648,117 @@
     if (typeof input.addEventListener === "function") input.addEventListener("input", session.inputListener);
     updateVoiceUi();
     try {
-      const recognition = new Recognition();
-      session.recognition = recognition;
-      state.voice.recognition = recognition;
-      recognition.lang = "zh-CN";
-      recognition.interimResults = true;
-      recognition.continuous = true;
-      recognition.onresult = (event) => {
-        if (!voiceSessionCurrent(session)) return;
-        if (String(input.value || "") !== session.renderedText) {
-          releaseVoice({ ticket, abort: true });
-          return;
-        }
-        const results = event && event.results;
-        if (!results || typeof results.length !== "number") return;
-        const firstChanged = Number.isInteger(event.resultIndex) ? Math.max(0, event.resultIndex) : 0;
-        for (const index of session.interimResults.keys()) {
-          if (index >= results.length) session.interimResults.delete(index);
-        }
-        for (let index = firstChanged; index < results.length; index += 1) {
-          const result = results[index];
-          const alternative = result && result[0];
-          const transcript = alternative && typeof alternative.transcript === "string" ? alternative.transcript : "";
-          if (result && result.isFinal === false) {
-            session.interimResults.set(index, transcript);
-          } else {
-            // SpeechRecognition re-emits the same result while later words are
-            // recognized. Replacing by result index prevents final text from
-            // being appended twice, while still preserving repeated phrases at
-            // distinct result indexes.
-            session.finalResults.set(index, transcript);
-            session.interimResults.delete(index);
-          }
-        }
-        const finalText = [...session.finalResults.entries()]
-          .sort(([left], [right]) => left - right)
-          .map(([, text]) => text)
-          .join("");
-        const interimText = [...session.interimResults.entries()]
-          .sort(([left], [right]) => left - right)
-          .map(([, text]) => text)
-          .join("");
-        const nextText = `${session.baseText}${finalText}${interimText}`;
-        state.voice.latestText = nextText;
-        session.renderedText = nextText;
-        if (input.value !== nextText) {
-          session.programmaticInput = true;
-          try {
-            input.value = nextText;
-            input.dispatchEvent(new Event("input", { bubbles: true }));
-          } finally {
-            session.programmaticInput = false;
-          }
-          if (input.id === "composerInput") resizeComposer();
-        }
-      };
-      recognition.onend = () => {
-        if (voiceSessionOwned(session)) releaseVoice({ ticket, abort: false });
-      };
-      recognition.onerror = (event) => {
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") throw new Error("getUserMedia_unavailable");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!voiceSessionCurrent(session, { allowStopping: false }) || !state.voice.starting) {
+        if (stream && typeof stream.getTracks === "function") stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      session.stream = stream;
+      state.voice.stream = stream;
+      const Recorder = voiceMediaRecorderConstructor();
+      if (!Recorder) throw new Error("MediaRecorder_unavailable");
+      const mimeType = voiceRecorderMimeType(Recorder);
+      const recorder = mimeType ? new Recorder(stream, { mimeType }) : new Recorder(stream);
+      session.mimeType = String(recorder.mimeType || mimeType || "audio/webm");
+      session.recorder = recorder;
+      state.voice.recorder = recorder;
+      recorder.ondataavailable = (event) => {
         if (!voiceSessionOwned(session)) return;
-        if (!voiceSessionCurrent(session)) {
-          releaseVoice({ ticket, abort: true });
+        const data = event && event.data;
+        const size = Number(data && data.size || 0);
+        if (!data || !size) return;
+        session.bytes += size;
+        if (session.bytes > VOICE_MAX_AUDIO_BYTES) {
+          session.tooLarge = true;
+          stopVoiceInput();
           return;
         }
-        const errorCode = event && event.error;
-        const expectedStop = state.voice.stopping || errorCode === "aborted";
-        releaseVoice({ ticket, abort: true });
-        if (!expectedStop && errorCode !== "aborted") {
-          const voiceErrors = {
-            "not-allowed": "麦克风权限被拒绝",
-            "service-not-allowed": "语音服务不可用",
-            "audio-capture": "未检测到可用麦克风",
-            "no-speech": "没有检测到语音",
-            network: "语音服务网络连接失败"
-          };
-          toast(`语音识别失败：${voiceErrors[errorCode] || "请检查麦克风权限或改用文字输入"}`, "error");
-        }
+        session.chunks.push(data);
       };
-      recognition.start();
-      startVoiceMeter(ticket);
+      recorder.onerror = () => {
+        if (!voiceSessionOwned(session)) return;
+        releaseVoice({ ticket, abort: false });
+        toast("录音失败，请检查麦克风权限后重试。", "error");
+      };
+      recorder.onstop = () => finishVoiceRecording(session);
+      recorder.start();
+      state.voice.starting = false;
+      const maxDurationSeconds = Math.min(
+        VOICE_DEFAULT_MAX_DURATION_SECONDS,
+        Math.max(1, Number(status && status.maxDurationSeconds) || VOICE_DEFAULT_MAX_DURATION_SECONDS),
+      );
+      session.stopTimer = window.setTimeout(() => stopVoiceInput({ reason: "timeout" }), maxDurationSeconds * 1000);
+      updateVoiceUi();
     } catch (error) {
-      stopVoiceInput({ cancel: true });
-      toast(`启动语音识别失败：${String(error && error.message || error)}`, "error");
+      const current = voiceSessionOwned(session);
+      releaseVoice({ ticket, abort: true });
+      if (current && String(error && error.name || "") !== "AbortError") {
+        const code = String(error && error.message || error);
+        const message = code === "getUserMedia_unavailable" ? "当前环境无法访问麦克风。" : code === "MediaRecorder_unavailable" ? "当前环境不支持本机录音。" : "无法获取麦克风权限，请允许后重试。";
+        toast(message, "error");
+      }
     }
+  }
+
+  async function beginVoiceInput(input) {
+    if (!voiceInputEligible(input)) return;
+    const startTicket = ++state.voice.generation;
+    const initialValue = String(input.value || "");
+    const initialSessionId = String(state.currentSessionId || "");
+    state.voice.starting = true;
+    state.voice.target = input;
+    updateVoiceUi();
+    const status = state.voice.status && state.voice.status.available === true ? state.voice.status : await loadVoiceStatus();
+    if (state.voice.generation !== startTicket || !state.voice.starting) return;
+    if (!voiceInputEligible(input) || String(input.value || "") !== initialValue || String(state.currentSessionId || "") !== initialSessionId) {
+      state.voice.starting = false;
+      state.voice.target = null;
+      updateVoiceUi();
+      return;
+    }
+    if (!status || status.available !== true) {
+      state.voice.starting = false;
+      state.voice.target = null;
+      updateVoiceUi();
+      toast((status && status.message) || "本机离线语音不可用，请确认语音组件已安装。", "error");
+      return;
+    }
+    await startVoiceRecording(input, status);
+  }
+
+  function toggleVoiceInput(targetInput = $("composerInput")) {
+    const input = targetInput && targetInput.nodeType === 1 ? targetInput : $("composerInput");
+    if (!voiceInputEligible(input)) return;
+    if (state.voice.starting) {
+      const sameTarget = state.voice.target === input;
+      stopVoiceInput({ cancel: true });
+      if (sameTarget) return;
+    }
+    if (state.voice.active || state.voice.stopping) {
+      const sameTarget = state.voice.target === input;
+      if (sameTarget && state.voice.active && !state.voice.stopping) {
+        stopVoiceInput();
+        return;
+      }
+      stopVoiceInput({ cancel: true });
+    }
+    void beginVoiceInput(input);
   }
 
   let voiceInputSequence = 0;
 
   function voiceInputAllowed(input) {
-    if (!input || input.dataset.voiceExclude === "true" || input.dataset.voiceAttached === "true") return false;
-    if (input.id === "composerInput" || input.id === "localImportPath") return false;
-    if (input.closest("#modelSettingsForm, #newSessionForm")) return false;
+    return voiceInputEligible(input) && input.dataset.voiceAttached !== "true" && input.id !== "composerInput";
+  }
+
+  function voiceInputEligible(input) {
+    if (!input || input.dataset.voiceExclude === "true" || input.disabled || input.readOnly) return false;
+    if (input.id === "localImportPath") return false;
+    if (input.closest("#modelSettingsForm, #newSessionForm, #githubProfileForm")) return false;
+    if (typeof document.contains === "function" && !document.contains(input)) return false;
     const type = String(input.type || (input.tagName === "TEXTAREA" ? "textarea" : "")).toLowerCase();
+    if (String(input.inputMode || "").toLowerCase() === "url") return false;
     return input.tagName === "TEXTAREA" || type === "text" || type === "search";
   }
 
@@ -5984,12 +8794,19 @@
     level.setAttribute("aria-label", "实时音量");
     for (let index = 0; index < 8; index += 1) level.appendChild(document.createElement("span"));
     tools.append(button, level);
+    const status = document.createElement("span");
+    status.className = "voice-input-status hidden";
+    status.dataset.voiceStatus = "true";
+    status.dataset.voiceTarget = input.id;
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    tools.appendChild(status);
     wrap.appendChild(tools);
     updateVoiceUi();
   }
 
   function enhanceVoiceInputs(root = document) {
-    if ((state.voice.active || state.voice.stopping) && state.voice.target && !document.contains(state.voice.target)) stopVoiceInput({ cancel: true });
+    if ((state.voice.active || state.voice.stopping || state.voice.starting) && state.voice.target && !document.contains(state.voice.target)) stopVoiceInput({ cancel: true });
     qsa("textarea, input", root).forEach((input) => addVoiceInputControl(input));
     updateVoiceUi();
   }
@@ -6000,7 +8817,14 @@
     if (!pane || !toggle) return;
     state.inspectorCollapsed = Boolean(collapsed);
     pane.classList.toggle("collapsed", state.inspectorCollapsed);
-    const expanded = !state.inspectorCollapsed;
+    syncInspectorToggle(pane, toggle);
+  }
+
+  function syncInspectorToggle(pane = $("inspectPane"), toggle = $("inspectorToggle")) {
+    if (!pane || !toggle) return;
+    const workflowOverlay = pane.parentNode === $("appShell") && pane.classList.contains("workflow-inspector-overlay");
+    const hiddenByWorkflowPage = state.pageView && !workflowOverlay;
+    const expanded = !pane.classList.contains("collapsed") && !hiddenByWorkflowPage;
     toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
     const label = expanded ? "收起求职资料面板" : "打开求职资料面板";
     toggle.setAttribute("aria-label", label);
@@ -6117,8 +8941,19 @@
 
   function bindEvents() {
     $("backToChat").addEventListener("click", () => openWorkflowChatDialog());
-    qsa("[data-profile-tab]").forEach((button) => button.addEventListener("click", () => setProfileTab(button.dataset.profileTab)));
+    qsa("[data-profile-tab]").forEach((button) => button.addEventListener("click", () => {
+      const tab = button.dataset.profileTab;
+      setProfileTab(tab);
+      if (tab === "interview") void openInterviewWindow();
+    }));
+    $("profileInterviewOpen")?.addEventListener("click", () => { void openInterviewWindow(); });
+    $("profileInputMode")?.addEventListener("change", (event) => { setProfileInputMode(event.target.value); });
     $("profileDocuments").addEventListener("change", (event) => { profileFiles = Array.from(event.target.files || []); renderProfileFiles(); });
+    $("profileResumeDocuments")?.addEventListener("change", (event) => { profileResumeFiles = Array.from(event.target.files || []); renderProfileResumeFiles(); });
+    $("profileLocalFileButton")?.addEventListener("click", () => { void pickProfileLocalPath("file"); });
+    $("profileLocalFolderButton")?.addEventListener("click", () => { void pickProfileLocalPath("folder"); });
+    $("profileLocalFilePicker")?.addEventListener("change", (event) => { handleProfileLocalBrowserFiles(event.target.files); event.target.value = ""; });
+    $("profileLocalFolderPicker")?.addEventListener("change", (event) => { handleProfileLocalBrowserFiles(event.target.files); event.target.value = ""; });
     $("profileImportForm").addEventListener("submit", submitProfilePage);
     $("planPageForm").addEventListener("submit", submitPlanPage);
     $("planOtherDiscuss").addEventListener("click", discussPlanOther);
@@ -6151,8 +8986,14 @@
     $("sidebarToggle").addEventListener("click", toggleSidebar);
     $("sidebarClose").addEventListener("click", closeSidebarDrawer);
     $("sidebarScrim").addEventListener("click", closeSidebarDrawer);
+    $("workspaceSwitchButton").addEventListener("click", openWorkspaceSwitch);
+    $("workspaceSwitchClose").addEventListener("click", () => closeWorkspaceSwitch());
+    $("workspaceSwitchCancel").addEventListener("click", () => closeWorkspaceSwitch());
+    $("workspacePickerButton").addEventListener("click", () => { void pickWorkspaceFolder(); });
+    $("workspaceSwitchForm").addEventListener("submit", submitWorkspaceSwitch);
+    $("workspaceSwitchBackdrop").addEventListener("click", (event) => { if (event.target === $("workspaceSwitchBackdrop")) closeWorkspaceSwitch(); });
     $("inspectorToggle").addEventListener("click", toggleInspectorPane);
-    $("paneClose").addEventListener("click", () => setInspectorCollapsed(true));
+    $("paneClose")?.addEventListener("click", () => setInspectorCollapsed(true));
     $("dismissTokenNotice").addEventListener("click", () => { state.dismissTokenNotice = true; showTokenNotice(); });
     $("composerForm").addEventListener("submit", (event) => { event.preventDefault(); sendMessage(); });
     $("composerInput").addEventListener("input", () => { resizeComposer(); captureComposerDraft(); });
@@ -6179,6 +9020,10 @@
       if (name === "drop" && event.dataTransfer && event.dataTransfer.files) void handleUploads(event.dataTransfer.files);
     }));
     $("sessionList").addEventListener("click", (event) => {
+      const rename = event.target.closest("[data-session-rename]");
+      if (rename) { event.preventDefault(); event.stopPropagation(); openRenameSession(rename.dataset.sessionRename); return; }
+      const pin = event.target.closest("[data-session-pin]");
+      if (pin) { event.preventDefault(); event.stopPropagation(); void toggleSessionPinned(pin.dataset.sessionPin); return; }
       const remove = event.target.closest("[data-session-delete]");
       if (remove) { event.preventDefault(); event.stopPropagation(); void deleteSession(remove.dataset.sessionDelete); return; }
       const button = event.target.closest("[data-session-id]");
@@ -6194,17 +9039,24 @@
     $("fileModalBackdrop").addEventListener("click", (event) => { if (event.target === $("fileModalBackdrop")) closeFileModal(); });
     $("modelSettingsClose").addEventListener("click", closeModelSettings);
     $("modelSettingsCancel").addEventListener("click", closeModelSettings);
+    $("modelEditorClose").addEventListener("click", () => closeModelEditor());
+    $("modelEditorCancel").addEventListener("click", () => closeModelEditor());
     $("modelTestButton").addEventListener("click", testModelSettings);
-    $("modelNewProfileButton").addEventListener("click", startNewModelProfile);
-    $("modelChoice").addEventListener("change", (event) => {
-      const choice = event.target;
-      const selected = choice.selectedOptions && choice.selectedOptions[0];
-      if (!selected || !selected.value) return;
-      void selectConfiguredModel(selected);
-    });
-    $("githubTokenSave").addEventListener("click", saveGitHubToken);
+    $("modelNewProfileButton").addEventListener("click", () => openModelEditor({ newProfile: true }));
+    $("modelEditProfileButton").addEventListener("click", () => openModelEditor());
+    $("modelDeleteProfileButton")?.addEventListener("click", () => { void deleteManagedModel(); });
+    $("modelProfileChoice").addEventListener("change", (event) => { void selectManagedModel(event.target.value); });
+    $("githubProfileChoice").addEventListener("change", (event) => { void selectGitHubProfile(event.target.value); });
+    $("githubNewProfileButton").addEventListener("click", openGitHubProfileEditor);
+    $("githubEditProfileButton")?.addEventListener("click", () => openGitHubProfileEditor({ profileId: state.github.activeProfileId }));
+    $("githubDeleteProfileButton")?.addEventListener("click", () => { void deleteGitHubProfile(); });
+    $("githubProfileEditorClose").addEventListener("click", () => closeGitHubProfileEditor());
+    $("githubProfileCancel").addEventListener("click", () => closeGitHubProfileEditor());
+    $("githubProfileForm").addEventListener("submit", saveGitHubProfile);
     $("modelSettingsForm").addEventListener("submit", saveModelSettings);
     $("modelSettingsBackdrop").addEventListener("click", (event) => { if (event.target === $("modelSettingsBackdrop")) closeModelSettings(); });
+    $("modelEditorBackdrop").addEventListener("click", (event) => { if (event.target === $("modelEditorBackdrop")) closeModelEditor(); });
+    $("githubProfileEditorBackdrop").addEventListener("click", (event) => { if (event.target === $("githubProfileEditorBackdrop")) closeGitHubProfileEditor(); });
     $("jobEditClose").addEventListener("click", closeJobEditor);
     $("jobEditCancel").addEventListener("click", closeJobEditor);
     $("jobEditForm").addEventListener("submit", saveJobEditor);
@@ -6227,13 +9079,12 @@
     $("clarificationBackdrop").addEventListener("click", (event) => { if (event.target === $("clarificationBackdrop")) closeClarificationModal(); });
     $("workflowChatClose").addEventListener("click", closeWorkflowChatDialog);
     $("workflowChatBackdrop").addEventListener("click", (event) => { if (event.target === $("workflowChatBackdrop")) closeWorkflowChatDialog(); });
-    $("jdImportButton").addEventListener("click", openJdImport);
     $("jdImportClose").addEventListener("click", closeJdImport);
     $("jdImportBackdrop").addEventListener("click", (event) => { if (event.target === $("jdImportBackdrop")) closeJdImport(); });
     qsa("[data-jd-mode]").forEach((button) => button.addEventListener("click", () => setJdMode(button.dataset.jdMode)));
     JD_FIELDS.forEach((id) => $(id).addEventListener("input", saveJdDraft));
     $("jdImportSubmit").addEventListener("click", () => submitJdImport(jdDraft().mode));
-    $("jdQuery").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); void submitJdImport("search"); } });
+    $("jdQuery").addEventListener("keydown", (event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); void submitJdImport("search"); } });
     $("jdImageDrop").addEventListener("click", () => $("jdImagePicker").click());
     $("jdImagePicker").addEventListener("change", (event) => { addJdFiles(event.target.files); event.target.value = ""; });
     $("jdImageDrop").addEventListener("dragover", (event) => event.preventDefault());
@@ -6244,48 +9095,60 @@
     $("newSessionForm").addEventListener("submit", submitNewSession);
     $("copySessionSource").addEventListener("change", () => { $("newSessionCreate").textContent = $("copySessionSource").value ? "复制档案并新建" : "新建岗位会话"; });
     $("newSessionBackdrop").addEventListener("click", (event) => { if (event.target === $("newSessionBackdrop")) closeNewSession(); });
+    $("sessionRenameClose").addEventListener("click", () => closeRenameSession());
+    $("sessionRenameCancel").addEventListener("click", () => closeRenameSession());
+    $("sessionRenameForm").addEventListener("submit", saveSessionRename);
+    $("sessionRenameBackdrop").addEventListener("click", (event) => { if (event.target === $("sessionRenameBackdrop")) closeRenameSession(); });
     $("localImportClose").addEventListener("click", closeLocalImport);
     $("localImportCancel").addEventListener("click", closeLocalImport);
     $("localImportForm").addEventListener("submit", submitLocalImport);
     $("localImportBackdrop").addEventListener("click", (event) => { if (event.target === $("localImportBackdrop")) closeLocalImport(); });
     document.addEventListener("keydown", (event) => {
       trapModelSettingsFocus(event);
-      if (event.key === "Escape") { closeSidebarDrawer(); closeJdImport(); closeFileModal(); closeModelSettings(); closeJobEditor(); closeNewSession(); closeLocalImport(); closeClarificationModal(); closeWorkflowChatDialog(); }
+      if (event.key === "Escape") { closeSidebarDrawer(); closeJdImport(); closeFileModal(); closeModelSettings(); closeJobEditor(); closeNewSession(); closeRenameSession(); closeLocalImport(); closeClarificationModal(); closeWorkflowChatDialog(); closeWorkspaceSwitch(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); openNewSession(); }
     });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") {
+        stopVoiceInput({ cancel: true });
         clearPolling();
         clearPracticeWindowRefresh();
+        clearInterviewRefresh();
         clearCommandRuntimeRefresh();
       } else {
         void refreshMainWindowOnReturn();
         if (state.currentSessionId && sessionBusy(state.currentSession)) startPolling(state.currentSessionId);
         if (state.practiceWindow.standalone) startPracticeWindowRefresh();
+        if (state.interview.standalone) startInterviewRefresh();
         startCommandRuntimeRefresh();
       }
     });
     window.addEventListener("focus", () => { void refreshMainWindowOnReturn(); });
-    window.addEventListener("beforeunload", () => { clearPolling(); clearPracticeWindowRefresh(); clearCommandRuntimeRefresh(); stopVoiceInput({ cancel: true }); });
+    window.addEventListener("beforeunload", () => { clearPolling(); clearPracticeWindowRefresh(); clearInterviewRefresh(); clearCommandRuntimeRefresh(); stopVoiceInput({ cancel: true }); });
     window.addEventListener("hashchange", handleTokenHashChange);
     window.addEventListener("resize", handleSidebarResize);
   }
 
   async function bootstrap() {
     const windowParams = readPracticeWindowParams();
+    const interviewParams = readInterviewWindowParams();
     state.practiceWindow.standalone = windowParams.standalone;
     state.practiceWindow.sessionId = windowParams.sessionId;
     state.practiceWindow.projectKey = windowParams.projectKey;
     state.practiceWindow.startRequested = Boolean(windowParams.start);
     state.practiceWindow.startConsumed = false;
+    state.interview.standalone = interviewParams.standalone;
+    state.interview.sessionId = interviewParams.sessionId;
+    state.interview.startRequested = Boolean(interviewParams.start);
     state.token = captureToken();
     bindEvents();
     startCommandRuntimeRefresh();
     applyPracticeWindowChrome();
+    applyInterviewWindowChrome();
     applyResponsiveInspectorDefault();
     showTokenNotice();
     renderAll();
-    await Promise.allSettled([refreshInfo(), refreshSessions(), loadUiSettings()]);
+    await Promise.allSettled([refreshInfo(), refreshSessions(), loadUiSettings(), loadVoiceStatus()]);
     if (state.practiceWindow.standalone) {
       state.selectedStep = "practice";
       state.pageView = true;
@@ -6317,6 +9180,25 @@
       }
       renderAll();
       await openPracticeChatDialog({ focus: true, start: state.practiceWindow.startRequested });
+      return;
+    }
+    if (state.interview.standalone) {
+      state.selectedStep = "profile";
+      state.pageView = true;
+      const requestedInterviewSession = state.sessions.find((row) => String(row.id) === String(state.interview.sessionId));
+      if (!requestedInterviewSession || !requestedInterviewSession.id) {
+        state.interview.error = "固定会话已不存在或无法读取。请关闭此窗口，并从当前岗位会话重新打开技能访谈。";
+        renderAll();
+        return;
+      }
+      await selectSession(requestedInterviewSession.id, { restore: true });
+      if (String(state.currentSessionId || "") !== String(state.interview.sessionId)) {
+        state.interview.error = "固定会话读取失败。请关闭此窗口，并从当前岗位会话重新打开技能访谈。";
+        renderAll();
+        return;
+      }
+      renderAll();
+      await openInterviewChatDialog({ focus: true, start: Boolean(interviewParams.start) });
       return;
     }
     const persisted = readPersistedSession();

@@ -1,10 +1,10 @@
-# 单一求职教练 Agent
+# 单一简历项目助手 Agent
 
-Agent Coach 的产品入口只有一个持续的求职教练。用户从 JD、简历或已有技能开始，后续追问、材料、工具结果、审批和实践证据都进入同一个会话上下文。产品不要求用户选择通用 Agent、安装求职模块或按固定按钮逐步调用模型。
+简历项目助手的产品入口只有一个持续的助手。用户从 JD、简历或已有技能开始，后续追问、材料、工具结果、审批和实践证据都进入同一个会话上下文。产品不要求用户选择通用 Agent、安装求职模块或按固定按钮逐步调用模型。
 
 ```mermaid
 flowchart TD
-    User[用户 / 浏览器或 CLI] --> Engine[AgentEngine · 求职教练]
+    User[用户 / 浏览器或 CLI] --> Engine[AgentEngine · 简历项目助手]
     Engine <--> Model[同一会话模型]
     Engine <--> State[会话消息 / 求职状态 / 审批 / 恢复]
     Engine --> JobTools[JD / 技能 / 计划 / 项目 / 进度工具]
@@ -28,6 +28,12 @@ flowchart TD
 | `web.py` | localhost 静态资源、Bearer 鉴权、上传、会话和后台 job API |
 
 `job_radar.py` 的工具直接注册到产品 Agent 的工具注册表。它们接收当前会话和工作区上下文，负责校验结构化结果、状态变更或项目检索，不再调用第二个模型来生成中间工件。所有领域工具和通用工作区工具都共享同一套路径校验、审批和恢复规则。
+
+### 岗位搜索与证据边界
+
+`legacy/tools/job_sources.py` 的 `web` 搜索只围绕一个目标岗位生成固定检索变体，并在有界引擎请求预算内收集去重候选（默认 18、最多 20）。搜索引擎原始链接先解包并过滤未解析的搜索引擎 wrapper；结果按具体 `job_detail` 优先于聚合 `search_index`，但两者都属于 `search_lead`，不是已读取的 JD。`integrations.search_jobs` 返回 `diagnostics`，记录每个变体/引擎的尝试、错误、候选数和路由探测，同时明确下一步是逐条调用 `fetch_url`。
+
+`fetch_url` 每跳继续执行公共 DNS 校验并禁用环境代理，结果带 `route_diagnostics` 说明实际使用的是直连、代理未参与；搜索工具的本机代理探测仅用于诊断，不会替代目标 URL 的 SSRF 校验。只有 `fetch_url` 返回非空正文的独立详情页才能计入搜索 JD 的 `sample_count`；`set_jd` 再校验 3–5 的目标范围、实际读取上限和 `compared`/`insufficient_samples` 状态。
 
 ## 同一 Agent 的多轮循环
 

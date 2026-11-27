@@ -10,9 +10,11 @@ after the returned :class:`~agent_coach.contracts.PendingApproval` is accepted.
 from __future__ import annotations
 
 import atexit
+import codecs
 import difflib
 from datetime import datetime, timezone
 import hashlib
+from html.parser import HTMLParser
 import ipaddress
 import json
 import math
@@ -59,6 +61,12 @@ DEFAULT_COMMAND_TIMEOUT: float | None = None
 MAX_COMMAND_TIMEOUT = 7 * 24 * 60 * 60.0
 DEFAULT_FETCH_TIMEOUT = 15.0
 MAX_FETCH_TIMEOUT = 60.0
+# Keep HTML projections below the Agent transcript's 20,000-character tool
+# result ceiling.  ``format=raw`` remains available for callers that need the
+# original bounded body.
+MAX_FETCH_VISIBLE_CHARS = 12_000
+MAX_STRUCTURED_POSTINGS = 5
+MAX_STRUCTURED_POSTING_CHARS = 4_000
 MAX_COMMAND_PURPOSE_BYTES = 2 * 1024
 MAX_COMMAND_SESSIONS = 128
 COMMAND_STOP_GRACE_SECONDS = 2.0
@@ -1675,8 +1683,322 @@ def _response_body(response: Any, limit: int) -> tuple[bytes, bool]:
     return b"".join(chunks), truncated
 
 
+_CHARSET_PARAMETER_RE = re.compile(
+    r"(?:^|;)\s*charset\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))",
+    re.IGNORECASE,
+)
+_META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_META_ATTRIBUTE_RE = re.compile(
+    r"([^\s=/>]+)(?:\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+)))?"
+)
+
+
+def _charset_parameter(value: str) -> str | None:
+    match = _CHARSET_PARAMETER_RE.search(value or "")
+    if match is None:
+        return None
+    label = next((item for item in match.groups() if item), "").strip()
+    if not label:
+        return None
+    try:
+        return codecs.lookup(label).name
+    except LookupError:
+        return None
+
+
+def _html_meta_charset(body: bytes) -> str | None:
+    # Charset labels and meta attributes are ASCII by definition; ignoring
+    # non-ASCII bytes keeps this scan safe for legacy encodings such as GBK.
+    sample = body[:8192].decode("ascii", errors="ignore")
+    for tag in _META_TAG_RE.findall(sample):
+        attrs: dict[str, str] = {}
+        for match in _META_ATTRIBUTE_RE.finditer(tag[5:-1]):
+            key = match.group(1).casefold()
+            value = next((item for item in match.groups()[1:] if item is not None), "")
+            attrs[key] = value
+        label = attrs.get("charset", "").strip()
+        if not label and attrs.get("http-equiv", "").strip().casefold() == "content-type":
+            label = _charset_parameter(attrs.get("content", "")) or ""
+        if label:
+            try:
+                return codecs.lookup(label).name
+            except LookupError:
+                continue
+    return None
+
+
+def _html_bom_encoding(body: bytes) -> str | None:
+    # Check UTF-32 signatures before UTF-16 because the little-endian forms
+    # share their first two bytes.
+    signatures = (
+        (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF32_LE, "utf-32"),
+        (codecs.BOM_UTF8, "utf-8-sig"),
+        (codecs.BOM_UTF16_BE, "utf-16"),
+        (codecs.BOM_UTF16_LE, "utf-16"),
+    )
+    return next((encoding for signature, encoding in signatures if body.startswith(signature)), None)
+
+
+def _looks_like_html(content_type: str, body: bytes) -> bool:
+    prefix = body[:4096].decode("ascii", errors="ignore")
+    return "html" in content_type.casefold() or bool(
+        re.search(r"<!doctype\s+html|<html(?:\s|>)|<head(?:\s|>)|<body(?:\s|>)", prefix, re.I)
+    )
+
+
+def _decode_response_body(body: bytes, content_type: str, *, looks_html: bool) -> tuple[str, str]:
+    """Decode HTTP bytes using declared metadata before conservative fallbacks."""
+
+    http_charset = _charset_parameter(content_type)
+    if http_charset:
+        decoder = "utf-8-sig" if http_charset == "utf-8" and body.startswith(codecs.BOM_UTF8) else http_charset
+        return body.decode(decoder, errors="replace"), http_charset
+
+    bom_encoding = _html_bom_encoding(body)
+    if bom_encoding:
+        return body.decode(bom_encoding, errors="replace"), bom_encoding
+
+    if looks_html:
+        meta_charset = _html_meta_charset(body)
+        if meta_charset:
+            return body.decode(meta_charset, errors="replace"), meta_charset
+
+    try:
+        return body.decode("utf-8", errors="strict"), "utf-8"
+    except UnicodeDecodeError:
+        # The product primarily reads Chinese public job pages. GB18030 is a
+        # standards-based superset of GBK, and is tried only when the bytes are
+        # not valid UTF-8 and the page supplied no usable charset declaration.
+        try:
+            return body.decode("gb18030", errors="strict"), "gb18030"
+        except UnicodeDecodeError:
+            return body.decode("utf-8", errors="replace"), "utf-8"
+
+
+class _VisibleHTMLParser(HTMLParser):
+    """Bounded HTML-to-text projection for model-facing public pages."""
+
+    _SKIP_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.jsonld_parts: list[str] = []
+        self._skip_depth = 0
+        self._jsonld_depth = 0
+        self._in_jsonld = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        folded = tag.casefold()
+        values = {str(key).casefold(): str(value or "") for key, value in attrs}
+        if folded in self._SKIP_TAGS:
+            self._skip_depth += 1
+            if folded == "script" and values.get("type", "").casefold() == "application/ld+json":
+                self._in_jsonld = True
+                self._jsonld_depth = self._skip_depth
+        elif self._skip_depth == 0 and folded in {"br", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        folded = tag.casefold()
+        if folded in self._SKIP_TAGS and self._skip_depth:
+            if folded == "script" and self._in_jsonld and self._jsonld_depth == self._skip_depth:
+                self._in_jsonld = False
+                self._jsonld_depth = 0
+            self._skip_depth -= 1
+        elif self._skip_depth == 0 and folded in {"br", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._in_jsonld:
+            self.jsonld_parts.append(data)
+        elif self._skip_depth == 0 and data.strip():
+            self.parts.append(data)
+
+
+def _compact_text(value: str, *, max_chars: int = MAX_FETCH_VISIBLE_CHARS) -> str:
+    cleaned = _normalize_projected_text(value)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    # Keep both the page heading and the requirements/footer where many job
+    # pages put qualifications.  This is a projection, not an assertion that
+    # omitted text was absent.
+    head = max_chars // 2
+    tail = max_chars - head
+    return cleaned[:head].rstrip() + "\n…[正文中段已省略]…\n" + cleaned[-tail:].lstrip()
+
+
+def _normalize_projected_text(value: str) -> str:
+    """Normalize presentation whitespace without treating it as lost content."""
+
+    cleaned = re.sub(r"[ \t\f\v]+", " ", value or "")
+    cleaned = re.sub(r"\n\s*\n+", "\n", cleaned)
+    return cleaned.strip()
+
+
+def _job_posting_projection(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    raw_type = value.get("@type")
+    types = raw_type if isinstance(raw_type, list) else [raw_type]
+
+    def is_job_posting_type(item: Any) -> bool:
+        # JSON-LD allows compact names as well as schema.org IRIs, including
+        # ``https://schema.org/JobPosting`` and ``http://schema.org/JobPosting``.
+        token = (
+            str(item or "")
+            .strip()
+            .rstrip("/#:")
+            .rsplit("/", 1)[-1]
+            .rsplit("#", 1)[-1]
+            .rsplit(":", 1)[-1]
+        )
+        return token.casefold() == "jobposting"
+
+    if not any(is_job_posting_type(item) for item in types):
+        return None
+    allowed = (
+        "title",
+        "description",
+        "qualifications",
+        "responsibilities",
+        "skills",
+        "experienceRequirements",
+        "educationRequirements",
+        "employmentType",
+        "hiringOrganization",
+        "jobLocation",
+        "baseSalary",
+        "datePosted",
+    )
+    projected = {key: value[key] for key in allowed if key in value}
+    return projected or None
+
+
+def _bound_projection_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep structured-data metadata bounded before it enters a tool result."""
+
+    if depth >= 3:
+        return _compact_text(str(value), max_chars=600)
+    if isinstance(value, str):
+        return _compact_text(value, max_chars=2000)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bound_projection_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:24]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_bound_projection_value(item, depth=depth + 1) for item in list(value)[:12]]
+    return value
+
+
+def _compact_structured_postings(postings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """Keep JSON-LD metadata small enough to coexist with visible page text."""
+
+    compacted: list[dict[str, Any]] = []
+    truncated = len(postings) > MAX_STRUCTURED_POSTINGS
+    encoded_size = 2  # ``[]``
+    for posting in postings[:MAX_STRUCTURED_POSTINGS]:
+        candidate = _bound_projection_value(posting)
+        truncated = truncated or candidate != posting
+        candidate_text = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if encoded_size + len(candidate_text) + (1 if compacted else 0) <= MAX_STRUCTURED_POSTING_CHARS:
+            compacted.append(candidate)
+            encoded_size += len(candidate_text) + (1 if len(compacted) > 1 else 0)
+            continue
+
+        # Preserve the role identity and the most useful JD fields when a
+        # single JSON-LD object is unusually verbose or nested.
+        minimal: dict[str, Any] = {}
+        for key in ("title", "description", "qualifications", "responsibilities", "skills"):
+            if key not in posting:
+                continue
+            value = posting[key]
+            if isinstance(value, (dict, list, tuple)):
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            value = _compact_text(str(value), max_chars=420 if key != "title" else 240)
+            if value:
+                minimal[key] = value
+            trial = json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
+            if encoded_size + len(trial) + (1 if compacted else 0) > MAX_STRUCTURED_POSTING_CHARS:
+                minimal.pop(key, None)
+                break
+        if minimal:
+            truncated = True
+            compacted.append(minimal)
+            break
+        truncated = True
+        break
+    return compacted, truncated
+
+
+def _iter_jsonld_nodes(value: Any):
+    """Yield typed JSON-LD nodes from a root object or nested @graph."""
+
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_jsonld_nodes(item)
+    elif isinstance(value, dict):
+        if "@type" in value:
+            yield value
+        if "@graph" in value:
+            yield from _iter_jsonld_nodes(value["@graph"])
+
+
+def _html_projection(text: str) -> tuple[str, list[dict[str, Any]], bool]:
+    parser = _VisibleHTMLParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except (TypeError, ValueError):
+        # A malformed page can still be useful as plain text; do not turn a
+        # parser quirk into a failed public fetch.
+        visible_source = re.sub(r"<[^>]+>", " ", text)
+        projected = _compact_text(visible_source)
+        truncated = len(_normalize_projected_text(visible_source)) > MAX_FETCH_VISIBLE_CHARS
+        return projected, [], truncated
+
+    postings: list[dict[str, Any]] = []
+    for raw in parser.jsonld_parts:
+        try:
+            value = json.loads(raw.strip())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for item in _iter_jsonld_nodes(value):
+            projected = _job_posting_projection(item)
+            if projected is not None:
+                postings.append(projected)
+    visible_source = " ".join(parser.parts)
+    visible = _compact_text(visible_source)
+    # Compare against normalized source text: block-tag separators and
+    # whitespace cleanup shorten ordinary complete HTML without omitting JD
+    # content, so raw length comparisons over-reported truncation on most pages.
+    projection_truncated = len(_normalize_projected_text(visible_source)) > MAX_FETCH_VISIBLE_CHARS
+    postings, structured_truncated = _compact_structured_postings(postings)
+    projection_truncated = projection_truncated or structured_truncated
+    if postings:
+        structured_source = json.dumps(postings, ensure_ascii=False, separators=(",", ":"))
+        structured = _compact_text(structured_source, max_chars=MAX_STRUCTURED_POSTING_CHARS)
+        projection_truncated = projection_truncated or (
+            len(_normalize_projected_text(structured_source)) > MAX_STRUCTURED_POSTING_CHARS
+        )
+        combined = "结构化 JobPosting：\n" + structured + ("\n\n页面正文：\n" + visible if visible else "")
+        visible = _compact_text(combined)
+        projection_truncated = projection_truncated or (
+            len(_normalize_projected_text(combined)) > MAX_FETCH_VISIBLE_CHARS
+        )
+    return visible, postings, projection_truncated
+
+
 def _fetch_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
     args = _require_mapping(args)
+    representation = _arg(args, "format", "response_format", default="text")
+    if representation is None:
+        representation = "text"
+    if not isinstance(representation, str) or representation.casefold() not in {"text", "raw", "auto"}:
+        raise ToolInputError("format must be text, raw, or auto")
+    representation = representation.casefold()
     max_bytes = _safe_limit(
         _arg(args, "max_bytes", "max_size"),
         default=MAX_FETCH_BYTES,
@@ -1762,9 +2084,23 @@ def _fetch_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
         session_headers.update({"User-Agent": "agent-coach/1.0"})
     current = url
     redirects = 0
+    route_events: list[dict[str, Any]] = []
     try:
         while True:
             current = ensure_public_url(current)
+            # ``fetch_url`` deliberately ignores environment proxies.  Keep
+            # that decision visible in the bounded result so a caller can
+            # distinguish a direct, DNS-validated fetch from a proxy probe;
+            # this metadata is diagnostic and never relaxes URL validation.
+            route_events.append(
+                {
+                    "url": current,
+                    "route": "direct",
+                    "proxy": None,
+                    "trust_env": False,
+                    "dns_validated": True,
+                }
+            )
             try:
                 response = session.get(
                     current,
@@ -1775,6 +2111,7 @@ def _fetch_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
             except requests.RequestException as exc:
                 raise ToolInputError(f"HTTP request failed: {exc}") from exc
             status = int(getattr(response, "status_code", 0))
+            route_events[-1]["status"] = status
             if 300 <= status < 400:
                 location = (getattr(response, "headers", {}) or {}).get("Location")
                 close = getattr(response, "close", None)
@@ -1793,22 +2130,42 @@ def _fetch_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
                     close()
                 raise ToolInputError(f"HTTP request returned status {status}")
             body, truncated = _response_body(response, max_bytes)
+            response_headers = getattr(response, "headers", {}) or {}
             close = getattr(response, "close", None)
             if callable(close):
                 close()
-            encoding = getattr(response, "encoding", None) or "utf-8"
-            try:
-                text = body.decode(encoding, errors="replace")
-            except (LookupError, UnicodeError):
-                text = body.decode("utf-8", errors="replace")
+            content_type = str(response_headers.get("Content-Type") or response_headers.get("content-type") or "")
+            looks_html = _looks_like_html(content_type, body)
+            text, content_encoding = _decode_response_body(body, content_type, looks_html=looks_html)
+            projected = text
+            structured_postings: list[dict[str, Any]] = []
+            content_truncated = truncated
+            content_format = "raw"
+            if representation != "raw" and looks_html:
+                projected, structured_postings, projection_truncated = _html_projection(text)
+                content_truncated = content_truncated or projection_truncated
+                content_format = "html_text"
+            elif representation != "raw":
+                content_format = "text"
             return _outcome(
                 {
                     "url": current,
                     "status": status,
-                    "content": text,
+                    "content": projected,
                     "bytes": len(body),
                     "truncated": truncated,
+                    "content_truncated": content_truncated,
                     "redirects": redirects,
+                    "content_format": content_format,
+                    "source_content_type": content_type[:200],
+                    "content_encoding": content_encoding,
+                    "structured_job_postings": structured_postings,
+                    "route_diagnostics": {
+                        "events": route_events,
+                        "proxy_used": False,
+                        "trust_env": False,
+                        "public_dns_required": True,
+                    },
                 }
             )
     finally:
@@ -1882,8 +2239,8 @@ def _search_jobs_handler(args: dict, ctx: ToolContext) -> ToolOutcome:
     try:
         payload = search_jobs(
             _arg(args, "query"),
-            platform=_arg(args, "platform", default="boss"),
-            limit=_arg(args, "limit", "n", default=6),
+            platform=_arg(args, "platform", default="web"),
+            limit=_arg(args, "limit", "n", default=18),
         )
     except IntegrationError as exc:
         raise ToolInputError(str(exc)) from exc
@@ -2144,6 +2501,12 @@ def _specs(*, include_job_integrations: bool = True) -> list[ToolDefinition]:
                         "url": {"type": "string"},
                         "timeout": {"type": "number"},
                         "max_bytes": {"type": "integer"},
+                        "format": {
+                            "type": "string",
+                            "enum": ["text", "raw", "auto"],
+                            "default": "text",
+                            "description": "HTML pages default to a bounded visible-text/JobPosting projection; use raw only when the original bounded body is needed.",
+                        },
                     },
                     "required": ["url"],
                 },
@@ -2218,15 +2581,23 @@ def _specs(*, include_job_integrations: bool = True) -> list[ToolDefinition]:
             spec=ToolSpec(
                 name="search_jobs",
                 description=(
-                    "Search only indexed public BOSS 直聘, 猎聘, or 智联招聘 links and summaries "
-                    "deterministically; never synthesize a JD and report login/insufficient results."
+                    "Search public web job pages and summaries deterministically (default web search is "
+                    "not restricted to one platform; legacy BOSS/猎聘/智联 values remain compatible); "
+                    "for a JD comparison query keep one target role, collect a bounded 15–20 lead pool, "
+                    "then read 3–5 independent URLs with fetch_url as source evidence; never synthesize a JD, "
+                    "label aggregator pages as details, or hide unavailable results."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "platform": {"type": "string", "enum": ["boss", "liepin", "zhilian"]},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                        "platform": {"type": "string", "enum": ["web", "boss", "liepin", "zhilian"]},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "description": "Search-lead pool size; bounded to 15–20 by the JD workflow.",
+                        },
                     },
                     "required": ["query"],
                     "additionalProperties": False,

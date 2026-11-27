@@ -27,6 +27,7 @@ SKILL_NAME = "job-radar"
 _STATE_KEY = SKILL_NAME
 _MAX_INPUT_FILES = 10
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
+_MAX_JD_SOURCE_URLS = 10
 _JD_SOURCE_KINDS = {
     "text",
     "screenshot",
@@ -343,6 +344,7 @@ def _state(ctx: ToolContext) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "jd": None,
         "jd_source": None,
+        "jd_comparison": None,
         "jd_confirmation": None,
         "profile": None,
         "profile_source": None,
@@ -676,6 +678,150 @@ def _history_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def _timeline_timestamp(value: Any) -> datetime | None:
+    """Parse a persisted event timestamp for legacy timeline comparisons."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _jd_identity(value: Any) -> tuple[str, str] | None:
+    """Return the stable posting identity available in a JD artifact."""
+
+    if not isinstance(value, dict):
+        return None
+    card = value.get("jd") if isinstance(value.get("jd"), dict) else value
+    title = str(card.get("job_title") or "").strip().casefold()
+    company = str(card.get("company") or "").strip().casefold()
+    if not title and not company:
+        return None
+    return title, company
+
+
+def _latest_jd_identity_change_index(state: dict[str, Any]) -> int | None:
+    """Return the latest JD-history index that changed posting identity.
+
+    ``None`` means that the old payload does not contain enough identity data
+    to make that decision; callers must preserve the legacy view in that case.
+    """
+
+    identities = [
+        _jd_identity(item.get("jd")) if isinstance(item, dict) else None
+        for item in state.get("jd_history", [])
+    ]
+    if not identities or identities[-1] is None:
+        return None
+    latest_change: int | None = None
+    for index in range(1, len(identities)):
+        previous = identities[index - 1]
+        current = identities[index]
+        if previous is not None and current is not None and previous != current:
+            latest_change = index
+    return latest_change
+
+
+def _current_project_scope(state: dict[str, Any]) -> dict[str, bool] | None:
+    """Return explicit current-JD membership for project-history records.
+
+    Project history is intentionally cumulative so changing a JD cannot erase
+    evidence.  The browser-facing projection can still avoid presenting an
+    older JD's projects as current when the durable event log and JD identity
+    prove the relationship: a project selection before the latest
+    identity-changing ``jd_updated`` event belongs to the archive.  A missing
+    or incomplete timeline returns ``None`` so old sessions retain their
+    records rather than receiving an inferred ownership assignment.
+    """
+
+    events = state.get("history")
+    event_rows = events if isinstance(events, list) else []
+    jd_update_indexes: list[int] = []
+    selection_indexes: dict[str, int] = {}
+    selection_times: dict[str, datetime] = {}
+    for index, raw in enumerate(event_rows):
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("type") or "").strip()
+        if kind == "jd_updated":
+            jd_update_indexes.append(index)
+            continue
+        if kind != "project_selected":
+            continue
+        key = _project_key(raw.get("project_key") or raw.get("full_name"))
+        if not key:
+            continue
+        selection_indexes[key] = index
+        timestamp = _timeline_timestamp(raw.get("at"))
+        if timestamp is not None:
+            selection_times[key] = timestamp
+
+    jd_history = state.get("jd_history")
+    if jd_update_indexes:
+        # Re-submitting or correcting the same posting must not hide its
+        # existing project history.  Only the latest explicit identity change
+        # starts a new visible project scope; later same-identity updates keep
+        # that boundary in place.
+        change_index = _latest_jd_identity_change_index(state)
+        if (
+            change_index is None
+            or change_index >= len(jd_update_indexes)
+            or not isinstance(jd_history, list)
+            or len(jd_history) != len(jd_update_indexes)
+            or not selection_indexes
+        ):
+            return None
+        boundary_index = jd_update_indexes[change_index]
+        return {
+            key: selection_index > boundary_index
+            for key, selection_index in selection_indexes.items()
+        }
+
+    # Some early persisted sessions have ``jd_history`` and project-selection
+    # events but no corresponding ``jd_updated`` event.  Use their explicit
+    # timestamps when both sides are present; otherwise keep the legacy view.
+    change_index = _latest_jd_identity_change_index(state)
+    if (
+        change_index is None
+        or not isinstance(jd_history, list)
+        or change_index >= len(jd_history)
+    ):
+        return None
+    boundary_item = jd_history[change_index]
+    boundary_time = (
+        _timeline_timestamp(boundary_item.get("at"))
+        if isinstance(boundary_item, dict)
+        else None
+    )
+    if boundary_time is None or not selection_times:
+        return None
+    return {
+        key: selection_time >= boundary_time
+        for key, selection_time in selection_times.items()
+    }
+
+
+def _visible_project_history(
+    state: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return current-JD records while retaining the full archive in state."""
+
+    scope = _current_project_scope(state)
+    if scope is None:
+        return records
+    return [
+        record
+        for record in records
+        if scope.get(str(record.get("project_key") or _project_key(record.get("project"))), True)
+    ]
+
+
 def _ensure_project_history(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Materialize the lazy history migration before a workflow mutation."""
 
@@ -784,10 +930,24 @@ def _result(message: str, **data: Any) -> ToolOutcome:
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     """Return current artifacts without replaying the unbounded history."""
 
-    project_history = _history_records(state)
+    # ``state["project_history"]`` remains the durable archive.  Only the
+    # public projection is narrowed to the current JD when explicit timeline
+    # events prove that a record belongs to an earlier JD.
+    project_history = _visible_project_history(state, _history_records(state))
+    selected_project = deepcopy(state.get("selected_project"))
+    progress = _normalise_progress(state.get("progress", []))
+    scope = _current_project_scope(state)
+    selected_key = _project_key(selected_project)
+    if scope is not None and selected_key and scope.get(selected_key) is False:
+        # A few legacy sessions persisted the active compatibility fields
+        # after a JD change.  Keep those bytes in the durable archive, but do
+        # not let a read or model context resurrect an old active project.
+        selected_project = None
+        progress = []
     return {
         "jd": deepcopy(state.get("jd")),
         "jd_source": deepcopy(state.get("jd_source")),
+        "jd_comparison": deepcopy(state.get("jd_comparison")),
         "jd_confirmation": deepcopy(state.get("jd_confirmation")),
         "profile": deepcopy(state.get("profile")),
         "profile_source": deepcopy(state.get("profile_source")),
@@ -797,8 +957,8 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
         "project_filter": deepcopy(state.get("project_filter", _default_project_filter())),
         "repos": deepcopy(state.get("repos", [])),
         "user_projects": deepcopy(state.get("user_projects", [])),
-        "selected_project": deepcopy(state.get("selected_project")),
-        "progress": _normalise_progress(state.get("progress", [])),
+        "selected_project": selected_project,
+        "progress": progress,
         "project_history": deepcopy(project_history),
         "project_selection_revision": _safe_selection_revision(state),
         "history_count": len(state.get("history", [])),
@@ -934,6 +1094,7 @@ def copy_profile_state(source_session: Any, target_session: Any) -> None:
     target_state["history"] = []
     target_state["jd"] = None
     target_state["jd_source"] = None
+    target_state["jd_comparison"] = None
     target_state["jd_confirmation"] = None
     target_state["plan"] = None
     target_state["plan_source"] = None
@@ -1152,6 +1313,111 @@ def _artifact(arguments: dict[str, Any], model_type: Any, *names: str, label: st
         raise ValueError(f"{label} 工件不符合既定 schema：{exc}") from exc
 
 
+def _readable_fetch_sample_urls(session: Any) -> set[str]:
+    """Return requested source URLs whose current-turn fetches were readable.
+
+    A search result URL is only a lead. This count deliberately comes from
+    successful ``fetch_url`` tool messages and requires non-empty fetched
+    content, so ``source_urls`` or a model assertion cannot inflate the
+    comparison sample count. The assistant tool-call URL is preferred over
+    the response URL because a legitimate HTTP redirect changes the latter.
+    """
+
+    messages = getattr(session, "messages", [])
+    if not isinstance(messages, list):
+        return set()
+    last_user = -1
+    for index, message in enumerate(messages):
+        if getattr(message, "role", None) == "user":
+            last_user = index
+    requested_by_call: dict[str, str] = {}
+    for message in messages[last_user + 1 :]:
+        if getattr(message, "role", None) != "assistant":
+            continue
+        for call in getattr(message, "tool_calls", None) or []:
+            if getattr(call, "name", None) != "fetch_url":
+                continue
+            arguments = getattr(call, "arguments", {})
+            requested = arguments.get("url") if isinstance(arguments, dict) else None
+            if isinstance(requested, str) and requested.strip():
+                requested_by_call[str(getattr(call, "id", ""))] = requested.strip()
+    seen: set[str] = set()
+    readable_urls: set[str] = set()
+    for index, message in enumerate(messages[last_user + 1 :], start=last_user + 1):
+        if getattr(message, "role", None) != "tool" or getattr(message, "name", None) != "fetch_url":
+            continue
+        raw = getattr(message, "content", "")
+        candidates: list[Any] = []
+        if isinstance(raw, str) and raw.strip():
+            try:
+                candidates.append(json.loads(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                for line in raw.splitlines():
+                    try:
+                        candidates.append(json.loads(line))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+        readable = False
+        url = ""
+        for payload in candidates:
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("error") or payload.get("ok") is False:
+                continue
+            try:
+                if int(payload.get("status", 200)) >= 400:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            body = payload.get("content") or payload.get("text") or payload.get("body", "")
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body, ensure_ascii=False)
+            if isinstance(body, str) and body.strip():
+                readable = True
+                url = str(payload.get("url") or "").strip()
+                break
+        if readable:
+            requested = requested_by_call.get(str(getattr(message, "tool_call_id", "")))
+            if requested:
+                seen.add(requested)
+            elif url:
+                # Keep compatibility with old/transformed transcripts that do
+                # not retain the assistant call alongside a tool result.
+                seen.add(url)
+    readable_urls.update(seen)
+    return readable_urls
+
+
+def _search_tool_attempted(session: Any) -> bool:
+    """Whether the current turn actually invoked the deterministic job search."""
+
+    messages = getattr(session, "messages", [])
+    if not isinstance(messages, list):
+        return False
+    last_user = -1
+    for index, message in enumerate(messages):
+        if getattr(message, "role", None) == "user":
+            last_user = index
+    for message in messages[last_user + 1 :]:
+        if getattr(message, "role", None) == "tool" and getattr(message, "name", None) == "search_jobs":
+            return True
+        if getattr(message, "role", None) != "assistant":
+            continue
+        if any(getattr(call, "name", None) == "search_jobs" for call in getattr(message, "tool_calls", None) or []):
+            return True
+    return False
+
+
+def _background_action_mode(session: Any) -> str:
+    action = getattr(session, "background_action", None)
+    if not isinstance(action, dict):
+        return ""
+    metadata = action.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("mode") or "").strip().casefold()
+
+
 def _validate_profile_evidence(profile: UserSkillProfile) -> None:
     """Reject skills that have no source/evidence to support an assertion."""
 
@@ -1205,40 +1471,212 @@ def set_jd(arguments: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
     """
 
     state = _state(ctx)
+    raw_card = _first(arguments, "jd", "jd_card", "artifact", default=None)
     card_model = _artifact(arguments, JDCard, "jd", "jd_card", "artifact", label="JD")
+    mode = _background_action_mode(ctx.session)
     source_meta = _source_evidence(
         ctx,
         arguments,
         artifact="JD",
         allowed_kinds=_JD_SOURCE_KINDS,
     )
-    source_url = _first(arguments, "source_url", "url", default=source_meta.get("url"))
-    if source_meta["kind"] == "public_source" and source_url is None:
-        raise ValueError("public_source 必须保留 source_url")
+    raw_source_urls = _first(arguments, "source_urls", default=source_meta.get("source_urls"))
+    if raw_source_urls is None:
+        source_urls: list[Any] = []
+    elif isinstance(raw_source_urls, str):
+        source_urls = [raw_source_urls]
+    elif isinstance(raw_source_urls, (tuple, list)):
+        source_urls = list(raw_source_urls)
+    else:
+        raise ValueError("source_urls 必须是字符串或字符串列表")
+    if len(source_urls) > _MAX_JD_SOURCE_URLS:
+        raise ValueError(f"一次最多保留 {_MAX_JD_SOURCE_URLS} 个岗位来源链接")
+
+    source_url = _first(
+        arguments,
+        "source_url",
+        "url",
+        default=source_meta.get("url", source_meta.get("source_url")),
+    )
     if source_url is not None:
         if not isinstance(source_url, str) or not source_url.strip():
             raise ValueError("source_url 必须是非空字符串")
-        from .legacy.tools.job_sources import platform_for
+        source_urls = [source_url, *[url for url in source_urls if url != source_url]]
+    if len(source_urls) > _MAX_JD_SOURCE_URLS:
+        raise ValueError(f"一次最多保留 {_MAX_JD_SOURCE_URLS} 个岗位来源链接")
 
-        platform = platform_for(source_url)
-        if platform is None:
-            raise ValueError("source_url 必须是支持招聘平台的 HTTPS 来源链接")
-        source_meta.update({"url": source_url, "platform": platform})
+    if source_urls:
+        from .legacy.tools.job_sources import platform_for, public_source_url
+
+        clean_urls: list[str] = []
+        platforms: list[str] = []
+        for value in source_urls:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("source_urls 中每个链接必须是非空字符串")
+            clean_url = value.strip()
+            if len(clean_url.encode("utf-8")) > 4096:
+                raise ValueError("source_urls 中的链接超出长度限制")
+            try:
+                clean_url = public_source_url(clean_url)
+            except ValueError as exc:
+                raise ValueError(f"source_urls 必须是无凭据的 HTTPS 公共岗位来源链接：{exc}") from exc
+            platform = platform_for(clean_url) or "web"
+            clean_urls.append(clean_url)
+            if platform not in platforms:
+                platforms.append(platform)
+        source_urls = clean_urls
         if source_meta["kind"] != "public_source":
-            raise ValueError("提供 source_url 时 source.kind 必须是 public_source")
+            raise ValueError("提供 source_urls/source_url 时 source.kind 必须是 public_source")
+        source_meta.update(
+            {
+                "url": source_urls[0],
+                "source_urls": source_urls,
+                "platform": platforms[0] if len(platforms) == 1 else "web",
+                "platforms": platforms,
+            }
+        )
+    elif source_meta["kind"] == "public_source":
+        raise ValueError("public_source 必须保留 source_urls 或 source_url")
+
+    comparison: dict[str, Any] = {
+        "mode": mode or "source",
+        "status": card_model.comparison_status,
+        "sample_target": card_model.sample_target,
+        "sample_count": card_model.sample_count,
+        "readable_samples": card_model.sample_count,
+        "minimum_samples": 1,
+        "evidence_complete": card_model.comparison_status != "insufficient_samples",
+    }
+    if mode == "search":
+        # Search mode is the only path with a hard multi-sample requirement.
+        # Count readable fetch results from the current turn rather than trusting
+        # source_urls or a model-provided number.
+        readable_urls = _readable_fetch_sample_urls(ctx.session)
+        attempted_urls = {str(value).strip() for value in source_urls if str(value).strip()}
+        readable_upper_bound = len(readable_urls.intersection(attempted_urls))
+        # A failed public search must not replace an existing JD with the
+        # model's empty/placeholder card. One readable sample is still a
+        # valid insufficient-sample result and is handled below; zero linked
+        # readable fetches is a hard no-save outcome.
+        if readable_upper_bound == 0 and (attempted_urls or _search_tool_attempted(ctx.session)):
+            raise ValueError(
+                "岗位搜索没有读取到任何可核实的 JD；本次未保存。请粘贴企业招聘官网或招聘网站的岗位链接/正文。"
+            )
+        raw_card_mapping = raw_card if isinstance(raw_card, dict) else {}
+        if "sample_target" in raw_card_mapping:
+            target = card_model.sample_target
+            if target < 3 or target > 5:
+                raise ValueError("岗位搜索的 sample_target 必须在 3 到 5 之间")
+        else:
+            target = 5
+        declared_count = card_model.sample_count if "sample_count" in raw_card_mapping else 0
+        # A search turn with zero *matching* readable samples is a failed
+        # search, even when fetch_url happened to return an unrelated page or
+        # a login/anti-bot shell.  Never let such a placeholder overwrite a
+        # previously reviewed JD.
+        if declared_count <= 0:
+            raise ValueError(
+                "岗位搜索没有形成任何有效的同类 JD；本次未保存。请粘贴企业招聘官网或招聘网站的岗位链接/正文。"
+            )
+        if declared_count > readable_upper_bound:
+            raise ValueError("岗位搜索的 sample_count 不能超过当前轮实际可读的 fetch_url 样本数")
+        # A model may have read three or more pages yet still determine that
+        # the samples are heterogeneous or otherwise insufficient for a
+        # trustworthy common-requirements comparison.  Never overwrite that
+        # explicit declaration solely because the numeric count reached the
+        # minimum.
+        declared_status = str(raw_card_mapping.get("comparison_status") or "").strip()
+        status = (
+            "insufficient_samples"
+            if declared_status == "insufficient_samples" or declared_count < 3
+            else "compared"
+        )
+        updates: dict[str, Any] = {
+            "sample_target": target,
+            "sample_count": declared_count,
+            "comparison_status": status,
+            # Search compares role requirements; company-specific values must
+            # not be copied from whichever result happened to appear first.
+            "company": None,
+            "salary": None,
+            "location": None,
+            "team": None,
+        }
+        if status == "insufficient_samples":
+            updates.update(
+                {
+                    "hard_requirements": [],
+                    "skill_tags": [],
+                    "responsibilities": [],
+                    "nice_to_haves": [],
+                }
+            )
+        note = (
+            f"可用于比较的同类 JD：{declared_count} 份，目标 {target} 份；"
+            + (
+                (
+                    "暂不足形成共性，不能把单样本要求当作共同要求。"
+                    if declared_count < 3
+                    else "样本仍未形成可靠共性，不能把单样本要求当作共同要求。"
+                )
+                if status == "insufficient_samples"
+                else "已达到最低比较数量。"
+            )
+        )
+        # Preserve the model's complete comparison notes.  The editor/UI owns
+        # folding long prose; the persistence layer must not silently delete
+        # the middle of the evidence or insert a claim that details live in
+        # source.evidence when they were not supplied there.
+        summary = card_model.raw_summary.strip()
+        if note not in summary:
+            summary = f"{summary}；{note}" if summary else note
+        updates["raw_summary"] = summary
+        if status == "insufficient_samples":
+            uncertainty = (
+                f"共同要求：可比样本不足 3 个（当前 {declared_count} 份，目标 {target} 份）"
+                if declared_count < 3
+                else f"共同要求：可比样本未形成可靠共性（当前 {declared_count} 份，目标 {target} 份）"
+            )
+            fields = list(card_model.uncertain_fields)
+            if uncertainty not in fields:
+                fields.append(uncertainty)
+            updates["uncertain_fields"] = fields
+        card_model = card_model.model_copy(update=updates)
+        comparison = {
+            "mode": "search",
+            "status": status,
+            "sample_target": target,
+            "sample_count": declared_count,
+            "readable_samples": declared_count,
+            "readable_fetches": len(readable_urls),
+            "readable_upper_bound": readable_upper_bound,
+            "minimum_samples": 3,
+            "evidence_complete": status == "compared",
+        }
 
     card = _dump(card_model)
     state["jd"] = card
     state["jd_source"] = source_meta
+    state["jd_comparison"] = deepcopy(comparison)
     # A new or edited JD is a new user-review candidate.  Confirmation is a
     # separate UI-owned state and can never be carried in by an Agent tool call.
     state["jd_confirmation"] = None
     _invalidate_downstream(state, "JD 已更新")
     state.setdefault("jd_history", []).append(
-        {"at": _now(), "jd": deepcopy(card), "source": deepcopy(source_meta)}
+        {
+            "at": _now(),
+            "jd": deepcopy(card),
+            "source": deepcopy(source_meta),
+            "comparison": deepcopy(comparison),
+        }
     )
     _event(state, "jd_updated", source=source_meta)
-    return _result("JD 已保存；计划、项目和进度已失效", jd=card, state=_public_state(state))
+    return _result(
+        "JD 已保存；计划、项目和进度已失效",
+        jd=card,
+        comparison=deepcopy(comparison),
+        state=_public_state(state),
+    )
 
 
 def confirm_jd(arguments: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
@@ -2060,6 +2498,7 @@ def _require_selectable_project(project: dict[str, Any], *, historical_continuat
 def select_project(arguments: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
     state = _state(ctx)
     records = _ensure_project_history(state)
+    visible_records = _visible_project_history(state, records)
     repos = state.get("repos") or []
     user_projects = state.get("user_projects") if isinstance(state.get("user_projects"), list) else []
     # ``repos`` is a compatibility snapshot and can be empty in a migrated or
@@ -2109,9 +2548,9 @@ def select_project(arguments: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
                 break
         # A previously practiced project remains selectable even when a later
         # candidate refresh no longer returns it.  This is the revisit path for
-        # the cumulative portfolio and still requires an exact known identity.
+        # the current JD's portfolio and still requires an exact known identity.
         if selected is None:
-            for record in records:
+            for record in visible_records:
                 project = record.get("project") if isinstance(record.get("project"), dict) else {}
                 if requested_key and record.get("project_key") == requested_key:
                     selected = project
@@ -2375,6 +2814,13 @@ def _source_schema(allowed_kinds: set[str]) -> dict[str, Any]:
             "code_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "repository": {"type": "string", "minLength": 1},
             "url": {"type": "string", "minLength": 1},
+            "source_url": {"type": "string", "minLength": 1},
+            "source_urls": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": _MAX_JD_SOURCE_URLS,
+                "items": {"type": "string", "minLength": 1},
+            },
         },
         # Canonical source/code evidence is accepted as the provenance field;
         # runtime validation still requires one non-empty evidence list for
@@ -2409,14 +2855,14 @@ def register_job_radar_tools(registry: ToolRegistry) -> ToolRegistry:
 
     definitions = [
         ToolDefinition(
-            spec=_spec("job_radar_status", "查看岗位雷达当前工件、前置条件和历史。", {}),
+        spec=_spec("job_radar_status", "查看简历项目助手当前工件、前置条件和历史。", {}),
             handler=job_radar_status,
             skill=SKILL_NAME,
         ),
         ToolDefinition(
             spec=_spec(
                 "set_jd",
-                "保存主体 Agent 已从用户材料整理出的结构化 JDCard；工具只校验、记录来源并使下游工件失效。",
+                "保存主体 Agent 已从用户材料整理出的结构化 JDCard；岗位搜索必须填写 sample_target、sample_count、comparison_status 并以实际 fetch_url 证据为准，工具只校验、记录来源并使下游工件失效。",
                 {
                     "jd": _model_schema(JDCard),
                     "jd_card": _model_schema(JDCard),
@@ -2424,6 +2870,12 @@ def register_job_radar_tools(registry: ToolRegistry) -> ToolRegistry:
                     "provenance": _source_schema(_JD_SOURCE_KINDS),
                     "source_evidence": _source_schema(_JD_SOURCE_KINDS),
                     "source_url": {"type": "string", "minLength": 1},
+                    "source_urls": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": _MAX_JD_SOURCE_URLS,
+                        "items": {"type": "string", "minLength": 1},
+                    },
                     "url": {"type": "string", "minLength": 1},
                 },
                 required=["jd"],

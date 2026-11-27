@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 # ── 环节①：岗位 JD 结构化卡片 ─────────────────────────────────
 
 Proficiency = Literal["aware", "working", "proficient", "expert"]
+JDComparisonStatus = Literal["single_source", "compared", "insufficient_samples"]
 EvidenceSource = Literal["resume", "self_report", "chat", "work_log", "obsidian", "local_path"]
 
 
@@ -27,7 +28,29 @@ class JDCard(BaseModel):
     )
     responsibilities: list[str] = Field(default_factory=list, description="岗位职责")
     nice_to_haves: list[str] = Field(default_factory=list, description="加分项")
-    raw_summary: str = Field("", description="JD 正文的连贯摘要，保留原话语气")
+    # Search imports compare one target role across independent employers.  The
+    # defaults keep the old single-link/text contract valid while giving the
+    # model a typed place to report whether a comparison actually happened.
+    sample_target: int = Field(
+        1,
+        ge=1,
+        le=5,
+        description="本次希望核实的独立岗位样本数；单条导入为 1，岗位搜索应为 3 到 5",
+    )
+    sample_count: int = Field(
+        1,
+        ge=0,
+        le=10,
+        description="实际成功读取且可作为证据的独立岗位样本数；不能用来源链接数量冒充",
+    )
+    comparison_status: JDComparisonStatus = Field(
+        "single_source",
+        description="single_source=单条材料，compared=已比较多个同职类样本，insufficient_samples=搜索样本不足 3 个",
+    )
+    raw_summary: str = Field(
+        "",
+        description="JD 正文的连贯摘要；多样本时说明样本数、共同要求的支持来源及单样本差异",
+    )
     uncertain_fields: list[str] = Field(
         default_factory=list,
         description="截图看不清、被截断或多张截图间相互矛盾的字段名",
