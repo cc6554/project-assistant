@@ -7,9 +7,9 @@
 程序需要 Windows 和 Microsoft Edge WebView2 Runtime，无需安装 Python。建议把整个 ZIP 解压到路径较短、可写的目录，并预留至少 2 GB 可用空间。下载包内没有个人会话或密钥。
 
 1. **推荐使用 Release 整包。** 下载并完整解压，打开解压后的程序目录，双击 `简历项目助手.exe`。[下载 Windows 整包](https://github.com/cc6554/project-assistant/releases/download/v0.6-desktop-v13/ResumeProjectAssistantDesktopV13-windows.zip)
-2. **也可以使用仓库分卷包。** 完整解压后双击 `Start.cmd`。首次启动会离线校验、合并并解压 7 个分卷，然后打开程序。以后可继续双击 `Start.cmd`，或打开 `app` 目录内的 `简历项目助手.exe`。首次启动前，请把分卷、校验文件和启动文件保留在同一目录。[下载 main 分支 ZIP](https://github.com/cc6554/project-assistant/archive/refs/heads/main.zip)
+2. **也可以使用仓库分卷包。** 完整解压后双击 `Start.cmd`。首次启动会离线校验、合并并解压 7 个分卷，然后打开程序。以后可继续双击 `Start.cmd`，或打开 `app` 目录内的 `简历项目助手.exe`。首次启动前，请把分卷、校验文件和启动文件保留在同一目录。[下载 master 分支 ZIP](https://github.com/cc6554/project-assistant/archive/refs/heads/master.zip)
 
-`main` 和 `1.0` 分支提供同一版 V13 Windows 成品。[1.0 分支](https://github.com/cc6554/project-assistant/tree/1.0) · [0.6 源码分支](https://github.com/cc6554/project-assistant/tree/0.6)
+`master` 和 `1.0` 分支提供同一版 V13 Windows 成品。[1.0 分支](https://github.com/cc6554/project-assistant/tree/1.0) · [0.6 源码分支](https://github.com/cc6554/project-assistant/tree/0.6)
 
 ## 首次配置
 
