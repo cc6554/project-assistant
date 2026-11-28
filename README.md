@@ -1,107 +1,33 @@
-# 校招雷达 · Job Radar Coach
+# 简历项目助手
 
-给求职者的一站式「岗位要求 → 学习计划 → 动手实操」桌面应用：把 BOSS 直聘等平台的**岗位截图**丢给它，AI 解析出岗位要求，对比你的技能档案做**差距分析**，输出**分阶段学习计划**并检索 **GitHub 可复现项目**，最后由一个能操作你电脑的 **Agent** 按计划带你逐个补足技能点。
+简历项目助手是一款面向求职者的 Windows 桌面软件。把目标岗位的招聘描述（JD）与已有经历放在同一个岗位会话里，AI 教练会帮你梳理岗位要求、整理能证明技能的经历、找出差距，并推荐可以动手复现的项目。选定项目后，可以继续让教练阅读代码和日志、指导实操，并根据实际结果记录进度和证据。
 
-## 工作流
+## 下载与启动
 
-```
-① 岗位 JD（截图） → ② 技能档案（简历/自填/访谈） → ③ 计划 & 项目（差距分析+分阶段计划+GitHub 项目）
-→ ④ Agent 实操（按计划补技能点，操作真实电脑，按需确认） → ⚙ 模型配置（多 provider）
-```
+程序需要 Windows 和 Microsoft Edge WebView2 Runtime，无需安装 Python。建议把整个 ZIP 解压到路径较短、可写的目录，并预留至少 2 GB 可用空间。下载包内没有个人会话或密钥。
 
-- **① JD 识别**：多张/长截图输入，视觉模型提取岗位信息，识别后可手动修正
-- **② 技能档案**：上传简历 / 工作日志，或与 AI 访谈逐步建立技能画像
-- **③ 计划 & 项目**：差距分析（missing / weak / evidence_insufficient / met）+ 2~5 阶段学习计划 + GitHub 项目检索（star 过滤 + LLM 重排）
-- **④ Agent 实操**：Codex 式操作面板——对话与真实操作实时可见，写文件 / 跑命令 / git clone 前需你确认；Agent 以计划为主线带用户补技能点（③ 的差距、阶段、项目自动注入 Agent 上下文）
-- **⚙ 模型配置**：任意 OpenAI 兼容 / Anthropic 端点，YAML 注册 + 环节级模型路由 + 失败自动降级
+1. **推荐使用 Release 整包。** 下载并完整解压，打开解压后的程序目录，双击 `简历项目助手.exe`。[下载 Windows 整包](https://github.com/cc6554/project-assistant/releases/download/v0.6-desktop-v13/ResumeProjectAssistantDesktopV13-windows.zip)
+2. **也可以使用仓库分卷包。** 完整解压后双击 `Start.cmd`。首次启动会离线校验、合并并解压 7 个分卷，然后打开程序。以后可继续双击 `Start.cmd`，或打开 `app` 目录内的 `简历项目助手.exe`。首次启动前，请把分卷、校验文件和启动文件保留在同一目录。[下载 main 分支 ZIP](https://github.com/cc6554/project-assistant/archive/refs/heads/main.zip)
 
-## 技术架构
+`main` 和 `1.0` 分支提供同一版 V13 Windows 成品。[1.0 分支](https://github.com/cc6554/project-assistant/tree/1.0) · [0.6 源码分支](https://github.com/cc6554/project-assistant/tree/0.6)
 
-| 层 | 技术 | 说明 |
-|---|---|---|
-| 桌面壳 | Tauri 2 (Rust) | 启动 sidecar、开窗口；窗口直接加载 `http://127.0.0.1:17689/` |
-| 后端 | Python FastAPI（PyInstaller 打包为 sidecar） | 业务内核 + 同源托管前端 + API |
-| 前端 | React + Vite + TypeScript | 五环节界面 |
-| LLM 接入 | 多 provider 注册表 | OpenAI 兼容 / Anthropic，YAML 配置，任务级 fallback 链 |
+## 首次配置
 
-- sidecar 只监听回环地址 `127.0.0.1:17689`，不走系统代理，避免被代理/TUN 拦截
-- 跨平台：Windows / Linux / macOS（代码零平台耦合，见下方构建）
+在左侧点 **连接设置 → 新建 API 配置**，选择 **Chat Completions（兼容 OpenAI）** 或 **Anthropic Messages**，填写 API 地址、模型名称和服务商提供的 API Key。可以给配置起名。点 **测试连接**，通过后点 **保存并应用**。所选配置用于各岗位会话的后续请求。
 
-```
-src/coach/
-├── core/
-│   ├── schema.py              # 内部统一 Message / ToolCall / LLMResponse
-│   └── llm/
-│       ├── base.py            # LLMClient 抽象 + 可重试错误判定
-│       ├── openai_compat.py   # DeepSeek/Kimi/智谱/豆包/OpenAI/Ollama/vLLM
-│       ├── anthropic_adapter.py
-│       ├── registry.py        # providers.yaml 声明式注册表
-│       └── router.py          # 环节路由、fallback、结构化 JSON 解析
-├── domain/schemas.py          # JDCard / UserSkillProfile / LearningPlan / GitHubRepo
-├── tools/
-│   ├── jd_parser.py           # ① 多截图 → JDCard（视觉模型）
-│   ├── profile_builder.py     # ② 材料 → 技能档案（增量合并）
-│   ├── interviewer.py         # ②b 一次一问的技能访谈
-│   ├── planner.py             # ③ 差距分析 + 分阶段计划（含异常重试）
-│   ├── github_search.py       # ③ GitHub 检索 + README/LLM 重排
-│   ├── pipeline.py            # 一键跑完整条管线
-│   ├── agent.py               # ④ Agent 运行时（工作区受限、按需确认）
-│   └── session.py             # 会话状态持久化
-└── sidecar/
-    ├── main.py                # FastAPI：同源托管前端 + API + SSE 流式 Agent
-    ├── paths.py               # 跨平台路径定位（开发态/打包态）
-    └── store.py               # 会话存储
-```
+使用 AI 教练需要支持工具调用的模型，上传岗位截图供模型识别时还需要视觉能力。未配置模型可体验演示。GitHub Token 可以按需添加，用于提高公开仓库搜索额度或读取有权限的私有仓库。
 
-## 快速开始（开发态）
+## 按四步推进一个岗位
 
-```bash
-# 后端
-python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp config/providers.example.yaml config/providers.yaml
-cp .env.example .env        # 填入你的 DEEPSEEK_API_KEY 等
-python -m coach.sidecar.main   # 启动 127.0.0.1:17689
+先在左侧点 **新建岗位会话**，再依次打开顶部步骤。
 
-# 前端（另开终端）
-npm install
-npm run build
+1. **岗位 JD**。粘贴多条公开招聘链接或岗位正文，输入一个目标岗位名称搜索公开网页，或上传、粘贴多张招聘截图。点 **交给 AI 整理 JD** 或 **搜索并汇总同类 JD**，核对来源、岗位要求和待确认项后保存，也可以手动填写。搜索会尝试收集同类岗位的多份 JD，总结共同要求并保留差异；可核验的原文不足时，可补充岗位正文或截图。
+2. **技能档案**。填写技能自述，上传简历或技能说明，添加本地日志、笔记，或打开 **访谈** 逐题补充经历。导入材料后点 **整理并更新技能档案**，核对技能、熟练程度和能支持它的具体证据，也可以手动编辑。
+3. **计划 & 项目**。确认 JD 和技能档案后，可填写包含或排除的关键词、GitHub 最低 star 数及其他复现要求，也可勾选查找相关高影响力论文的开源实现。点 **生成差距分析、学习计划和复现项目**，查看差距、阶段任务、检查点和候选项目来源。已有目标项目时，可提供 URL、上传代码和说明，或导入本地文件和文件夹，再点 **评估并加入项目候选**。
+4. **Agent 实操**。选择一个候选项目，点 **开始今天的实操**，在该项目的独立窗口继续和教练对话。可把命令输出、文件或日志作为实操证据。需要修改文件或执行命令时，先查看预览，再点 **批准并继续** 或 **拒绝**。重新打开项目可继续查看已有对话和进度。
 
-# 桌面壳（可选）
-cd src-tauri && cargo build --release
-```
+## 继续已有会话与语音输入
 
-浏览器打开 `http://127.0.0.1:17689/` 即可使用（无需 Rust 壳）。
+会话、资料和实操进度保存在本地工作区。下次从左侧 **会话历史** 回到对应岗位，也可把已有技能档案复制到另一个岗位会话。使用远程模型时，处理任务所需的内容会发送到你配置的 API。
 
-## 构建桌面应用
-
-### Windows
-```powershell
-pip install pyinstaller
-pyinstaller --noconfirm src-tauri/job-radar-sidecar.spec
-npm run build
-Copy-Item dist\* src-tauri\target\release\dist\ -Recurse -Force
-cd src-tauri; cargo build --release
-```
-
-### Linux（Ubuntu 22.04+）
-```bash
-sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-  python3-venv python3-pip nodejs npm
-bash build-linux.sh     # 一键：venv → sidecar → 前端 → Rust 壳 → 组装
-```
-
-## 配置模型
-
-`config/providers.yaml` 是唯一需要了解的配置：任何 OpenAI 兼容端点只需加一段注册，`tasks` 定义每个环节的 fallback 链（如识图用视觉模型、规划用强推理模型）。API key 一律放 `.env`（`api_key_env` 指向的环境变量），不进代码。
-
-## 安全
-
-- Agent 能操作真实电脑：只读操作（列目录/读文件）自动执行；写文件、跑命令、git clone 一律**先弹确认**，你批准才执行
-- Agent 文件操作被限制在应用工作区目录内（路径越界自动拒绝）
-- 会话数据（岗位截图、技能档案、计划）只存本机 `data/`
-
-## License
-
-MIT
+语音输入首次使用时需要允许访问麦克风。点击麦克风开始录音，再点一次结束，程序会在本机离线转写。核对文字后再提交，后续 AI 处理仍使用已配置的模型。
