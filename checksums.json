@@ -1,0 +1,44 @@
+{
+  "archive": {
+    "file": "ResumeProjectAssistantDesktopV13-windows.zip",
+    "bytes": 313180346,
+    "sha256": "246ac85169419d3a9c0e008313574e92f706e07c1358148bc16faded1e3b15ca"
+  },
+  "parts": [
+    {
+      "file": "app.zip.001",
+      "bytes": 50331648,
+      "sha256": "9c840684875f2dc51555c5131370f15ff2ef57b8ed806252a45cc8176e10bade"
+    },
+    {
+      "file": "app.zip.002",
+      "bytes": 50331648,
+      "sha256": "fa1df3e610443b8635f4d5c18227051ed9f47d0a5ca2f7574851496c37f93d57"
+    },
+    {
+      "file": "app.zip.003",
+      "bytes": 50331648,
+      "sha256": "a06a7b6e72e6a8a7f037cad5fc8d63a389c8a3b917445547e49ff0d7c4ffabb4"
+    },
+    {
+      "file": "app.zip.004",
+      "bytes": 50331648,
+      "sha256": "2c45c3fe5afd488f99c044bb9e4666e00112452b7ba0d1b01c3e4414df54ee00"
+    },
+    {
+      "file": "app.zip.005",
+      "bytes": 50331648,
+      "sha256": "fda69f15df8b2cc9505f41730c52e8e8b1381e3ac2dd150b9fc6353e00afe5b8"
+    },
+    {
+      "file": "app.zip.006",
+      "bytes": 50331648,
+      "sha256": "0d5f47efe4f2cb5abed9aa01f9c7cdc338965909dbfb42d08ef72d0fe0afd478"
+    },
+    {
+      "file": "app.zip.007",
+      "bytes": 11190458,
+      "sha256": "1da97f4e8f563c2c352aa5d856b00208256d4f7b22060799712133bfbf5a9f63"
+    }
+  ]
+}
